@@ -1,0 +1,40 @@
+# JOB A — curate. Writes ten candidates into the Sheet, then stops.
+#
+# Cron is UTC and does not follow US daylight saving. 12:00 UTC is 07:00 in
+# New York in winter and 08:00 in summer. If that drift matters, change it
+# twice a year; nothing downstream depends on the exact minute.
+name: curate
+
+on:
+  schedule:
+    - cron: "0 12 * * 1"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "How many candidates to write"
+        required: false
+        default: ""
+
+concurrency:
+  group: curate
+  cancel-in-progress: false
+
+jobs:
+  curate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run curate
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python jobs/curate.py ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}

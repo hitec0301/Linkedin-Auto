@@ -1,0 +1,26 @@
+# Secrets. Nothing here ever belongs in the repo.
+.env
+.env.*
+!.env.example
+.secrets/
+*service-account*.json
+*service_account*.json
+*-sa.json
+credentials.json
+client_secret*.json
+linkedin_tokens.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/

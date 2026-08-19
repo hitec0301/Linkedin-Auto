@@ -1,0 +1,159 @@
+# LinkedIn L&D publishing pipeline — configuration.
+# Secrets live in the environment, never here.
+
+sheet:
+  # Tab names. Changing one means renaming the tab in the Sheet too.
+  pipeline_tab: Pipeline
+  history_tab: History
+  feedback_tab: Feedback
+  amendments_tab: VoiceAmendments
+  config_tab: Config
+  # Rows older than this are moved from Pipeline to History. Nothing is deleted.
+  archive_after_days: 90
+
+ingest:
+  lookback_days: 7
+  # Hard cap before any LLM call. Scoring 200 items costs pennies; scoring an
+  # unbounded feed dump does not.
+  max_items: 200
+  # Per-feed cap, applied before the global cap so one prolific feed cannot
+  # crowd out the rest.
+  max_items_per_feed: 40
+  # rapidfuzz token_set_ratio threshold. Four outlets covering one story is the
+  # normal failure here, not the exception.
+  fuzzy_threshold: 85
+  # How far back through Sheet history to compare titles.
+  history_days: 90
+  request_timeout_seconds: 20
+  # arXiv is high volume and mostly irrelevant; keep only education-adjacent work.
+  education_terms:
+    - education
+    - learning
+    - teaching
+    - student
+    - classroom
+    - curriculum
+    - pedagog
+    - instruction
+    - training
+    - tutor
+    - assessment
+    - university
+    - school
+    - course
+    - MOOC
+    - literacy
+    - skill
+  sources:
+    rss: true
+    # Both default off. Turning one on is a deliberate act with its own setup.
+    gmail_label: false
+    web_search: false
+  gmail:
+    label: LNP-Sources
+    max_messages: 50
+
+scoring:
+  model: claude-sonnet-4-6
+  max_tokens: 8000
+  # Items sent to the scoring model in one call.
+  batch_size: 40
+  candidates: 10
+  # Tier 1 is what everyone in this space read this morning. The differentiated
+  # take comes from tiers 2 and 3, so the weights push against the news cycle.
+  tier_weights:
+    1: 0.7
+    2: 1.0
+    3: 1.3
+  # Quotas are filled before any top-up by score. Without this, an AI-heavy news
+  # week yields ten AI candidates.
+  quotas:
+    audience:
+      AUD_CORPORATE: 0.5
+      AUD_ACADEMIC: 0.5
+    theme:
+      THM_AI: 0.4
+      THM_PLATFORM: 0.2
+      THM_DELIVERY: 0.2
+      THM_STRATEGY: 0.2
+
+drafting:
+  model: claude-sonnet-4-6
+  max_tokens: 4000
+  temperature: 1.0
+  min_chars: 900
+  max_chars: 1300
+  # LinkedIn truncates near 210 characters. The first two lines have to carry
+  # the hook and the claim on their own.
+  hook_chars: 210
+  max_hashtags: 3
+  # Two variants while the human is still calibrating the voice card.
+  variants_until_post: 20
+  max_revisions: 3
+  # Article extraction cap. Beyond this the model is paying for boilerplate.
+  extract_max_chars: 8000
+  fetch_timeout_seconds: 20
+  user_agent: "lnp-pipeline/1.0 (+https://github.com/hitec0301/Linkedin-Auto)"
+
+voice:
+  card_path: config/voice_card.md
+  model: claude-sonnet-4-6
+  max_tokens: 4000
+  # Retrieval of published posts as few-shot examples starts once there is a
+  # corpus worth retrieving from.
+  retrieval_min_posts: 20
+  retrieval_examples: 8
+  # The same instruction three times across different posts means the system is
+  # not learning. That gets flagged and alerted, not quietly re-proposed.
+  recurrence_threshold: 3
+  max_proposals_per_run: 5
+
+publish:
+  # Leave this on for two weeks. It logs the exact payload and posts nothing.
+  dry_run: true
+  # A row more than this many hours past ScheduledFor expires unpublished. A
+  # four-day-old take is worse than no post.
+  staleness_hours: 48
+  # Posts per run. The pipeline targets 3-4 posts a week, not a burst.
+  max_posts_per_run: 1
+  api_base: https://api.linkedin.com
+  api_version: "202605"
+  request_timeout_seconds: 30
+
+schedule:
+  timezone: America/New_York
+  # Slots assigned to newly drafted rows, in local time.
+  slots:
+    - {day: Tue, time: "08:30"}
+    - {day: Wed, time: "08:30"}
+    - {day: Thu, time: "08:30"}
+    - {day: Fri, time: "08:30"}
+
+tokens:
+  # file (chmod 600, local) or gist (private Gist, CI). A GitHub Actions run
+  # cannot write back to its own repository secrets, hence the Gist.
+  backend: file
+  file_path: .secrets/linkedin_tokens.json
+  gist_filename: linkedin_tokens.json
+  # Refresh the access token this many days before it expires.
+  refresh_within_days: 7
+  # Alert when the refresh token has this long left. Re-running the OAuth
+  # bootstrap is a two-minute job; discovering it expired is a dead pipeline.
+  refresh_token_warn_days: 30
+
+health:
+  # Below this, the pipeline is costing more editing time than it saves.
+  clean_publish_floor: 0.5
+  evaluate_after_days: 30
+  window: 10
+
+alerts:
+  # Slack first, SMTP fallback, always a structured log line.
+  slack: true
+  email: false
+  smtp:
+    host: ""
+    port: 587
+    use_tls: true
+    from_addr: ""
+    to_addr: ""

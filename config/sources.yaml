@@ -1,0 +1,112 @@
+# Source feeds, in three tiers.
+#
+# The weight is applied to the model's relevance score. Tier 1 is what everyone
+# in this space already read this morning, so it is discounted; the
+# differentiated take comes from tiers 2 and 3.
+#
+#   verify: true   -> the feed URL is not confirmed. Run
+#                     `python scripts/validate_sources.py` and fix or disable it.
+#   ingest: gmail  -> publishes by email only. Not an RSS feed; route it through
+#                     a Gmail label (ingest.sources.gmail_label must be on).
+#   enabled: false -> ignored by every job.
+
+tiers:
+  tier_1:
+    name: News
+    weight: 0.7
+    feeds:
+      - name: EdSurge
+        url: https://www.edsurge.com/articles_rss
+      - name: Inside Higher Ed
+        url: https://www.insidehighered.com/rss.xml
+      - name: The 74
+        url: https://www.the74million.org/feed
+      - name: eSchool News
+        url: https://www.eschoolnews.com/feed
+      - name: KQED MindShift
+        url: https://ww2.kqed.org/mindshift/feed
+      - name: Learning News
+        url: https://learningnews.com/news/rss.xml
+        verify: true
+
+  tier_2:
+    name: Analysts and practitioner-researchers
+    weight: 1.0
+    feeds:
+      - name: Josh Bersin
+        url: https://joshbersin.com/feed/
+        verify: true
+      - name: Philippa Hardman
+        url: https://drphilippahardman.substack.com/feed
+        verify: true
+      - name: Donald Clark Plan B
+        url: https://donaldclarkplanb.blogspot.com/feeds/posts/default?alt=rss
+        verify: true
+      - name: Stephen Downes OLDaily
+        url: https://downes.ca/news/OLDaily.xml
+        verify: true
+      - name: Ethan Mollick — One Useful Thing
+        url: https://www.oneusefulthing.org/feed
+        verify: true
+      - name: RedThread Research
+        url: https://redthreadresearch.com/feed/
+        verify: true
+      # Fosway and HolonIQ distribute by newsletter rather than a public feed.
+      # Subscribe with the pipeline's Gmail address and label the messages.
+      - name: Fosway Group
+        url: ""
+        ingest: gmail
+        gmail_from: fosway.com
+        enabled: false
+      - name: HolonIQ
+        url: ""
+        ingest: gmail
+        gmail_from: holoniq.com
+        enabled: false
+
+  tier_3:
+    name: Primary sources
+    weight: 1.3
+    feeds:
+      # arXiv is high volume and mostly not about education; these two are
+      # filtered against ingest.education_terms before anything else happens.
+      - name: arXiv cs.CY
+        url: https://rss.arxiv.org/rss/cs.CY
+        education_filter: true
+        verify: true
+      - name: arXiv cs.HC
+        url: https://rss.arxiv.org/rss/cs.HC
+        education_filter: true
+        verify: true
+      - name: OECD Education
+        url: https://www.oecd.org/en/topics/education-and-skills.xml
+        verify: true
+      - name: UNESCO Education
+        url: https://www.unesco.org/en/rss/education.xml
+        verify: true
+      - name: Anthropic News
+        url: https://www.anthropic.com/news/rss.xml
+        verify: true
+      - name: OpenAI Blog
+        url: https://openai.com/news/rss.xml
+        verify: true
+      - name: Google DeepMind Blog
+        url: https://deepmind.google/blog/rss.xml
+        verify: true
+      # Public earnings material. Slow-moving, but a quarterly transcript is a
+      # primary source nobody else in the feed is reading.
+      - name: Coursera Investor Relations
+        url: https://investor.coursera.com/rss/news-releases.xml
+        verify: true
+      - name: Duolingo Investor Relations
+        url: https://investors.duolingo.com/rss/news-releases.xml
+        verify: true
+      - name: Instructure Investor Relations
+        url: https://ir.instructure.com/rss/news-releases.xml
+        verify: true
+      - name: Docebo Investor Relations
+        url: https://investors.docebo.com/rss/news-releases.xml
+        verify: true
+      - name: 2U Investor Relations
+        url: https://investors.2u.com/rss/news-releases.xml
+        verify: true

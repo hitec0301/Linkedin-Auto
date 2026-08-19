@@ -1,0 +1,29 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run the test suite
+        run: python -m pytest -v
+      - name: Check the config files parse
+        run: |
+          python -c "
+          import sys; sys.path.insert(0, 'src')
+          from lnp.config import load_config, load_sources
+          c = load_config(); s = load_sources()
+          print(f'config ok, {len(s)} sources configured')
+          assert c.dry_run is True, 'ship with dry_run on'
+          "
