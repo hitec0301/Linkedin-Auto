@@ -241,6 +241,24 @@ and never deletes your rows.
 | `404` / `Requested entity was not found` | `SHEET_ID` is wrong | It is only the part between `/d/` and `/edit`, not the whole URL |
 | Newly enabled API still 403s | Enabling propagates for a minute or two | Wait sixty seconds and re-run `--check` |
 
+Two failures that happen before the script reaches Google at all:
+
+| What you see | What it means | Fix |
+|---|---|---|
+| `TypeError: Metaclasses with custom tp_new are not supported` from `yaml/_yaml` | A PyYAML built from source with an old Cython, which cannot import on Python 3.12. Usually a stale wheel in pip's cache | `pip install --upgrade --force-reinstall --no-cache-dir --only-binary :all: "PyYAML>=6.0.2"` |
+| `ModuleNotFoundError: No module named 'lnp'` | Run from the repo root, not from inside `scripts/` | `cd` to the repo root and use `python scripts/setup_sheet.py` |
+
+If the PyYAML fix does not take, the venv itself is probably carrying older
+builds. Rebuilding it is quick and reliable:
+
+```bash
+deactivate; rm -rf .venv
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
+pip install --no-cache-dir -r requirements.txt
+pytest
+```
+
 That creates the five tabs (`Pipeline`, `History`, `Feedback`,
 `VoiceAmendments`, `Config`) with headers, a frozen bold header row, the Status
 enum as data validation, a `Selected` checkbox, per-status row colouring, and
