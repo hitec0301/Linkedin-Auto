@@ -247,6 +247,7 @@ Two failures that happen before the script reaches Google at all:
 |---|---|---|
 | `TypeError: Metaclasses with custom tp_new are not supported` from `yaml/_yaml` | A PyYAML built from source with an old Cython, which cannot import on Python 3.12. Usually a stale wheel in pip's cache | Upgrade pip first, then reinstall (below) |
 | `ModuleNotFoundError: No module named 'yaml'` right after trying that fix | The reinstall uninstalled the old copy and then failed to install the new one | Same fix — it is safe to re-run |
+| Any `pip` command tracebacks inside `pip/_vendor/packaging`, e.g. `InvalidVersion: Invalid version: '0.dev0'` | pip's own install is broken or half-upgraded, so it cannot install anything at all | Rebuild the venv (below). Do not try to fix pip with pip |
 | `ModuleNotFoundError: No module named 'lnp'` | Run from the repo root, not from inside `scripts/` | `cd` to the repo root and use `python scripts/setup_sheet.py` |
 
 For either of those two, upgrade pip before reinstalling. An old pip is the
@@ -264,16 +265,27 @@ the active venv. Avoid `--only-binary :all:` here: if it cannot match a wheel
 it fails outright, and combined with `--force-reinstall` that removes the
 working copy before discovering it has nothing to replace it with.
 
-If that still does not take, the venv is carrying other stale builds.
-Rebuilding is quick and reliable:
+### Rebuilding the venv
+
+The fix for anything environment-shaped — a broken pip, a C extension that will
+not import, packages that never installed. It takes a minute and discards
+nothing you care about: the venv holds no configuration, only downloaded
+packages.
 
 ```bash
-deactivate; rm -rf .venv
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install --upgrade pip
-pip install --no-cache-dir -r requirements.txt
+deactivate                     # ignore "command not found" if it is not active
+rm -rf .venv
+python3.12 -m venv --upgrade-deps .venv
+source .venv/bin/activate
+python -m pip install --no-cache-dir -r requirements.txt
 pytest
 ```
+
+`--upgrade-deps` gives the new venv a current pip and setuptools up front,
+rather than the older pair bundled with your Python. That matters because a
+broken pip cannot repair itself — `pip install --upgrade pip` needs a working
+pip to run. Building a new venv sidesteps it entirely: the pip inside comes
+from Python's own bundled wheel, not from the broken copy.
 
 That creates the five tabs (`Pipeline`, `History`, `Feedback`,
 `VoiceAmendments`, `Config`) with headers, a frozen bold header row, the Status
