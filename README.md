@@ -87,17 +87,159 @@ pytest                      # should be green before you go further
 
 ### 2. Google Sheet
 
-1. Create a new Google Sheet. Copy its id from the URL:
-   `docs.google.com/spreadsheets/d/`**`<SHEET_ID>`**`/edit`
-2. In Google Cloud Console: create a project, enable the **Google Sheets API**,
-   create a **service account**, and download a JSON key.
-3. Share the Sheet with the service account's `client_email` as an **Editor**.
-   This is the step people forget; without it every job fails with a 403.
-4. Put the key path and sheet id in `.env`, then:
+The pipeline reads and writes one Google Sheet. It does that as a **service
+account** — a robot Google account with its own email address, which you invite
+to your sheet exactly like you would invite a colleague. That is the whole
+mental model: everything below is either creating that robot, or introducing it
+to your sheet.
+
+Budget fifteen minutes. Nothing here costs money.
+
+#### 2a. Create the sheet and copy its id
+
+Go to [sheets.new](https://sheets.new). That creates an empty sheet. Give it a
+name — "LinkedIn pipeline" — so you can find it later.
+
+Now look at the address bar. The URL is:
+
+```
+https://docs.google.com/spreadsheets/d/1a2B3cD4eFgHiJkLmNoPqRsTuVwXyZ_example/edit#gid=0
+                                       └──────────── this part is the id ────┘
+```
+
+The id is the long string between `/d/` and `/edit`. It is around 44
+characters, letters and numbers with the odd dash or underscore. Copy it
+somewhere; you need it in step 2e.
+
+#### 2b. Create a Google Cloud project
+
+Go to [console.cloud.google.com](https://console.cloud.google.com). First time
+in, it may ask you to accept terms and pick a country. There is no billing
+setup and no credit card for what we are doing.
+
+At the top of the page, next to the "Google Cloud" logo, is a project picker —
+it either says "Select a project" or shows a project name. Click it, then click
+**New Project** at the top right of the dialog.
+
+Name it something like `linkedin-pipeline`. Leave "Location" as "No
+organisation". Click **Create**, then wait a few seconds and make sure the
+project picker at the top now shows your new project. If it still shows
+something else, click the picker and select the one you just made — every step
+after this applies to whichever project is selected.
+
+#### 2c. Turn on the Sheets API
+
+In the search bar at the top, type `Google Sheets API` and pick it out of the
+results (it appears under "Marketplace" or "APIs & Services"). You will land on
+a page with a blue **Enable** button. Click it. Wait for the page to reload
+into the API's dashboard.
+
+That is the only API this pipeline needs. It never touches Google Drive: the
+sheet is opened directly by its id rather than searched for by name, so there
+is no Drive permission to grant and no second API to enable.
+
+#### 2d. Create the service account and download its key
+
+In the left sidebar go to **APIs & Services** → **Credentials**. (No sidebar?
+Click the hamburger menu at the top left.)
+
+1. Click **+ Create Credentials** at the top, then **Service account**.
+2. **Service account name**: `lnp-pipeline`. The account id fills itself in.
+   Click **Create and Continue**.
+3. **Grant this service account access to project** — *skip this*. Click
+   **Continue**. This trips people up because it looks required. It is not, and
+   it is genuinely not needed: those roles control access to Google Cloud
+   resources, whereas access to your sheet comes from sharing the sheet in the
+   next step. An account with no roles at all is exactly right here.
+4. **Grant users access to this service account** — skip it too. Click **Done**.
+
+You are back on the Credentials page with your service account listed under
+"Service Accounts". Now get its key:
+
+1. Click the service account's email to open it.
+2. Open the **Keys** tab.
+3. **Add Key** → **Create new key** → choose **JSON** → **Create**.
+
+A `.json` file downloads immediately. **This file is a password.** Anyone
+holding it can act as this account. It is shown to you exactly once — if you
+lose it you delete the key and create another.
+
+Move it into the repo's gitignored secrets folder:
+
+```bash
+mkdir -p .secrets
+mv ~/Downloads/linkedin-pipeline-*.json .secrets/service-account.json
+chmod 600 .secrets/service-account.json
+```
+
+(Adjust the download filename — it is your project name plus a random suffix.)
+`.secrets/` is already in `.gitignore`, so it will not be committed.
+
+#### 2e. Share the sheet with the service account
+
+Open the JSON file and find the `client_email` line:
+
+```bash
+grep client_email .secrets/service-account.json
+```
+
+It looks like `lnp-pipeline@linkedin-pipeline-123456.iam.gserviceaccount.com`.
+
+Now open your Google Sheet, click the green **Share** button at the top right,
+paste that address in, and set the role to **Editor** — not Viewer, not
+Commenter; the pipeline writes to the sheet. Untick **Notify people** (it is
+not a real mailbox and the mail bounces). Click **Share**.
+
+**This is the step people skip, and it is why the first run 403s.** Enabling
+the API in step 2c grants nothing on its own — it only makes the API callable.
+The sheet is still private until you share it, the same as any document.
+
+#### 2f. Fill in `.env` and verify
+
+Open `.env` and set two values:
+
+```bash
+GOOGLE_SA_JSON=.secrets/service-account.json
+SHEET_ID=1a2B3cD4eFgHiJkLmNoPqRsTuVwXyZ_example
+```
+
+`GOOGLE_SA_JSON` takes either a path to that file (what you want locally) or
+the entire JSON pasted on one line (what you will use for GitHub Actions
+later). Both work; the code checks whether the value is a readable path first.
+
+Check the wiring before changing anything:
+
+```bash
+python scripts/setup_sheet.py --check
+```
+
+It prints the service account address, the project, the sheet id, and the tabs
+it can see — or it tells you which of the three usual problems you have. When
+it says access is working, build the tabs:
 
 ```bash
 python scripts/setup_sheet.py
 ```
+
+That creates `Pipeline`, `History`, `Feedback`, `VoiceAmendments` and `Config`,
+with headers, a frozen bold header row, the Status enum as a dropdown, a
+`Selected` checkbox, per-status row colouring, and text wrapping on the long
+columns. Refresh the sheet in your browser and you should see all five tabs.
+
+It is idempotent — run it again any time the sheet looks wrong, and after any
+upgrade that changes the columns. It repairs headers and formatting in place
+and never deletes your rows.
+
+#### If something fails
+
+| What you see | What it means | Fix |
+|---|---|---|
+| `missing required secret GOOGLE_SA_JSON` | `.env` is missing or the line is not filled in | Check you are in the repo root and `.env` exists (`cp .env.example .env`) |
+| `GOOGLE_SA_JSON is neither a readable file path nor valid JSON` | The path is wrong | `ls -l .secrets/` — the path in `.env` is relative to the repo root |
+| `403 ... PERMISSION_DENIED` or `The caller does not have permission` | The sheet was never shared with the service account | Step 2e. Check you pasted the `client_email`, not your own address |
+| `Google Sheets API has not been used in project ... or it is disabled` | Step 2c was skipped, or you enabled it on a different project | Enable the Sheets API on the project the key belongs to — the `project_id` in the JSON file |
+| `404` / `Requested entity was not found` | `SHEET_ID` is wrong | It is only the part between `/d/` and `/edit`, not the whole URL |
+| Newly enabled API still 403s | Enabling propagates for a minute or two | Wait sixty seconds and re-run `--check` |
 
 That creates the five tabs (`Pipeline`, `History`, `Feedback`,
 `VoiceAmendments`, `Config`) with headers, a frozen bold header row, the Status
@@ -361,6 +503,7 @@ tests/test_pipeline.py  every invariant above, with the network mocked
 ### Local commands
 
 ```bash
+python scripts/setup_sheet.py --check   # verify Google access, change nothing
 python scripts/setup_sheet.py           # create or repair the Sheet
 python scripts/validate_sources.py      # per-feed status, non-zero if any is dead
 python scripts/oauth_bootstrap.py       # one-time LinkedIn OAuth

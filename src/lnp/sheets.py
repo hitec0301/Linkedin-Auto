@@ -33,10 +33,9 @@ from .util import iso, parse_dt, utcnow
 
 logger = log.get(__name__)
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
-]
+# Sheets only. Nothing here touches the Drive API: the sheet is opened by id,
+# never searched for by name, so a Drive scope would be permission we never use.
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 HISTORY_COLUMNS: List[str] = COLUMNS + ["ArchivedAt"]
 

@@ -292,8 +292,74 @@ def seed_config(ws) -> None:
         logger.info("seeded config keys", extra={"keys": [r[0] for r in missing]})
 
 
+def check() -> int:
+    """Verify access and explain what is wrong, without changing anything.
+
+    Almost every first-run problem is one of three things: the API is not
+    enabled, the sheet was never shared with the service account, or the sheet
+    id is wrong. Each returns a different error, so name them separately rather
+    than making somebody read a stack trace.
+    """
+    from lnp.config import google_credentials_info, require_env
+
+    try:
+        info = google_credentials_info()
+    except Exception as exc:  # noqa: BLE001 - this is the diagnostic path
+        print(f"GOOGLE_SA_JSON is not usable: {exc}")
+        print("It must be either a path to the downloaded key file, or the JSON itself.")
+        return 1
+
+    email = info.get("client_email", "?")
+    print(f"service account: {email}")
+    print(f"project:         {info.get('project_id', '?')}")
+
+    try:
+        sheet_id = require_env("SHEET_ID")
+    except Exception as exc:  # noqa: BLE001 - this is the diagnostic path
+        print(exc)
+        return 1
+    print(f"sheet id:        {sheet_id}")
+
+    config = load_config()
+    try:
+        sheets = Sheets.open(config)
+        titles = [ws.title for ws in sheets.ss.worksheets()]
+    except Exception as exc:  # noqa: BLE001 - this is the diagnostic path
+        text = str(exc)
+        print(f"\nCannot open the sheet.\n{text[:500]}\n")
+        if "has not been used in project" in text or "SERVICE_DISABLED" in text:
+            print(
+                "The Google Sheets API is not enabled on this project.\n"
+                "  Cloud console -> APIs & Services -> Library -> Google Sheets API -> Enable"
+            )
+        elif "PERMISSION_DENIED" in text or "403" in text:
+            print(
+                "The service account cannot see this sheet. Open the sheet, click\n"
+                f"Share, and add this address as an Editor:\n\n    {email}\n\n"
+                "Untick 'Notify people' - it is not a real mailbox."
+            )
+        elif "404" in text or "not found" in text.lower():
+            print(
+                "No sheet with that id. SHEET_ID is the part of the URL between\n"
+                "  /spreadsheets/d/   and   /edit"
+            )
+        return 1
+
+    print(f"tabs:            {', '.join(titles) if titles else '(none yet)'}")
+    print("\nAccess is working. Run without --check to create or repair the tabs.")
+    return 0
+
+
 def main() -> int:
-    argparse.ArgumentParser(description=__doc__).parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check", action="store_true",
+        help="verify access and exit without changing the sheet",
+    )
+    args = parser.parse_args()
+    if args.check:
+        return check()
+
     config = load_config()
     sheets = Sheets.open(config)
     ss = sheets.ss
