@@ -397,7 +397,19 @@ if [ -f .env ]; then
     "" | *...*) ;;
     "{"*) ok "GOOGLE_SA_JSON holds inline JSON" ;;
     *) if [ -f "$sa" ]; then ok "key file exists at $sa"
-       else bad "GOOGLE_SA_JSON points at $sa, which does not exist"; note_problem; fi ;;
+       else
+         bad "GOOGLE_SA_JSON points at $sa, which does not exist"
+         found=$(ls -t "$HOME"/Downloads/*.json 2>/dev/null | head -3)
+         if [ -n "$found" ]; then
+           echo "       JSON files in ~/Downloads that might be the key:"
+           echo "$found" | sed 's/^/         /'
+           echo "       Move the right one into place:"
+           echo "         mkdir -p .secrets && mv <that file> $sa && chmod 600 $sa"
+         else
+           echo "       Download it from the Cloud console - README section 2d."
+         fi
+         note_problem
+       fi ;;
   esac
 else
   warn ".env not found - run: cp .env.example .env"
@@ -412,8 +424,11 @@ head_ "Google Sheets access"
 head_ "Summary"
 # --------------------------------------------------------------------------
 if [ "$PROBLEMS" -eq 0 ]; then
-  echo "  The Python environment is healthy."
+  echo "  The Python environment is healthy. Activate it before using python:"
   echo "      source .venv/bin/activate"
+  echo
+  echo "  Or run commands without activating, via the venv directly:"
+  echo "      .venv/bin/python scripts/setup_sheet.py --check"
   echo
   echo "  Anything under 'Google Sheets access' is about credentials, not the"
   echo "  install - see README section 2."
