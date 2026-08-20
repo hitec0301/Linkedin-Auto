@@ -68,9 +68,12 @@ def fetch_extract(config: Config, url: str) -> Extract:
         logger.warning("extraction failed", extra={"url": url, "error": str(exc)})
         return Extract("", False, f"could not fetch the article ({type(exc).__name__})")
 
+    # lxml is faster and handles broken markup better, but it is an optional
+    # dependency: it needs a C build where no wheel matches, and the stdlib
+    # parser is a perfectly adequate fallback for pulling text out of a page.
     try:
         soup = BeautifulSoup(response.content, "lxml")
-    except Exception:  # noqa: BLE001 - lxml can reject malformed markup
+    except Exception:  # noqa: BLE001 - not installed, or it rejected the markup
         soup = BeautifulSoup(response.content, "html.parser")
     for tag in soup(STRIP_TAGS):
         tag.decompose()

@@ -13,5 +13,13 @@ python-dateutil>=2.9.0
 PyYAML>=6.0.2
 ulid-py>=1.1.0
 beautifulsoup4>=4.12.0
-lxml>=5.2.0
+
+# lxml is optional and deliberately not required. It is a faster, more
+# forgiving HTML parser, but it is a C extension that has to compile when no
+# wheel matches your platform, and a failed lxml build aborts the whole
+# `pip install -r requirements.txt` — taking every other package down with it.
+# drafting.fetch_extract falls back to the stdlib html.parser when lxml is
+# absent, and the test suite passes either way. Install it if you want it:
+#
+#     pip install lxml
 pytest>=8.0.0
