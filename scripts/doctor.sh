@@ -16,20 +16,70 @@ FIX=0
 
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$(pwd)
+VENV_PY="$ROOT/.venv/bin/python"
 
-ok()   { printf "  ok   %s\n" "$1"; }
-warn() { printf "  --   %s\n" "$1"; }
-bad()  { printf "  FAIL %s\n" "$1"; }
+ok()    { printf "  ok   %s\n" "$1"; }
+warn()  { printf "  --   %s\n" "$1"; }
+bad()   { printf "  FAIL %s\n" "$1"; }
 head_() { printf "\n== %s\n" "$1"; }
 
 PROBLEMS=0
 note_problem() { PROBLEMS=$((PROBLEMS + 1)); }
 
+MODULES="yaml gspread anthropic feedparser rapidfuzz bs4 ulid dateutil requests"
+
+# Import name -> distribution name, for the ones that differ.
+dist_for() {
+  case "$1" in
+    yaml)     echo "PyYAML" ;;
+    bs4)      echo "beautifulsoup4" ;;
+    dateutil) echo "python-dateutil" ;;
+    ulid)     echo "ulid-py" ;;
+    *)        echo "$1" ;;
+  esac
+}
+
+# Report which modules fail AND why. "Missing or broken" without the exception
+# is the difference between diagnosing this in one run and in five.
+FAILED_MODULES=""
+check_imports() {
+  FAILED_MODULES=""
+  for module in $MODULES; do
+    if err=$("$VENV_PY" -c "import $module" 2>&1); then
+      :
+    else
+      FAILED_MODULES="$FAILED_MODULES $module"
+      if [ "${1:-quiet}" = "verbose" ]; then
+        printf "       %-12s %s\n" "$module" "$(echo "$err" | tail -1)"
+      fi
+    fi
+  done
+  [ -z "$FAILED_MODULES" ]
+}
+
+# Fetch a current pip straight from PyPI using stdlib urllib, then run it off
+# sys.path. A pip wheel is executable that way, so replacing a bad or ancient
+# pip never asks that pip to do the work.
+bootstrap_pip() {
+  printf "  fetching a current pip from PyPI (no pip involved)...\n"
+  rm -rf "$ROOT/.venv"
+  "$BASE_PY" -m venv --without-pip "$ROOT/.venv" || return 1
+  "$VENV_PY" - <<'BOOTSTRAP' 2>/tmp/lnp_boot_err
+import json, os, subprocess, sys, tempfile, urllib.request
+meta = json.load(urllib.request.urlopen("https://pypi.org/pypi/pip/json", timeout=60))
+url = next(u["url"] for u in meta["urls"] if u["packagetype"] == "bdist_wheel")
+dest = os.path.join(tempfile.mkdtemp(), url.rsplit("/", 1)[-1])
+urllib.request.urlretrieve(url, dest)
+sys.exit(subprocess.call([sys.executable, os.path.join(dest, "pip"),
+                          "install", "--no-cache-dir", "--quiet", dest]))
+BOOTSTRAP
+}
+
 # --------------------------------------------------------------------------
 head_ "Where we are"
 # --------------------------------------------------------------------------
 printf "  repo    %s\n" "$ROOT"
-printf "  os      %s %s\n" "$(uname -s)" "$(uname -r)"
+printf "  os      %s %s\n" "$(uname -s)" "$(uname -m)"
 
 if [ -f requirements.txt ] && [ -d src/lnp ]; then
   ok "this is the project root"
@@ -37,12 +87,7 @@ else
   bad "requirements.txt or src/lnp is missing - are you in the right folder?"
   exit 1
 fi
-
-if [ -n "${VIRTUAL_ENV:-}" ]; then
-  printf "  venv    active: %s\n" "$VIRTUAL_ENV"
-else
-  printf "  venv    not active in this shell\n"
-fi
+[ -n "${VIRTUAL_ENV:-}" ] && printf "  venv    active: %s\n" "$VIRTUAL_ENV"
 
 # --------------------------------------------------------------------------
 head_ "Python interpreters available"
@@ -56,150 +101,150 @@ for candidate in python3.12 python3.13 python3.11 python3; do
   fi
 done
 
-printf "\n  base interpreter pip:\n"
-if BASE_PIP=$("${BASE_PY:-python3}" -m pip --version 2>&1 | tail -1); then
-  printf "    %s\n" "$BASE_PIP"
-else
-  printf "    BROKEN: %s\n" "$(echo "$BASE_PIP" | tail -1)"
-  printf "    Your Python installation itself has a damaged pip, so every venv\n"
-  printf "    it seeds starts broken. This script works around it below.\n"
-fi
-printf "  environment that can shadow packages:\n"
-printf "    PYTHONPATH=[%s] PIP_TARGET=[%s] PIP_CONFIG_FILE=[%s]\n" \
-  "${PYTHONPATH:-}" "${PIP_TARGET:-}" "${PIP_CONFIG_FILE:-}"
-
 if [ -z "$BASE_PY" ]; then
   bad "no usable python3 found on PATH"
-  echo
-  echo "  Install Python 3.12:  brew install python@3.12"
-  echo "  (or from python.org). Then re-run this script."
+  echo "      brew install python@3.12   (or install from python.org)"
   exit 1
 fi
 ok "using $BASE_PY to build the venv"
 
+BASE_VERSION=$("$BASE_PY" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')
+case "$BASE_VERSION" in
+  3.12.0|3.12.1|3.12.2)
+    warn "$BASE_VERSION is an early 3.12 release; several C extensions did not"
+    warn "have matching wheels until later 3.12.x. If packages fail to build"
+    warn "below, updating Python is the durable fix." ;;
+esac
+
+printf "  base pip: %s\n" "$("$BASE_PY" -m pip --version 2>&1 | tail -1)"
+printf "  shadowing env: PYTHONPATH=[%s] PIP_TARGET=[%s] PIP_CONFIG_FILE=[%s]\n" \
+  "${PYTHONPATH:-}" "${PIP_TARGET:-}" "${PIP_CONFIG_FILE:-}"
+
 # --------------------------------------------------------------------------
 head_ "Current venv health"
 # --------------------------------------------------------------------------
-VENV_PY="$ROOT/.venv/bin/python"
 VENV_BROKEN=0
-
 if [ ! -x "$VENV_PY" ]; then
-  warn "no .venv yet (or it has no python)"
+  warn "no .venv yet"
   VENV_BROKEN=1
 else
   ok ".venv exists"
   if PIP_OUT=$("$VENV_PY" -m pip --version 2>&1); then
     ok "pip works: $PIP_OUT"
   else
-    bad "pip is broken - it cannot even report its own version"
-    echo "$PIP_OUT" | tail -3 | sed 's/^/       /'
-    echo "       A broken pip cannot install anything, including a new pip."
-    echo "       Rebuilding the venv is the only fix."
+    bad "pip is broken - it cannot report its own version"
+    echo "$PIP_OUT" | tail -2 | sed 's/^/       /'
     VENV_BROKEN=1
     note_problem
   fi
-
-  MISSING=""
-  for module in yaml gspread anthropic feedparser rapidfuzz bs4 ulid dateutil requests; do
-    "$VENV_PY" -c "import $module" >/dev/null 2>&1 || MISSING="$MISSING $module"
-  done
-  if [ -z "$MISSING" ]; then
+  if check_imports verbose; then
     ok "all required packages import"
   else
-    bad "packages missing or broken:$MISSING"
+    bad "these do not import:$FAILED_MODULES"
     VENV_BROKEN=1
     note_problem
   fi
 fi
 
-# --------------------------------------------------------------------------
 if [ "$VENV_BROKEN" -eq 1 ] && [ "$FIX" -eq 0 ]; then
   head_ "What to do"
-  echo "  The environment needs rebuilding. Re-run with --fix:"
+  echo "  Re-run with --fix:"
   echo
   echo "      bash scripts/doctor.sh --fix"
-  echo
-  echo "  That deletes .venv and builds a fresh one. Nothing else is touched -"
-  echo "  a venv holds only downloaded packages, no configuration of yours."
   exit 1
 fi
 
+# --------------------------------------------------------------------------
 if [ "$FIX" -eq 1 ]; then
   head_ "Rebuilding the venv"
-  rm -rf "$ROOT/.venv"
-  ok "removed the old .venv"
 
-  # Deliberately NOT --upgrade-deps. That makes pip upgrade itself in place,
-  # and an interrupted in-place self-upgrade leaves pip/_vendor/packaging with
-  # files from two versions mixed together - which is a pip that cannot run at
-  # all, in a venv that was brand new. If the seeded pip needs replacing we do
-  # it below, from a clean wheel, without asking the broken pip to do the work.
-  if ! "$BASE_PY" -m venv "$ROOT/.venv" 2>/tmp/lnp_venv_err; then
-    bad "could not create the venv"
-    sed 's/^/       /' /tmp/lnp_venv_err
-    exit 1
-  fi
+  # Deliberately not --upgrade-deps: that makes pip upgrade itself in place,
+  # and an interrupted in-place self-upgrade leaves pip/_vendor/packaging
+  # holding files from two versions, which is a pip that cannot run at all.
+  rm -rf "$ROOT/.venv"
+  "$BASE_PY" -m venv "$ROOT/.venv" 2>/tmp/lnp_venv_err || {
+    bad "could not create the venv"; sed 's/^/       /' /tmp/lnp_venv_err; exit 1; }
   ok "created a new venv"
 
-  NEED_BOOTSTRAP=0
+  NEED_PIP=0
   if [ "${LNP_FORCE_PIP_BOOTSTRAP:-0}" = "1" ]; then
-    warn "LNP_FORCE_PIP_BOOTSTRAP is set - bootstrapping pip from PyPI"
-    NEED_BOOTSTRAP=1
+    warn "LNP_FORCE_PIP_BOOTSTRAP set"
+    NEED_PIP=1
   elif PIP_OUT=$("$VENV_PY" -m pip --version 2>&1); then
-    ok "seeded pip works: $PIP_OUT"
+    PIP_MAJOR=$(echo "$PIP_OUT" | awk '{print $2}' | cut -d. -f1)
+    if [ "${PIP_MAJOR:-0}" -lt 24 ] 2>/dev/null; then
+      # Python 3.12.0 seeds pip 23.1.2, which predates current wheel metadata
+      # and can resolve to a source build where a wheel exists - producing
+      # C extensions built against the wrong toolchain, which install happily
+      # and then fail on import.
+      warn "seeded pip is old ($PIP_OUT)"
+      NEED_PIP=1
+    else
+      ok "seeded pip is current enough: $PIP_OUT"
+    fi
   else
-    bad "the freshly seeded pip is broken too"
+    bad "the freshly seeded pip is broken too - the damage is in your Python install"
     echo "$PIP_OUT" | tail -2 | sed 's/^/       /'
-    warn "this means the damage is in your Python installation, not the venv"
-    NEED_BOOTSTRAP=1
+    NEED_PIP=1
   fi
 
-  if [ "$NEED_BOOTSTRAP" -eq 1 ]; then
-    printf "  fetching a clean pip from PyPI (no pip involved)...\n"
-    rm -rf "$ROOT/.venv"
-    "$BASE_PY" -m venv --without-pip "$ROOT/.venv" || exit 1
-    if ! "$VENV_PY" - <<'BOOTSTRAP' 2>/tmp/lnp_boot_err
-import json, os, subprocess, sys, tempfile, urllib.request
-meta = json.load(urllib.request.urlopen("https://pypi.org/pypi/pip/json", timeout=60))
-url = next(u["url"] for u in meta["urls"] if u["packagetype"] == "bdist_wheel")
-dest = os.path.join(tempfile.mkdtemp(), url.rsplit("/", 1)[-1])
-urllib.request.urlretrieve(url, dest)
-# A pip wheel is runnable straight off sys.path, so this needs no working pip.
-sys.exit(subprocess.call([sys.executable, os.path.join(dest, "pip"),
-                          "install", "--no-cache-dir", "--quiet", dest]))
-BOOTSTRAP
-    then
+  if [ "$NEED_PIP" -eq 1 ]; then
+    if bootstrap_pip; then
+      ok "bootstrapped pip: $("$VENV_PY" -m pip --version 2>&1 | tail -1)"
+    else
       bad "could not bootstrap pip"
       tail -10 /tmp/lnp_boot_err | sed 's/^/       /'
-      echo "       Your Python 3.12 install is damaged. Reinstall it:"
-      echo "           brew reinstall python@3.12"
-      echo "       or download a fresh installer from python.org."
+      echo "       Reinstall Python:  brew install python@3.12"
       exit 1
     fi
-    ok "bootstrapped a clean pip: $("$VENV_PY" -m pip --version 2>&1 | tail -1)"
   fi
 
   printf "  installing dependencies (this takes a minute)...\n"
-  if ! "$VENV_PY" -m pip install --no-cache-dir -q -r requirements.txt 2>/tmp/lnp_pip_err; then
-    bad "dependency install failed"
-    tail -20 /tmp/lnp_pip_err | sed 's/^/       /'
+  if "$VENV_PY" -m pip install --no-cache-dir -r requirements.txt >/tmp/lnp_pip.log 2>&1; then
+    ok "pip install reported success"
+  else
+    bad "pip install failed"
+    tail -25 /tmp/lnp_pip.log | sed 's/^/       /'
     exit 1
   fi
-  ok "dependencies installed"
 
-  MISSING=""
-  for module in yaml gspread anthropic feedparser rapidfuzz bs4 ulid dateutil requests; do
-    "$VENV_PY" -c "import $module" >/dev/null 2>&1 || MISSING="$MISSING $module"
-  done
-  if [ -z "$MISSING" ]; then
+  if check_imports verbose; then
     ok "all packages import cleanly"
   else
-    bad "still missing after install:$MISSING"
-    exit 1
+    # Installed but not importable almost always means a C extension built
+    # from source against the wrong toolchain. Force prebuilt wheels only.
+    warn "installed, but these do not import:$FAILED_MODULES"
+    DISTS=""
+    for module in $FAILED_MODULES; do DISTS="$DISTS $(dist_for "$module")"; done
+    printf "  retrying those as prebuilt wheels only:%s\n" "$DISTS"
+    if "$VENV_PY" -m pip install --no-cache-dir --force-reinstall \
+         --only-binary :all: $DISTS >/tmp/lnp_retry.log 2>&1; then
+      ok "reinstalled from wheels"
+    else
+      bad "wheel-only reinstall failed - there may be no wheel for your Python"
+      tail -20 /tmp/lnp_retry.log | sed 's/^/       /'
+    fi
+
+    if check_imports verbose; then
+      ok "all packages import cleanly now"
+    else
+      bad "still failing:$FAILED_MODULES"
+      echo
+      echo "       Versions actually installed:"
+      for module in $FAILED_MODULES; do
+        "$VENV_PY" -m pip show "$(dist_for "$module")" 2>/dev/null \
+          | awk '/^(Name|Version|Location)/' | sed 's/^/         /'
+      done
+      echo
+      echo "       This is your Python build, not the project. $BASE_VERSION from"
+      echo "       python.org is the likely culprit. Install a current Python and"
+      echo "       re-run:"
+      echo "           brew install python@3.12"
+      echo "           bash scripts/doctor.sh --fix"
+      note_problem
+    fi
   fi
-  # Everything diagnosed above has now been rebuilt; only failures found after
-  # this point are still outstanding.
-  PROBLEMS=0
+  [ -z "$FAILED_MODULES" ] && PROBLEMS=0
 fi
 
 # --------------------------------------------------------------------------
@@ -221,29 +266,17 @@ if [ -f .env ]; then
   for key in ANTHROPIC_API_KEY GOOGLE_SA_JSON SHEET_ID LINKEDIN_CLIENT_ID; do
     value=$(grep "^$key=" .env 2>/dev/null | head -1 | cut -d= -f2-)
     case "$value" in
-      "")
-        warn "$key is empty" ;;
-      *...*)
-        # .env.example ships placeholders like sk-ant-... - a placeholder that
-        # reads as "set" is worse than an empty value, because it looks done.
-        warn "$key still holds the example placeholder" ;;
-      *)
-        ok "$key is set" ;;
+      "")     warn "$key is empty" ;;
+      *...*)  warn "$key still holds the example placeholder" ;;
+      *)      ok "$key is set" ;;
     esac
   done
-
-  # A path that points at nothing is the most common GOOGLE_SA_JSON mistake.
   sa=$(grep "^GOOGLE_SA_JSON=" .env 2>/dev/null | head -1 | cut -d= -f2-)
   case "$sa" in
     "" | *...*) ;;
     "{"*) ok "GOOGLE_SA_JSON holds inline JSON" ;;
-    *)
-      if [ -f "$sa" ]; then
-        ok "the service account key file exists at $sa"
-      else
-        bad "GOOGLE_SA_JSON points at $sa, which does not exist"
-        note_problem
-      fi ;;
+    *) if [ -f "$sa" ]; then ok "key file exists at $sa"
+       else bad "GOOGLE_SA_JSON points at $sa, which does not exist"; note_problem; fi ;;
   esac
 else
   warn ".env not found - run: cp .env.example .env"
@@ -259,12 +292,10 @@ head_ "Summary"
 # --------------------------------------------------------------------------
 if [ "$PROBLEMS" -eq 0 ]; then
   echo "  The Python environment is healthy."
-  echo
-  echo "  Activate it in your shell with:"
   echo "      source .venv/bin/activate"
   echo
-  echo "  Anything reported under 'Google Sheets access' above is about"
-  echo "  credentials, not the install - see README section 2."
+  echo "  Anything under 'Google Sheets access' is about credentials, not the"
+  echo "  install - see README section 2."
 else
   echo "  $PROBLEMS problem(s) above still need attention."
 fi
