@@ -230,12 +230,21 @@ if [ "$FIX" -eq 1 ]; then
       if [ "$SSL_BROKEN" -eq 1 ]; then
         echo
         echo "       Your Python has no CA certificates, so it cannot verify HTTPS."
-        echo "       python.org builds ship a script that installs them, and it has"
-        echo "       to be run once after installing Python:"
+        echo "       python.org builds ship a script to install them. Find it with:"
         echo
-        echo "           open \"/Applications/Python 3.12/Install Certificates.command\""
+        echo "           find /Applications /Library/Frameworks/Python.framework \\"
+        echo "                -name 'Install Certificates.command' 2>/dev/null"
         echo
-        echo "       Then re-run:  bash scripts/doctor.sh --fix"
+        echo "       If it is not there, do the same thing by hand - it only points"
+        echo "       Python at certifi's CA bundle:"
+        echo
+        echo "           $BASE_PY -m pip install --upgrade certifi"
+        echo "           $BASE_PY -c \"import os,ssl,certifi; d=ssl.get_default_verify_paths().openssl_cafile; os.path.lexists(d) and os.remove(d); os.symlink(certifi.where(), d); print('linked', d)\""
+        echo
+        echo "       (prefix both with sudo if it reports a permissions error)"
+        echo
+        echo "       This is optional for this project - the fetch above prefers"
+        echo "       curl, which uses the system trust store instead."
       else
         echo "       Reinstall Python:  brew install python@3.12"
       fi
