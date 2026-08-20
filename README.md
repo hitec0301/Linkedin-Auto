@@ -248,6 +248,8 @@ Two failures that happen before the script reaches Google at all:
 | `TypeError: Metaclasses with custom tp_new are not supported` from `yaml/_yaml` | A PyYAML built from source with an old Cython, which cannot import on Python 3.12. Usually a stale wheel in pip's cache | Upgrade pip first, then reinstall (below) |
 | `ModuleNotFoundError: No module named 'yaml'` right after trying that fix | The reinstall uninstalled the old copy and then failed to install the new one | Same fix — it is safe to re-run |
 | Any `pip` command tracebacks inside `pip/_vendor/packaging`, e.g. `InvalidVersion: Invalid version: '0.dev0'` | pip's own install is broken or half-upgraded, so it cannot install anything at all | Rebuild the venv (below). Do not try to fix pip with pip |
+| `TypeError: Metaclasses with custom tp_new are not supported` on import, after pip reported a successful install | pip was too old to use the prebuilt wheels, so it built C extensions from source with an outdated Cython. They install fine and fail on import | `bash scripts/doctor.sh --fix` — it installs a current pip first |
+| `SSL: CERTIFICATE_VERIFY_FAILED` from Python (but not from curl or pip) | A python.org build whose CA certificates were never installed. pip bundles its own, so only stdlib HTTPS breaks | Run once: `open "/Applications/Python 3.12/Install Certificates.command"` |
 | `ModuleNotFoundError: No module named 'lnp'` | Run from the repo root, not from inside `scripts/` | `cd` to the repo root and use `python scripts/setup_sheet.py` |
 
 For either of those two, upgrade pip before reinstalling. An old pip is the

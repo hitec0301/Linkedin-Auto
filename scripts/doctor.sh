@@ -57,22 +57,55 @@ check_imports() {
   [ -z "$FAILED_MODULES" ]
 }
 
-# Fetch a current pip straight from PyPI using stdlib urllib, then run it off
-# sys.path. A pip wheel is executable that way, so replacing a bad or ancient
-# pip never asks that pip to do the work.
-bootstrap_pip() {
-  printf "  fetching a current pip from PyPI (no pip involved)...\n"
-  rm -rf "$ROOT/.venv"
-  "$BASE_PY" -m venv --without-pip "$ROOT/.venv" || return 1
-  "$VENV_PY" - <<'BOOTSTRAP' 2>/tmp/lnp_boot_err
-import json, os, subprocess, sys, tempfile, urllib.request
+# Get a current pip wheel, then run it off sys.path to install itself. A pip
+# wheel is executable that way, so replacing a bad or ancient pip never asks
+# that pip to do the work.
+#
+# Three download routes, because each fails in a different real situation:
+#   curl        - uses the system trust store, so it works on python.org builds
+#                 whose stdlib has no CA certificates configured
+#   pip download - the old pip may be too old to install modern wheels but can
+#                 still fetch one, and it bundles its own certifi
+#   urllib      - last resort, needs the stdlib's SSL trust to be set up
+PIP_WHEEL=""
+SSL_BROKEN=0
+
+fetch_pip_wheel() {
+  DL=$(mktemp -d)
+  if command -v curl >/dev/null 2>&1; then
+    url=$(curl -fsSL --max-time 60 https://pypi.org/pypi/pip/json 2>/dev/null \
+      | "$BASE_PY" -c 'import json,sys; d=json.load(sys.stdin); print(next(u["url"] for u in d["urls"] if u["packagetype"]=="bdist_wheel"))' 2>/dev/null)
+    if [ -n "$url" ] && curl -fsSL --max-time 120 -o "$DL/${url##*/}" "$url" 2>/dev/null; then
+      PIP_WHEEL="$DL/${url##*/}"; printf "    fetched with curl\n"; return 0
+    fi
+  fi
+  if [ -x "$VENV_PY" ] && "$VENV_PY" -m pip download --quiet --no-deps --only-binary :all: \
+       --dest "$DL" pip >/tmp/lnp_dl_err 2>&1; then
+    PIP_WHEEL=$(ls "$DL"/pip-*.whl 2>/dev/null | head -1)
+    if [ -n "$PIP_WHEEL" ]; then printf "    fetched with the existing pip\n"; return 0; fi
+  fi
+  if "$BASE_PY" - "$DL" <<'FETCH' 2>/tmp/lnp_boot_err
+import json, os, sys, urllib.request
 meta = json.load(urllib.request.urlopen("https://pypi.org/pypi/pip/json", timeout=60))
 url = next(u["url"] for u in meta["urls"] if u["packagetype"] == "bdist_wheel")
-dest = os.path.join(tempfile.mkdtemp(), url.rsplit("/", 1)[-1])
-urllib.request.urlretrieve(url, dest)
-sys.exit(subprocess.call([sys.executable, os.path.join(dest, "pip"),
-                          "install", "--no-cache-dir", "--quiet", dest]))
-BOOTSTRAP
+urllib.request.urlretrieve(url, os.path.join(sys.argv[1], url.rsplit("/", 1)[-1]))
+FETCH
+  then
+    PIP_WHEEL=$(ls "$DL"/pip-*.whl 2>/dev/null | head -1)
+    [ -n "$PIP_WHEEL" ] && { printf "    fetched with urllib\n"; return 0; }
+  fi
+  grep -q "CERTIFICATE_VERIFY_FAILED" /tmp/lnp_boot_err 2>/dev/null && SSL_BROKEN=1
+  return 1
+}
+
+bootstrap_pip() {
+  printf "  fetching a current pip from PyPI...\n"
+  fetch_pip_wheel || return 1
+  # Download first, recreate second: the old pip may be one of the download
+  # routes, so deleting it before fetching would remove a working option.
+  rm -rf "$ROOT/.venv"
+  "$BASE_PY" -m venv --without-pip "$ROOT/.venv" || return 1
+  "$VENV_PY" "$PIP_WHEEL/pip" install --no-cache-dir --quiet "$PIP_WHEEL" 2>/tmp/lnp_boot_err
 }
 
 # --------------------------------------------------------------------------
@@ -193,8 +226,19 @@ if [ "$FIX" -eq 1 ]; then
       ok "bootstrapped pip: $("$VENV_PY" -m pip --version 2>&1 | tail -1)"
     else
       bad "could not bootstrap pip"
-      tail -10 /tmp/lnp_boot_err | sed 's/^/       /'
-      echo "       Reinstall Python:  brew install python@3.12"
+      tail -6 /tmp/lnp_boot_err | sed 's/^/       /'
+      if [ "$SSL_BROKEN" -eq 1 ]; then
+        echo
+        echo "       Your Python has no CA certificates, so it cannot verify HTTPS."
+        echo "       python.org builds ship a script that installs them, and it has"
+        echo "       to be run once after installing Python:"
+        echo
+        echo "           open \"/Applications/Python 3.12/Install Certificates.command\""
+        echo
+        echo "       Then re-run:  bash scripts/doctor.sh --fix"
+      else
+        echo "       Reinstall Python:  brew install python@3.12"
+      fi
       exit 1
     fi
   fi
