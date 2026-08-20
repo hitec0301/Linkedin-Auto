@@ -265,6 +265,23 @@ the active venv. Avoid `--only-binary :all:` here: if it cannot match a wheel
 it fails outright, and combined with `--force-reinstall` that removes the
 working copy before discovering it has nothing to replace it with.
 
+### First: run the doctor
+
+Before reading the table above, run this. It checks everything in one pass and
+repairs the common breakages itself:
+
+```bash
+bash scripts/doctor.sh          # report only, changes nothing
+bash scripts/doctor.sh --fix    # rebuild the venv and reinstall
+```
+
+It reports which Python interpreters you have, whether pip itself is working,
+which packages are missing, whether the tests pass, whether `.env` is filled in
+(placeholders count as empty), whether the service-account key file is actually
+where `.env` says it is, and whether the sheet is reachable. It is plain bash,
+so it still runs when the Python environment is too broken to import anything —
+which is exactly when you need it.
+
 ### Rebuilding the venv
 
 The fix for anything environment-shaped — a broken pip, a C extension that will
@@ -549,6 +566,7 @@ tests/test_pipeline.py  every invariant above, with the network mocked
 ### Local commands
 
 ```bash
+bash scripts/doctor.sh --fix            # diagnose and repair the environment
 python scripts/setup_sheet.py --check   # verify Google access, change nothing
 python scripts/setup_sheet.py           # create or repair the Sheet
 python scripts/validate_sources.py      # per-feed status, non-zero if any is dead
