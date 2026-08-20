@@ -125,29 +125,97 @@ fi
 # --------------------------------------------------------------------------
 head_ "Python interpreters available"
 # --------------------------------------------------------------------------
+# Modern `packaging` - which pip, and therefore every install, depends on -
+# matches version strings with a regex using possessive quantifiers and scoped
+# inline flags. Some Python builds mis-compile that pattern and then reject
+# perfectly valid versions, which makes pip unusable no matter how it is
+# installed. Test each interpreter before trusting it.
+interpreter_is_sane() {
+  "$1" - <<'SANITY' >/dev/null 2>&1
+import re, sys
+# packaging's VERSION_PATTERN, verbatim. Using the real thing rather than an
+# abbreviation means a Python that passes this test can definitely compile what
+# pip compiles.
+pattern = r"""
+    v?+                                                   # optional leading v
+    (?a:
+        (?:(?P<epoch>[0-9]+)!)?+                          # epoch
+        (?P<release>[0-9]+(?:\.[0-9]+)*+)                 # release segment
+        (?P<pre>                                          # pre-release
+            [._-]?+
+            (?P<pre_l>alpha|a|beta|b|preview|pre|c|rc)
+            [._-]?+
+            (?P<pre_n>[0-9]+)?
+        )?+
+        (?P<post>                                         # post release
+            (?:-(?P<post_n1>[0-9]+))
+            |
+            (?:
+                [._-]?
+                (?P<post_l>post|rev|r)
+                [._-]?
+                (?P<post_n2>[0-9]+)?
+            )
+        )?+
+        (?P<dev>                                          # dev release
+            [._-]?+
+            (?P<dev_l>dev)
+            [._-]?+
+            (?P<dev_n>[0-9]+)?
+        )?+
+    )
+    (?a:\+
+        (?P<local>                                        # local version
+            [a-z0-9]+
+            (?:[._-][a-z0-9]+)*+
+        )
+    )?+
+"""
+try:
+    rx = re.compile(r"^\s*" + pattern + r"\s*$", re.VERBOSE | re.IGNORECASE)
+except Exception:
+    sys.exit(1)
+# "0.dev0" is the literal value modern packaging evaluates at import time.
+sys.exit(0 if all(rx.search(v) for v in ("0.dev0", "1.2.3", "2.34.2", "6.0.3")) else 1)
+SANITY
+}
+
 BASE_PY=""
+BROKEN_PYS=""
 for candidate in python3.12 python3.13 python3.11 python3; do
-  if command -v "$candidate" >/dev/null 2>&1; then
-    version=$("$candidate" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null)
-    printf "  %-12s %-10s %s\n" "$candidate" "${version:-unknown}" "$(command -v "$candidate")"
-    [ -z "$BASE_PY" ] && [ -n "$version" ] && BASE_PY="$candidate"
+  command -v "$candidate" >/dev/null 2>&1 || continue
+  version=$("$candidate" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null)
+  [ -z "$version" ] && continue
+  if interpreter_is_sane "$candidate"; then
+    note="usable"
+    [ -z "$BASE_PY" ] && BASE_PY="$candidate"
+  else
+    note="UNUSABLE - its re module rejects valid version strings"
+    BROKEN_PYS="$BROKEN_PYS $candidate($version)"
   fi
+  printf "  %-12s %-10s %-28s %s\n" "$candidate" "$version" "$(command -v "$candidate")" "$note"
 done
 
+if [ -n "$BROKEN_PYS" ]; then
+  echo
+  warn "these interpreters cannot run modern pip:$BROKEN_PYS"
+  warn "packaging matches versions with possessive quantifiers; a Python whose"
+  warn "re module mishandles them rejects strings like '0.dev0', so pip fails"
+  warn "on import. No pip version fixes this - the interpreter has to change."
+fi
+
 if [ -z "$BASE_PY" ]; then
-  bad "no usable python3 found on PATH"
-  echo "      brew install python@3.12   (or install from python.org)"
+  bad "no usable Python found - every interpreter on PATH has the defect above"
+  echo
+  echo "      brew install python@3.12"
+  echo "      bash scripts/doctor.sh --fix"
+  echo
+  echo "  (or install a current 3.12.x / 3.13.x from python.org)"
   exit 1
 fi
 ok "using $BASE_PY to build the venv"
 
 BASE_VERSION=$("$BASE_PY" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')
-case "$BASE_VERSION" in
-  3.12.0|3.12.1|3.12.2)
-    warn "$BASE_VERSION is an early 3.12 release; several C extensions did not"
-    warn "have matching wheels until later 3.12.x. If packages fail to build"
-    warn "below, updating Python is the durable fix." ;;
-esac
 
 printf "  base pip: %s\n" "$("$BASE_PY" -m pip --version 2>&1 | tail -1)"
 printf "  shadowing env: PYTHONPATH=[%s] PIP_TARGET=[%s] PIP_CONFIG_FILE=[%s]\n" \
