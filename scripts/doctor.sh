@@ -56,6 +56,18 @@ for candidate in python3.12 python3.13 python3.11 python3; do
   fi
 done
 
+printf "\n  base interpreter pip:\n"
+if BASE_PIP=$("${BASE_PY:-python3}" -m pip --version 2>&1 | tail -1); then
+  printf "    %s\n" "$BASE_PIP"
+else
+  printf "    BROKEN: %s\n" "$(echo "$BASE_PIP" | tail -1)"
+  printf "    Your Python installation itself has a damaged pip, so every venv\n"
+  printf "    it seeds starts broken. This script works around it below.\n"
+fi
+printf "  environment that can shadow packages:\n"
+printf "    PYTHONPATH=[%s] PIP_TARGET=[%s] PIP_CONFIG_FILE=[%s]\n" \
+  "${PYTHONPATH:-}" "${PIP_TARGET:-}" "${PIP_CONFIG_FILE:-}"
+
 if [ -z "$BASE_PY" ]; then
   bad "no usable python3 found on PATH"
   echo
@@ -117,12 +129,55 @@ if [ "$FIX" -eq 1 ]; then
   rm -rf "$ROOT/.venv"
   ok "removed the old .venv"
 
-  if ! "$BASE_PY" -m venv --upgrade-deps "$ROOT/.venv" 2>/tmp/lnp_venv_err; then
+  # Deliberately NOT --upgrade-deps. That makes pip upgrade itself in place,
+  # and an interrupted in-place self-upgrade leaves pip/_vendor/packaging with
+  # files from two versions mixed together - which is a pip that cannot run at
+  # all, in a venv that was brand new. If the seeded pip needs replacing we do
+  # it below, from a clean wheel, without asking the broken pip to do the work.
+  if ! "$BASE_PY" -m venv "$ROOT/.venv" 2>/tmp/lnp_venv_err; then
     bad "could not create the venv"
     sed 's/^/       /' /tmp/lnp_venv_err
     exit 1
   fi
-  ok "created a new venv with a current pip"
+  ok "created a new venv"
+
+  NEED_BOOTSTRAP=0
+  if [ "${LNP_FORCE_PIP_BOOTSTRAP:-0}" = "1" ]; then
+    warn "LNP_FORCE_PIP_BOOTSTRAP is set - bootstrapping pip from PyPI"
+    NEED_BOOTSTRAP=1
+  elif PIP_OUT=$("$VENV_PY" -m pip --version 2>&1); then
+    ok "seeded pip works: $PIP_OUT"
+  else
+    bad "the freshly seeded pip is broken too"
+    echo "$PIP_OUT" | tail -2 | sed 's/^/       /'
+    warn "this means the damage is in your Python installation, not the venv"
+    NEED_BOOTSTRAP=1
+  fi
+
+  if [ "$NEED_BOOTSTRAP" -eq 1 ]; then
+    printf "  fetching a clean pip from PyPI (no pip involved)...\n"
+    rm -rf "$ROOT/.venv"
+    "$BASE_PY" -m venv --without-pip "$ROOT/.venv" || exit 1
+    if ! "$VENV_PY" - <<'BOOTSTRAP' 2>/tmp/lnp_boot_err
+import json, os, subprocess, sys, tempfile, urllib.request
+meta = json.load(urllib.request.urlopen("https://pypi.org/pypi/pip/json", timeout=60))
+url = next(u["url"] for u in meta["urls"] if u["packagetype"] == "bdist_wheel")
+dest = os.path.join(tempfile.mkdtemp(), url.rsplit("/", 1)[-1])
+urllib.request.urlretrieve(url, dest)
+# A pip wheel is runnable straight off sys.path, so this needs no working pip.
+sys.exit(subprocess.call([sys.executable, os.path.join(dest, "pip"),
+                          "install", "--no-cache-dir", "--quiet", dest]))
+BOOTSTRAP
+    then
+      bad "could not bootstrap pip"
+      tail -10 /tmp/lnp_boot_err | sed 's/^/       /'
+      echo "       Your Python 3.12 install is damaged. Reinstall it:"
+      echo "           brew reinstall python@3.12"
+      echo "       or download a fresh installer from python.org."
+      exit 1
+    fi
+    ok "bootstrapped a clean pip: $("$VENV_PY" -m pip --version 2>&1 | tail -1)"
+  fi
 
   printf "  installing dependencies (this takes a minute)...\n"
   if ! "$VENV_PY" -m pip install --no-cache-dir -q -r requirements.txt 2>/tmp/lnp_pip_err; then
