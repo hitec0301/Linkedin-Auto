@@ -15,6 +15,9 @@ from typing import Any
 
 _CONFIGURED = False
 
+# Where structured fields live on the record, out of reach of the name check.
+_CONTAINER = "lnp_fields"
+
 # Attributes LogRecord always carries; anything else was passed by us as extra.
 _RESERVED = set(
     logging.LogRecord("", 0, "", 0, "", (), None).__dict__
@@ -29,9 +32,15 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "msg": record.getMessage(),
         }
+        core = set(payload)
+        # Fields passed through the adapter, which cannot collide with
+        # LogRecord's own attributes because they never became attributes.
+        for key, value in (getattr(record, _CONTAINER, None) or {}).items():
+            payload[f"{key}_" if key in core else key] = _safe(value)
+        # Anything a third-party library set directly on the record.
         for key, value in record.__dict__.items():
-            if key not in _RESERVED and not key.startswith("_"):
-                payload[key] = _safe(value)
+            if key not in _RESERVED and key != _CONTAINER and not key.startswith("_"):
+                payload.setdefault(key, _safe(value))
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, default=str)
@@ -62,6 +71,27 @@ def setup(level: str | None = None) -> None:
     _CONFIGURED = True
 
 
-def get(name: str) -> logging.Logger:
+class _FieldAdapter(logging.LoggerAdapter):
+    """Carries structured fields in one container attribute.
+
+    `logging` refuses any `extra` key that shadows a LogRecord attribute, and
+    raises at call time: `extra={"created": ...}` is a KeyError, not a mangled
+    log line. Several perfectly natural field names collide that way - created,
+    module, name, args, filename, process - so the trap is easy to walk into and
+    it takes down whichever job logged it.
+
+    Nesting the fields under one key sidesteps the check entirely; the formatter
+    unpacks them, so call sites keep writing extra={...} and output keys read
+    exactly as written.
+    """
+
+    def process(self, msg, kwargs):
+        fields = kwargs.pop("extra", None)
+        if fields:
+            kwargs["extra"] = {_CONTAINER: dict(fields)}
+        return msg, kwargs
+
+
+def get(name: str) -> logging.LoggerAdapter:
     setup()
-    return logging.getLogger(name)
+    return _FieldAdapter(logging.getLogger(name), {})

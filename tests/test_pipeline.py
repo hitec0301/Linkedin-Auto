@@ -1324,3 +1324,65 @@ def test_curate_job_writes_ten_tagged_candidates(monkeypatch, capsys):
     # Nothing is pre-selected and no angle is invented. Those are the human's.
     assert all(r.Selected == "" and r.Angle == "" for r in rows)
     assert "Tick Selected" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# 13. Structured logging
+# --------------------------------------------------------------------------
+
+import io
+import json as _json_mod
+import logging as _logging
+
+from lnp import log as lnp_log
+
+
+def _capture(fn):
+    """Run fn with the JSON formatter attached to a buffer, return the records."""
+    buffer = io.StringIO()
+    handler = _logging.StreamHandler(buffer)
+    handler.setFormatter(lnp_log.JsonFormatter())
+    logger = lnp_log.get("test.logging")
+    logger.logger.handlers = [handler]
+    logger.logger.propagate = False
+    logger.logger.setLevel(_logging.INFO)
+    fn(logger)
+    return [_json_mod.loads(line) for line in buffer.getvalue().splitlines() if line.strip()]
+
+
+def test_field_names_that_shadow_logrecord_attributes_do_not_raise():
+    """`extra={"created": ...}` raises KeyError on a plain logger, and took down
+    setup_sheet.py. Every one of these is a plausible field name."""
+    for name in ["created", "module", "name", "args", "filename", "lineno", "process"]:
+        records = _capture(lambda lg, n=name: lg.info("event", extra={n: "value"}))
+        assert records[0][name] == "value", f"{name} was dropped or mangled"
+
+
+def test_fields_keep_their_names_in_the_output():
+    records = _capture(lambda lg: lg.info("tab ready", extra={"tab": "Pipeline", "created": False}))
+    assert records[0]["msg"] == "tab ready"
+    assert records[0]["tab"] == "Pipeline"
+    assert records[0]["created"] is False
+
+
+def test_a_field_colliding_with_a_core_key_does_not_clobber_it():
+    records = _capture(lambda lg: lg.info("real message", extra={"msg": "field value"}))
+    assert records[0]["msg"] == "real message"
+    assert records[0]["msg_"] == "field value"
+
+
+def test_every_logging_call_in_the_repo_survives_its_own_field_names():
+    """Guards the whole codebase, not just the one call site that crashed."""
+    import re
+    root = Path(__file__).resolve().parents[1]
+    checked = 0
+    for path in list((root / "src").rglob("*.py")) + list((root / "jobs").rglob("*.py")) \
+            + list((root / "scripts").rglob("*.py")):
+        for match in re.finditer(r"extra=\{([^}]*)\}", path.read_text(), re.S):
+            keys = re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:', match.group(1))
+            if not keys:
+                continue
+            checked += 1
+            records = _capture(lambda lg, k=keys: lg.info("e", extra={n: 1 for n in k}))
+            assert records, f"logging call in {path.name} produced no record"
+    assert checked > 10, f"expected to find many logging calls, found {checked}"
