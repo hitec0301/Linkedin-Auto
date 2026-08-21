@@ -79,11 +79,39 @@ Roughly an hour, most of it waiting on LinkedIn's UI.
 
 ```bash
 git clone <this repo> && cd Linkedin-Auto
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-pytest                      # should be green before you go further
+./setup.sh
 ```
+
+That is the whole install. It takes about a minute and is safe to re-run.
+
+`setup.sh` does not use the Python on your machine. It installs
+[uv](https://docs.astral.sh/uv/), which fetches a known-good CPython of its own,
+builds the environment, installs the dependencies, runs the test suite, and then
+walks you through configuration. Every setup failure this project has actually
+hit came from a system Python — a broken pip, an interpreter whose regex engine
+could not run modern packaging, missing CA certificates, C extensions built from
+source against the wrong toolchain. An interpreter we bring ourselves cannot
+have any of them.
+
+Afterwards, every command runs through one launcher, with nothing to activate:
+
+```bash
+./lnp setup      configure credentials, checking each one against its service
+./lnp check      re-verify the install and the credentials
+./lnp curate     put this week's candidates in the sheet
+./lnp draft      draft the rows you selected
+./lnp publish    post approved rows (dry run until you turn it off)
+./lnp voice      propose voice rules from your corrections
+./lnp doctor     diagnose and repair the environment
+./lnp test       run the test suite
+```
+
+The setup step checks each value against the real service as you enter it — the
+Anthropic key by calling the API, the sheet by opening it — so a wrong value is
+caught where you typed it rather than three steps later as an error naming
+something else. Nothing is written until it passes. It accepts your sheet's full
+web address rather than asking you to extract the id, takes the key file under
+whatever name Google gave it, and finds it if it is still in your Downloads.
 
 ### 2. Google Sheet
 
@@ -571,7 +599,7 @@ tests/test_pipeline.py  every invariant above, with the network mocked
 ```bash
 bash scripts/doctor.sh --fix            # diagnose and repair the environment
 python scripts/setup_sheet.py --check   # verify Google access, change nothing
-python scripts/setup_sheet.py           # create or repair the Sheet
+./lnp sheet                             # create or repair the Sheet
 python scripts/validate_sources.py      # per-feed status, non-zero if any is dead
 python scripts/oauth_bootstrap.py       # one-time LinkedIn OAuth
 

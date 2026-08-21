@@ -1386,3 +1386,130 @@ def test_every_logging_call_in_the_repo_survives_its_own_field_names():
             records = _capture(lambda lg, k=keys: lg.info("e", extra={n: 1 for n in k}))
             assert records, f"logging call in {path.name} produced no record"
     assert checked > 10, f"expected to find many logging calls, found {checked}"
+
+
+# --------------------------------------------------------------------------
+# 14. Setup / onboarding
+# --------------------------------------------------------------------------
+
+import json as _json
+
+from lnp import onboarding as onb
+
+
+def test_sheet_id_accepted_as_url_or_bare_id():
+    """People have the URL in front of them, not the id."""
+    real = "1b3j52JEZ7tfDI5vmN1D_g9m3udBNmTxsjJ72YYevclc"
+    for text in [
+        real,
+        f"https://docs.google.com/spreadsheets/d/{real}/edit#gid=0",
+        f"https://docs.google.com/spreadsheets/d/{real}/edit?usp=sharing",
+        f"  https://docs.google.com/spreadsheets/d/{real}/  ",
+        f'"{real}"',
+    ]:
+        assert onb.parse_sheet_id(text) == real, text
+
+
+def test_sheet_id_rejects_things_that_are_not_one():
+    for text in ["", "   ", "not-an-id", "https://docs.google.com/document/d/" + "x" * 40]:
+        assert onb.parse_sheet_id(text) is None, text
+
+
+def test_sheet_check_explains_a_google_url_that_is_not_a_sheet():
+    check = onb.check_sheet_id("https://docs.google.com/document/d/" + "x" * 40)
+    assert check.ok is False
+    assert "spreadsheets" in check.fix
+
+
+def test_key_file_accepted_by_path_and_reports_the_share_address(tmp_path):
+    key = tmp_path / "link-auto-506113-e2ffa28879eb.json"
+    key.write_text(_json.dumps({
+        "client_email": "lnp@link-auto-506113.iam.gserviceaccount.com",
+        "private_key": "-----BEGIN PRIVATE KEY-----",
+        "project_id": "link-auto-506113",
+    }))
+    check = onb.check_key_file(str(key))
+    assert check.ok is True
+    assert check.extra["client_email"] == "lnp@link-auto-506113.iam.gserviceaccount.com"
+
+
+def test_key_file_accepted_as_inline_json():
+    """GitHub Actions holds the whole blob rather than a path."""
+    blob = _json.dumps({"client_email": "a@b.iam.gserviceaccount.com",
+                        "private_key": "k", "project_id": "p"})
+    assert onb.check_key_file(blob).ok is True
+
+
+def test_key_file_errors_are_specific(tmp_path):
+    missing = onb.check_key_file(str(tmp_path / "nope.json"))
+    assert missing.ok is False and "no file at" in missing.detail
+
+    not_json = tmp_path / "x.json"; not_json.write_text("not json at all")
+    assert "not JSON" in onb.check_key_file(str(not_json)).detail
+
+    wrong = tmp_path / "oauth.json"
+    wrong.write_text(_json.dumps({"installed": {"client_id": "x"}}))
+    check = onb.check_key_file(str(wrong))
+    assert check.ok is False
+    assert "client_email" in check.detail
+    assert "Keys tab" in check.fix
+
+
+def test_find_key_files_looks_where_the_file_actually_is(tmp_path):
+    """The exact situation that cost a round: filed under .secrets with the
+    name Google gave it, while .env expected the template name."""
+    root = tmp_path / "repo"; (root / ".secrets").mkdir(parents=True)
+    home = tmp_path / "home"; (home / "Downloads").mkdir(parents=True)
+    good = _json.dumps({"client_email": "a@b.iam.gserviceaccount.com",
+                        "private_key": "k", "project_id": "p"})
+    (root / ".secrets" / "link-auto-506113-e2ffa28879eb.json").write_text(good)
+    (home / "Downloads" / "unrelated.json").write_text('{"hello": "world"}')
+    (home / "Downloads" / "another-key.json").write_text(good)
+
+    found = onb.find_key_files(root, home)
+    assert found[0].name == "link-auto-506113-e2ffa28879eb.json"   # .secrets first
+    assert any(p.name == "another-key.json" for p in found)
+    assert not any(p.name == "unrelated.json" for p in found)      # not a key
+
+
+def test_install_key_keeps_googles_filename(tmp_path):
+    root = tmp_path / "repo"; root.mkdir()
+    src = tmp_path / "link-auto-506113-e2ffa28879eb.json"
+    src.write_text(_json.dumps({"client_email": "a@b.iam.gserviceaccount.com",
+                                "private_key": "k", "project_id": "p"}))
+    target = onb.install_key_file(src, root)
+    assert target.name == src.name          # renaming is what let the two facts disagree
+    assert target.parent.name == ".secrets"
+    assert oct(target.stat().st_mode)[-3:] == "600"
+
+
+def test_env_upsert_preserves_comments_and_other_keys(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("# my notes\nANTHROPIC_API_KEY=sk-ant-...\nCUSTOM=keepme\n")
+    onb.upsert_env(env, {"SHEET_ID": "abc123", "ANTHROPIC_API_KEY": "sk-ant-real"})
+    text = env.read_text()
+    assert "# my notes" in text
+    assert "CUSTOM=keepme" in text
+    values = onb.read_env(env)
+    assert values["ANTHROPIC_API_KEY"] == "sk-ant-real"
+    assert values["SHEET_ID"] == "abc123"
+    assert text.count("ANTHROPIC_API_KEY=") == 1     # replaced, not appended
+
+
+def test_env_upsert_creates_the_file_with_tight_permissions(tmp_path):
+    env = tmp_path / ".env"
+    onb.upsert_env(env, {"SHEET_ID": "abc"})
+    assert onb.read_env(env) == {"SHEET_ID": "abc"}
+    assert oct(env.stat().st_mode)[-3:] == "600"
+
+
+def test_placeholders_do_not_count_as_set():
+    """A placeholder reading as 'set' is worse than a blank; it looks done."""
+    assert onb.is_placeholder("sk-ant-...") is True
+    assert onb.is_placeholder("<your key here>") is True
+    assert onb.is_set("sk-ant-...") is False
+    assert onb.is_set("sk-ant-api03-realkey") is True
+    assert onb.is_set("") is False
+    assert onb.missing_required({"ANTHROPIC_API_KEY": "sk-ant-...",
+                                 "SHEET_ID": "abc", "GOOGLE_SA_JSON": "k.json"}) \
+        == ["ANTHROPIC_API_KEY"]
