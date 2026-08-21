@@ -28,7 +28,13 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import log
-from .models import Row, Status, assert_transition, assert_writable
+from .models import (
+    Row,
+    Status,
+    assert_human_writable,
+    assert_transition,
+    assert_writable,
+)
 from .util import parse_bool
 
 logger = log.get(__name__)
@@ -129,6 +135,22 @@ class PipelineStore(ABC):
             return
         assert_writable(list(updates), allow_revision_note=allow_revision_note)
         self._write_fields(row, updates, allow_revision_note=allow_revision_note)
+        for name, value in updates.items():
+            setattr(row, name, "" if value is None else str(value))
+
+    def write_as_human(self, row: Row, updates: Dict[str, Any]) -> None:
+        """A person's edit, from the interface they use.
+
+        The opposite guard to `write`: a job may not touch the human's
+        columns, and the human's interface may not touch the model's. Both
+        exist for the same reason - the gap between the draft and what was
+        published is the measurement, and either side writing over the other
+        destroys it.
+        """
+        if not updates:
+            return
+        assert_human_writable(list(updates))
+        self._write_fields(row, updates, allow_revision_note=True)
         for name, value in updates.items():
             setattr(row, name, "" if value is None else str(value))
 

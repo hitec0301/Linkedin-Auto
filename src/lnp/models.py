@@ -176,6 +176,37 @@ def assert_writable(columns: Sequence[str], *, allow_revision_note: bool = False
             )
 
 
+# The mirror image of the rule above, for the other writer.
+#
+# The jobs must not write the human's columns. The interface the human uses
+# must not write the model's, and the one that matters is DraftText: the
+# distance between what the model wrote and what actually got published is the
+# only learning signal this pipeline has, and an edit folded back into
+# DraftText erases it. So the UI writes FinalText and the draft stays as it
+# was, which is also why "revise" is a separate instruction rather than the
+# human retyping the draft.
+HUMAN_WRITABLE_COLUMNS: Set[str] = set(HUMAN_OWNED_COLUMNS)
+
+
+def assert_human_writable(columns: Sequence[str]) -> None:
+    """Raise if a human-facing edit touches a column the human does not own."""
+    for name in columns:
+        if name not in COLUMN_INDEX:
+            raise ColumnPermissionError(f"unknown column {name!r}")
+        if name not in HUMAN_WRITABLE_COLUMNS:
+            raise ColumnPermissionError(
+                f"{name} is not editable here"
+                + (
+                    ". Editing the draft directly would erase the difference "
+                    "between what the model wrote and what you published, "
+                    "which is the only thing this system learns from. Put your "
+                    "version in FinalText instead."
+                    if name == "DraftText"
+                    else "."
+                )
+            )
+
+
 class Audience:
     CORPORATE = "AUD_CORPORATE"
     ACADEMIC = "AUD_ACADEMIC"

@@ -22,4 +22,25 @@ beautifulsoup4>=4.12.0
 # absent, and the test suite passes either way. Install it if you want it:
 #
 #     pip install lxml
+# ---- the hosted product ---------------------------------------------------
+# The single-tenant install needs none of these: it keeps its rows in a Sheet
+# and has no server. They are here rather than in a second requirements file
+# because one file that installs cleanly beats two that can disagree, and the
+# whole point of this install is that it does not fail halfway.
+SQLAlchemy>=2.0.30
+# psycopg 3 with the binary wheel: psycopg2 needs libpq and a compiler on the
+# machine, which is exactly the class of install failure this project already
+# spent a day on.
+psycopg[binary]>=3.2
+alembic>=1.14
+fastapi>=0.115
+uvicorn[standard]>=0.32
+itsdangerous>=2.2
+python-multipart>=0.0.12
+cryptography>=43
+pydantic>=2.9
+
 pytest>=8.0.0
+# TestClient is httpx-based, so the API tests need it even though nothing in
+# the product makes an httpx call.
+httpx>=0.28

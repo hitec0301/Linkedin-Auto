@@ -18,7 +18,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine
+from conftest import make_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -57,8 +57,7 @@ def encryption_key(monkeypatch):
 
 
 def new_engine():
-    url = os.environ.get("TEST_DATABASE_URL", "sqlite://")
-    engine = create_engine(url)
+    engine = make_engine()
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     return engine
