@@ -399,7 +399,22 @@ if [ -f .env ]; then
     *) if [ -f "$sa" ]; then ok "key file exists at $sa"
        else
          bad "GOOGLE_SA_JSON points at $sa, which does not exist"
-         found=$(ls -t "$HOME"/Downloads/*.json 2>/dev/null | head -3)
+         # The commonest cause is a name mismatch, not a missing download: the
+         # key arrives named after the cloud project, while .env still holds the
+         # template's service-account.json.
+         here=$(ls .secrets/*.json 2>/dev/null | head -3)
+         if [ -n "$here" ]; then
+           echo "       but .secrets/ does contain:"
+           echo "$here" | sed 's/^/         /'
+           echo "       The name does not match. Point .env at the file you have:"
+           echo "         KEY=\$(ls .secrets/*.json | head -1)"
+           echo "         grep -v '^GOOGLE_SA_JSON=' .env > .env.tmp"
+           echo "         echo \"GOOGLE_SA_JSON=\$KEY\" >> .env.tmp && mv .env.tmp .env"
+           note_problem
+           found=""
+         else
+           found=$(ls -t "$HOME"/Downloads/*.json 2>/dev/null | head -3)
+         fi
          if [ -n "$found" ]; then
            echo "       JSON files in ~/Downloads that might be the key:"
            echo "$found" | sed 's/^/         /'
