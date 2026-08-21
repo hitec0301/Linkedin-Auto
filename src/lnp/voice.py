@@ -110,17 +110,17 @@ def existing_amendments(card: str) -> List[str]:
     ]
 
 
-def append_amendments(config: Config, rules: Sequence[str]) -> List[str]:
-    """Append accepted rules between the markers. Idempotent by rule text.
+def amend_card_text(card: str, rules: Sequence[str], where: str = "the voice card") -> tuple:
+    """Insert accepted rules between the markers. Returns (card, written).
 
-    Returns the rules actually written. Re-running with the same rule is a
-    no-op, so a failed run can be repeated without duplicating the card.
+    Pure, so it works the same whether the card is a file on the owner's laptop
+    or a row in a customer's account. Idempotent by rule text: re-running with
+    the same rule is a no-op, so a failed run can be repeated without
+    duplicating the card.
     """
-    path = card_path(config)
-    card = path.read_text(encoding="utf-8")
     if AMENDMENTS_BEGIN not in card or AMENDMENTS_END not in card:
         raise ValueError(
-            f"{path} is missing the amendment markers; add "
+            f"{where} is missing the amendment markers; add "
             f"{AMENDMENTS_BEGIN} / {AMENDMENTS_END} back before running the voice job"
         )
     present = existing_amendments(card)
@@ -131,12 +131,28 @@ def append_amendments(config: Config, rules: Sequence[str]) -> List[str]:
             continue
         written.append(rule)
     if not written:
-        return []
-
+        return card, []
     insertion = "".join(f"- {rule}\n" for rule in written)
-    card = card.replace(AMENDMENTS_END, insertion + AMENDMENTS_END)
+    return card.replace(AMENDMENTS_END, insertion + AMENDMENTS_END), written
+
+
+def append_amendments(config: Config, rules: Sequence[str]) -> List[str]:
+    """Amend the card on disk. The single-tenant path."""
+    path = card_path(config)
+    card, written = amend_card_text(path.read_text(encoding="utf-8"), rules, str(path))
+    if not written:
+        return []
     path.write_text(card, encoding="utf-8")
     logger.info("voice card amended", extra={"rules": written, "path": str(path)})
+    return written
+
+
+def amend_card_in_store(store, rules: Sequence[str]) -> List[str]:
+    """Amend the card wherever this deployment keeps it."""
+    card, written = amend_card_text(store.load_voice_card(), rules)
+    if written:
+        store.save_voice_card(card)
+        logger.info("voice card amended", extra={"rules": written})
     return written
 
 
@@ -183,9 +199,14 @@ def build_voice_context(
     angle: str = "",
     published: Optional[Sequence[Row]] = None,
     post_count: int = 0,
+    card: Optional[str] = None,
 ) -> str:
-    """The voice block that opens every drafting prompt."""
-    parts = [load_card(config).strip()]
+    """The voice block that opens every drafting prompt.
+
+    `card` is passed in when the card belongs to a tenant rather than to this
+    checkout; omitted, it comes off disk as it always did.
+    """
+    parts = [(card if card is not None else load_card(config)).strip()]
     threshold = int(config.get("voice.retrieval_min_posts", 20))
     published = [r for r in (published or []) if r.status == Status.POSTED]
 

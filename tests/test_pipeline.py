@@ -781,6 +781,33 @@ def make_sheets(rows=(), paused="FALSE"):
     )
 
 
+def patch_store(monkeypatch, sheets):
+    """Point the job runner at a fake Sheet.
+
+    The jobs no longer know what storage is; they ask the runner for a store.
+    Patching the adapter's `open` is the one seam that leaves everything below
+    it — the real Sheets logic, the real guards — running.
+    """
+    from lnp import runner as runner_mod
+    from lnp.store import SheetsStore
+
+    monkeypatch.setattr(
+        runner_mod.SheetsStore, "open",
+        staticmethod(lambda config, sheet_id=None: SheetsStore(sheets, config)),
+    )
+
+
+def make_run(sheets, alerts=None):
+    """A `runner.Run` over a fake Sheet, with alerts captured if asked."""
+    from lnp import runner as runner_mod
+    from lnp.store import SheetsStore
+
+    run = runner_mod.Run(config=SHEET_CONFIG, store=SheetsStore(sheets, SHEET_CONFIG))
+    if alerts is not None:
+        run.alert = lambda title, body="", **kw: alerts.append(title)
+    return run
+
+
 def test_sheet_write_refuses_human_columns():
     row = Row(ID="a", Status=Status.DRAFTED)
     s = make_sheets([row])
@@ -893,11 +920,15 @@ def test_stuck_posting_row_is_never_blindly_retried():
         def create_post(self, payload):  # pragma: no cover - must never run
             raise AssertionError("a stuck row must never be republished")
 
+    run = make_run(s, alerts)
     publish_job.resolve_stuck_rows(
-        s, SHEET_CONFIG, s.pipeline_rows(), UnhelpfulAPI(), "urn:li:person:x"
+        run, run.store.pipeline_rows(), UnhelpfulAPI(), "urn:li:person:x"
     )
     assert s.pipeline_rows()[0].status == Status.POSTING   # untouched
-    assert alerts == []
+    # Untouched, but not unreported: this is the one case only a human can
+    # resolve, so silence here would be the worst outcome.
+    assert len(alerts) == 1
+    assert "could not be verified" in alerts[0]
 
 
 def test_stuck_row_confirmed_live_becomes_posted():
@@ -908,8 +939,9 @@ def test_stuck_row_confirmed_live_becomes_posted():
         def find_recent_post(self, author, text):
             return True, "urn:li:share:999"
 
+    run = make_run(s)
     publish_job.resolve_stuck_rows(
-        s, SHEET_CONFIG, s.pipeline_rows(), ConfirmingAPI(), "urn:li:person:x"
+        run, run.store.pipeline_rows(), ConfirmingAPI(), "urn:li:person:x"
     )
     stored = s.pipeline_rows()[0]
     assert stored.status == Status.POSTED
@@ -924,8 +956,9 @@ def test_stuck_row_confirmed_absent_becomes_failed():
         def find_recent_post(self, author, text):
             return False, None
 
+    run = make_run(s)
     publish_job.resolve_stuck_rows(
-        s, SHEET_CONFIG, s.pipeline_rows(), DenyingAPI(), "urn:li:person:x"
+        run, run.store.pipeline_rows(), DenyingAPI(), "urn:li:person:x"
     )
     assert s.pipeline_rows()[0].status == Status.FAILED
 
@@ -966,10 +999,10 @@ def test_ambiguous_row_with_both_variants_is_refused():
 
     s = make_sheets([row])
     alerts = []
-    publish_job.alert = lambda cfg, title, body="", **kw: alerts.append(title)
+    run = make_run(s, alerts)
 
-    live = s.pipeline_rows()[0]
-    publish_job.flag(s, SHEET_CONFIG, live, "ambiguous: both variants are still present",
+    live = run.store.pipeline_rows()[0]
+    publish_job.flag(run, live, "ambiguous: both variants are still present",
                      "title", "body")
     stored = s.pipeline_rows()[0]
     assert stored.status == Status.APPROVED           # nothing was posted, nothing broken
@@ -977,7 +1010,7 @@ def test_ambiguous_row_with_both_variants_is_refused():
     assert len(alerts) == 1
 
     # A row still waiting on a human must not alert on every run.
-    publish_job.flag(s, SHEET_CONFIG, stored, "ambiguous: both variants are still present",
+    publish_job.flag(run, stored, "ambiguous: both variants are still present",
                      "title", "body")
     assert len(alerts) == 1
 
@@ -1115,9 +1148,9 @@ def test_publish_dry_run_logs_a_full_payload_and_posts_nothing(monkeypatch, caps
             raise AssertionError("dry run must not call the API")
 
     monkeypatch.setattr(publish_job, "load_config", real_config)
-    monkeypatch.setattr(publish_job.Sheets, "open", staticmethod(lambda c, sheet_id=None: s))
+    patch_store(monkeypatch, s)
     monkeypatch.setattr(publish_job.token_mod, "load_fresh",
-                        lambda config, alerter=None: TokenSet(access_token="t"))
+                        lambda config, **kw: TokenSet(access_token="t"))
     monkeypatch.setattr(publish_job.token_mod, "cache_person_urn",
                         lambda *a, **kw: None)
     monkeypatch.setattr(publish_job, "LinkedIn", FakeAPI)
@@ -1151,12 +1184,12 @@ def test_publish_stops_at_the_kill_switch(monkeypatch, capsys):
         raise AssertionError("PAUSED must stop the job before tokens are touched")
 
     monkeypatch.setattr(publish_job, "load_config", real_config)
-    monkeypatch.setattr(publish_job.Sheets, "open", staticmethod(lambda c, sheet_id=None: s))
+    patch_store(monkeypatch, s)
     monkeypatch.setattr(publish_job.token_mod, "load_fresh", explode)
     monkeypatch.setattr(sys, "argv", ["publish.py"])
 
     assert publish_job.main() == 0
-    assert "PAUSED" in capsys.readouterr().out
+    assert "paused" in capsys.readouterr().out.lower()
     assert s.pipeline_rows()[0].status == Status.APPROVED
 
 
@@ -1176,7 +1209,7 @@ def test_draft_job_drafts_a_selected_row_and_regenerates_a_revise_row(monkeypatc
     seen = {}
 
     monkeypatch.setattr(draft_job, "load_config", real_config)
-    monkeypatch.setattr(draft_job.Sheets, "open", staticmethod(lambda c, sheet_id=None: s))
+    patch_store(monkeypatch, s)
     monkeypatch.setattr(draft_job.voice, "build_voice_context",
                         lambda config, **kw: "VOICE CONTEXT")
     def fake_draft(config, row, ctx, **kw):
@@ -1222,9 +1255,11 @@ def test_draft_job_skips_a_row_that_hit_the_revision_cap(monkeypatch):
     alerts = []
 
     monkeypatch.setattr(draft_job, "load_config", real_config)
-    monkeypatch.setattr(draft_job.Sheets, "open", staticmethod(lambda c, sheet_id=None: s))
-    monkeypatch.setattr(draft_job, "alert",
-                        lambda cfg, title, body="", **kw: alerts.append(f"{title} {body}"))
+    patch_store(monkeypatch, s)
+    monkeypatch.setattr(
+        "lnp.runner.alert",
+        lambda cfg, title, body="", **kw: alerts.append(f"{title} {body}"),
+    )
     monkeypatch.setattr(draft_job.drafting, "revise",
                         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("capped")))
     monkeypatch.setattr(sys, "argv", ["draft.py"])
@@ -1298,7 +1333,7 @@ def test_curate_job_writes_ten_tagged_candidates(monkeypatch, capsys):
 
     s = make_sheets()
     monkeypatch.setattr(curate_job, "load_config", real_config)
-    monkeypatch.setattr(curate_job.Sheets, "open", staticmethod(lambda c, sheet_id=None: s))
+    patch_store(monkeypatch, s)
     monkeypatch.setattr(curate_job.ingest, "fetch_feed", fake_fetch)
     monkeypatch.setattr("lnp.scoring.complete_json", fake_scorer)
     monkeypatch.setattr(sys, "argv", ["curate.py"])

@@ -614,3 +614,198 @@ def test_a_tenant_without_an_app_is_told_what_to_do():
     with pytest.raises(TokenError) as excinfo:
         app_credentials(store.session, TENANT)
     assert "developer.linkedin.com" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# The runner: one job, many accounts
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def hosted(monkeypatch):
+    """Point the runner at a throwaway database with two live tenants."""
+    from lnp.db import session as session_mod
+    from lnp.db.schema import Tenant
+
+    engine = new_engine()
+    session_mod.configure(engine)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://test/test")
+
+    with session_mod.session_scope() as session:
+        session.add(Tenant(id=TENANT, email="one@example.test", status="active"))
+        session.add(Tenant(id=OTHER_TENANT, email="two@example.test", status="active"))
+    return engine
+
+
+def test_hosted_mode_yields_one_run_per_account(hosted):
+    from lnp import runner
+
+    labels = [run.label for run in runner.runs("draft", SHEET_CONFIG)]
+    assert labels == ["one@example.test", "two@example.test"]
+
+
+def test_cancelled_accounts_are_not_run(hosted):
+    from lnp import runner
+    from lnp.db import session as session_mod
+    from lnp.db.schema import Tenant
+
+    with session_mod.session_scope() as session:
+        session.get(Tenant, OTHER_TENANT).status = "canceled"
+
+    labels = [run.label for run in runner.runs("draft", SHEET_CONFIG)]
+    assert labels == ["one@example.test"]
+
+
+def test_one_account_can_be_named(hosted):
+    from lnp import runner
+
+    labels = [run.label for run in runner.runs("draft", SHEET_CONFIG, OTHER_TENANT)]
+    assert labels == ["two@example.test"]
+
+
+def test_one_accounts_failure_does_not_stop_the_others(hosted):
+    """The tenth customer must not lose their week because the third had a bad feed."""
+    from lnp import runner
+
+    served = []
+    for run in runner.runs("draft", SHEET_CONFIG):
+        with runner.isolated(run, "draft"):
+            served.append(run.label)
+            if run.label == "one@example.test":
+                raise RuntimeError("this account's feed is broken")
+    assert served == ["one@example.test", "two@example.test"]
+
+
+def test_a_local_failure_still_stops_the_job(monkeypatch):
+    """Locally there is nobody else to protect, and a non-zero exit is the signal."""
+    from lnp import runner
+
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    run = runner.Run(config=SHEET_CONFIG, store=make_sheet_store())
+    with pytest.raises(RuntimeError):
+        with runner.isolated(run, "draft"):
+            raise RuntimeError("broken")
+
+
+def test_the_meter_follows_the_account_and_is_removed_after(hosted):
+    from lnp import llm, runner
+
+    seen = []
+    for run in runner.runs("draft", SHEET_CONFIG):
+        meter = llm.current_meter()
+        assert meter is not None
+        seen.append(meter.tenant_id)
+    assert seen == [TENANT, OTHER_TENANT]
+    assert llm.current_meter() is None
+
+
+def test_the_meter_is_removed_even_when_a_tenant_fails(hosted):
+    """A crashed run must not leave one account's meter on another's calls."""
+    from lnp import llm, runner
+
+    with pytest.raises(RuntimeError):
+        for run in runner.runs("draft", SHEET_CONFIG):
+            raise RuntimeError("something went wrong mid-tenant")
+    assert llm.current_meter() is None
+
+
+def test_a_run_reads_that_accounts_sources(hosted):
+    from lnp import runner
+    from lnp.db import session as session_mod
+    from lnp.db.schema import Source
+
+    with session_mod.session_scope() as session:
+        session.add(Source(id="01S1", tenant_id=TENANT, name="Mine",
+                           url="https://mine.test/feed", tier=1, audience="AUD_CORPORATE"))
+        session.add(Source(id="01S2", tenant_id=OTHER_TENANT, name="Theirs",
+                           url="https://theirs.test/feed", tier=3))
+        session.add(Source(id="01S3", tenant_id=TENANT, name="Switched off",
+                           url="https://off.test/feed", tier=2, active=False))
+
+    by_label = {run.label: run.sources() for run in runner.runs("curate", SHEET_CONFIG)}
+    assert [f["name"] for f in by_label["one@example.test"]] == ["Mine"]
+    assert [f["name"] for f in by_label["two@example.test"]] == ["Theirs"]
+    assert by_label["one@example.test"][0]["weight"] == 0.7
+
+
+def test_a_run_reads_that_accounts_voice_card(hosted):
+    from lnp import runner
+    from lnp.db import session as session_mod
+    from lnp.db.schema import VoiceCard
+
+    with session_mod.session_scope() as session:
+        session.add(VoiceCard(tenant_id=TENANT, content="# One's voice"))
+        session.add(VoiceCard(tenant_id=OTHER_TENANT, content="# Two's voice"))
+
+    cards = {run.label: run.voice_card() for run in runner.runs("draft", SHEET_CONFIG)}
+    assert cards["one@example.test"] == "# One's voice"
+    assert cards["two@example.test"] == "# Two's voice"
+
+
+def test_alerts_name_the_account_by_email_not_by_token(hosted, monkeypatch):
+    from lnp import runner
+
+    seen = []
+    monkeypatch.setattr("lnp.runner.alert",
+                        lambda cfg, title, body="", **kw: seen.append(title))
+    for run in runner.runs("draft", SHEET_CONFIG):
+        run.alert("a feed returned nothing")
+    assert seen == [
+        "[one@example.test] a feed returned nothing",
+        "[two@example.test] a feed returned nothing",
+    ]
+
+
+def test_the_voice_job_never_ticks_its_own_proposals(hosted):
+    """The model does not get to accept its own instructions."""
+    import jobs.voice_amend as voice_job
+    from lnp import runner, voice
+    from lnp.db import session as session_mod
+    from lnp.db.schema import VoiceCard
+
+    with session_mod.session_scope() as session:
+        session.add(VoiceCard(
+            tenant_id=TENANT,
+            content=f"# Voice\n\n{voice.AMENDMENTS_BEGIN}\n{voice.AMENDMENTS_END}\n",
+        ))
+
+    run = next(runner.runs("voice_amend", SHEET_CONFIG, TENANT))
+    proposal = voice.Proposal(rule="No em dashes", rationale="edited out twice",
+                              signal="DIFF", occurrences=2, source_row_ids=["01AAA"])
+    run.store.append_amendments([
+        AmendmentRecord(rule=proposal.rule, rationale=proposal.rationale,
+                        signal=proposal.signal, occurrences=proposal.occurrences,
+                        accepted=False),
+    ])
+    assert run.store.pending_amendments() == []
+
+    class Args:
+        dry_run = False
+
+    assert voice_job.apply_accepted(run.store, Args.dry_run) == []
+    assert voice.AMENDMENTS_BEGIN in run.store.load_voice_card()
+    assert "No em dashes" not in run.store.load_voice_card()
+
+
+def test_an_accepted_rule_reaches_the_card_exactly_once(hosted):
+    import jobs.voice_amend as voice_job
+    from lnp import runner, voice
+    from lnp.db import session as session_mod
+    from lnp.db.schema import VoiceCard
+
+    with session_mod.session_scope() as session:
+        session.add(VoiceCard(
+            tenant_id=TENANT,
+            content=f"# Voice\n\n{voice.AMENDMENTS_BEGIN}\n{voice.AMENDMENTS_END}\n",
+        ))
+
+    run = next(runner.runs("voice_amend", SHEET_CONFIG, TENANT))
+    run.store.append_amendments([
+        AmendmentRecord(rule="No em dashes", signal="DIFF", accepted=True),
+    ])
+    assert voice_job.apply_accepted(run.store, False) == ["No em dashes"]
+    card = run.store.load_voice_card()
+    assert card.count("No em dashes") == 1
+    # Nothing pending means a second run is a no-op, not a duplicate.
+    assert voice_job.apply_accepted(run.store, False) == []
+    assert run.store.load_voice_card().count("No em dashes") == 1
