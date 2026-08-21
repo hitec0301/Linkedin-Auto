@@ -612,6 +612,94 @@ python jobs/voice_amend.py --dry-run    # propose rules, write nothing
 pytest
 ```
 
+## Running it on Railway
+
+The jobs run on Railway as four scheduled services, all built from the same
+image. There is no server here — each job starts, does a few seconds of work,
+and exits — so a cron service is the right shape and you pay only for the
+seconds it runs.
+
+The GitHub Actions job workflows have been removed so the jobs run in exactly
+one place. `test.yml` stays, running the suite on every push. **Never run both
+at once**: two schedulers on one Sheet can both pick up the same APPROVED row,
+and the guard against double-publishing protects against a crashed run, not
+against a second scheduler.
+
+### 1. Create the project
+
+In Railway: **New Project → Deploy from GitHub repo**, pick this repository.
+Railway reads `railway.json` and builds the `Dockerfile`. The build runs the
+test suite, so a broken commit fails at build time rather than at 07:00 on a
+Monday.
+
+### 2. Set the variables once, on the project
+
+Project → **Variables**. Set them at project level so all four services share
+them.
+
+| Variable | Value |
+|---|---|
+| `ANTHROPIC_API_KEY` | your key |
+| `SHEET_ID` | the id from your sheet's URL |
+| `GOOGLE_SA_JSON` | **the whole contents of the key file**, pasted in |
+| `SLACK_WEBHOOK_URL` | optional, but a pipeline with no alerting is a pipeline you will not notice failing |
+| `LINKEDIN_CLIENT_ID` | from your LinkedIn app |
+| `LINKEDIN_CLIENT_SECRET` | from your LinkedIn app |
+| `LINKEDIN_TOKENS_JSON` | the contents of `.secrets/linkedin_tokens.json` after `./lnp oauth` |
+
+`GOOGLE_SA_JSON` takes a path or the JSON itself, and on a container there is no
+file to point at, so paste the JSON. Same for `LINKEDIN_TOKENS_JSON`.
+
+### 3. Add the volume, then the four services
+
+Add a **volume mounted at `/data`** on the publish service. Then create four
+services from the same repo, each with a start command and a cron schedule
+(service → Settings → **Cron Schedule**):
+
+| Service | Start command | Cron (UTC) |
+|---|---|---|
+| `curate` | `python jobs/curate.py` | `0 12 * * 1` |
+| `draft` | `python jobs/draft.py` | `0 * * * *` |
+| `publish` | `python jobs/publish.py` | `*/30 * * * *` |
+| `voice` | `python jobs/voice_amend.py` | `0 15 * * 0` |
+
+Set **restart policy to NEVER** on all four. A cron job that exits 0 has
+finished; restarting it would run it again immediately, and on `publish` that
+is the one behaviour you do not want.
+
+### Why the volume, when the tokens are already a variable
+
+Because tokens rotate. The access token lasts 60 days and the publish job
+refreshes it automatically — and a process cannot write to its own environment,
+so the refreshed value would have nowhere to go.
+
+So the store reads `LINKEDIN_TOKENS_JSON` when the volume is empty, and writes
+every rotation to the volume. You paste once, rotations survive restarts and
+deploys, and if the volume is ever wiped it re-seeds from the variable and
+carries on. Only `publish` touches tokens, so only `publish` needs the volume.
+
+You still re-authorise from your laptop once a year, with `./lnp oauth` — there
+is no public callback URL, and nothing to attack.
+
+### First deploy
+
+Leave `dry_run: true` in `config/config.yaml`. The publish service will log the
+exact payload it would send and post nothing. Watch it for a few days, then set
+it to `false` and redeploy.
+
+The kill switch works from anywhere: set `PAUSED` to `TRUE` in the Sheet's
+Config tab and the publish service exits without posting, whatever the schedule
+says.
+
+### What I could not verify
+
+I built and tested everything in this repo, but I have no Railway account, so
+the dashboard steps above come from how Railway works rather than from me
+having clicked them. If a field has moved, the shape still holds: one image,
+four services, four cron expressions, a volume at `/data`, restart policy NEVER.
+
+---
+
 ## Deliberately not built
 
 Company-page posting. Image, video, or document posts. Comment or DM

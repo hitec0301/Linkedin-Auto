@@ -147,18 +147,77 @@ class GistBackend:
         logger.info("tokens saved", extra={"backend": "gist", "gist_id": self.gist_id})
 
 
+class SeededFileBackend(FileBackend):
+    """A file that starts life from an environment variable.
+
+    Tokens rotate: the access token is refreshed every sixty days and the store
+    has to keep what comes back. A process cannot write to its own environment,
+    so a variable alone loses every rotation. A file alone needs someone to put
+    the first tokens there, which on a container means a deploy step.
+
+    So: read the variable when the file is missing or empty, and write every
+    rotation to the file. One paste on first deploy, rotations persist across
+    restarts, and if the disk is ever wiped it re-seeds from the variable and
+    carries on - at worst costing one extra refresh.
+    """
+
+    def __init__(self, path: Path, seed_var: str = "LINKEDIN_TOKENS_JSON"):
+        super().__init__(path)
+        self.seed_var = seed_var
+
+    def load(self) -> Optional[TokenSet]:
+        stored = super().load()
+        if stored and stored.access_token:
+            return stored
+        raw = env(self.seed_var)
+        if not raw:
+            return stored
+        try:
+            seeded = TokenSet(**json.loads(raw))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise TokenError(
+                f"{self.seed_var} is set but is not the JSON that "
+                f"scripts/oauth_bootstrap.py produced: {exc}"
+            ) from exc
+        logger.info("seeded tokens from environment", extra={"var": self.seed_var})
+        try:
+            self.save(seeded)  # so the next rotation has somewhere to land
+        except OSError as exc:
+            logger.warning(
+                "token store is not writable, so refreshes will not persist",
+                extra={"path": str(self.path), "error": str(exc)},
+            )
+        return seeded
+
+
 def make_backend(config: Config):
-    """Pick the backend from config, or from the environment in CI."""
+    """Pick the backend from config, or from the environment it is running in.
+
+    Detection beats configuration here: the same image runs on a laptop and on a
+    host, and a container that has to be told where it is is a container that
+    will one day be told wrong.
+    """
     backend = (config.get("tokens.backend", "file") or "file").lower()
     if os.environ.get("GITHUB_ACTIONS") == "true" and env("GIST_ID"):
         backend = "gist"
+    elif env("LINKEDIN_TOKENS_JSON") or env("RAILWAY_ENVIRONMENT"):
+        backend = "seeded"
+
     if backend == "gist":
         return GistBackend(
             require_env("GIST_ID"),
             require_env("GIST_TOKEN"),
             config.get("tokens.gist_filename", "linkedin_tokens.json"),
         )
-    path = Path(config.get("tokens.file_path", ".secrets/linkedin_tokens.json"))
+
+    configured = config.get("tokens.file_path", ".secrets/linkedin_tokens.json")
+    if backend == "seeded":
+        # The mounted volume, so a refresh outlives the container that made it.
+        data_dir = env("LNP_DATA_DIR") or "/data"
+        path = Path(data_dir) / "linkedin_tokens.json"
+        return SeededFileBackend(path)
+
+    path = Path(configured)
     return FileBackend(path if path.is_absolute() else REPO_ROOT / path)
 
 

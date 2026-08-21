@@ -1331,6 +1331,7 @@ def test_curate_job_writes_ten_tagged_candidates(monkeypatch, capsys):
 # --------------------------------------------------------------------------
 
 import io
+import os
 import json as _json_mod
 import logging as _logging
 
@@ -1544,3 +1545,71 @@ def test_a_secret_never_appears_whole_in_a_check_detail():
     secret = "WPL_AP1.EXAMPLE0000FAKE.aBcDeF=="
     check = onb.check_linkedin_secret(secret)
     assert secret not in check.detail
+
+
+# --------------------------------------------------------------------------
+# 15. Token storage on a host with a volume
+# --------------------------------------------------------------------------
+
+from lnp import tokens as tok
+
+
+def _token_blob(**over):
+    base = {"access_token": "at", "refresh_token": "rt",
+            "expires_at": "2030-01-01T00:00:00Z",
+            "refresh_expires_at": "2030-06-01T00:00:00Z"}
+    base.update(over)
+    return base
+
+
+def test_tokens_seed_from_the_environment_when_the_volume_is_empty(tmp_path, monkeypatch):
+    """First deploy: the variable is the only source, and it must land on disk
+    so the next rotation has somewhere to go."""
+    monkeypatch.setenv("LINKEDIN_TOKENS_JSON", _json_mod.dumps(_token_blob()))
+    store = tok.SeededFileBackend(tmp_path / "linkedin_tokens.json")
+
+    loaded = store.load()
+    assert loaded.access_token == "at"
+    assert (tmp_path / "linkedin_tokens.json").exists(), "seed was not persisted"
+
+
+def test_the_volume_wins_over_the_seed_once_a_refresh_has_happened(tmp_path, monkeypatch):
+    """The whole point: a rotated token must not be overwritten by the stale
+    value still sitting in the variable."""
+    store = tok.SeededFileBackend(tmp_path / "linkedin_tokens.json")
+    store.save(tok.TokenSet(**_token_blob(access_token="rotated", refresh_token="rotated-rt")))
+    monkeypatch.setenv("LINKEDIN_TOKENS_JSON", _json_mod.dumps(_token_blob(access_token="stale")))
+
+    assert store.load().access_token == "rotated"
+
+
+def test_a_wiped_volume_re_seeds_rather_than_failing(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINKEDIN_TOKENS_JSON", _json_mod.dumps(_token_blob()))
+    store = tok.SeededFileBackend(tmp_path / "linkedin_tokens.json")
+    store.load()
+    (tmp_path / "linkedin_tokens.json").unlink()          # volume lost
+    assert store.load().access_token == "at"
+
+
+def test_a_malformed_seed_says_so_rather_than_looking_like_no_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("LINKEDIN_TOKENS_JSON", "not json")
+    store = tok.SeededFileBackend(tmp_path / "linkedin_tokens.json")
+    with pytest.raises(tok.TokenError) as exc:
+        store.load()
+    assert "oauth_bootstrap" in str(exc.value)
+
+
+def test_backend_choice_follows_where_it_is_running(tmp_path, monkeypatch):
+    config = Config({"tokens": {"backend": "file", "file_path": str(tmp_path / "t.json")}})
+    for var in ("GITHUB_ACTIONS", "GIST_ID", "LINKEDIN_TOKENS_JSON", "RAILWAY_ENVIRONMENT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(tok, "env", lambda name, default=None: os.environ.get(name, default))
+
+    assert isinstance(tok.make_backend(config), tok.FileBackend)
+    assert not isinstance(tok.make_backend(config), tok.SeededFileBackend)
+
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+    monkeypatch.setenv("LNP_DATA_DIR", str(tmp_path / "data"))
+    hosted = tok.make_backend(config)
+    assert isinstance(hosted, tok.SeededFileBackend)
+    assert str(hosted.path).startswith(str(tmp_path / "data")), "must write to the volume"

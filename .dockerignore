@@ -1,0 +1,13 @@
+# Never let a credential reach an image layer.
+.env
+.env.*
+.secrets/
+*service-account*.json
+*.pem
+
+.git
+.venv
+.uv
+__pycache__/
+*.pyc
+.pytest_cache/
