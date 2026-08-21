@@ -28,3 +28,7 @@ htmlcov/
 # Front end
 web/node_modules/
 web/dist/
+
+# Local scratch databases
+*.db
+*.sqlite3
