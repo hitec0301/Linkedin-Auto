@@ -1,10 +1,21 @@
-# The image every Railway service runs. One image, four services, four
-# schedules - the only difference between them is the start command.
+# The image every service runs: the web app and the four scheduled jobs. One
+# image, one build, and the only difference between the services is the start
+# command - so a job can never be running different code from the API that
+# shows its results.
 #
 # Plain python:3.12-slim rather than a uv image. uv earns its place in
 # setup.sh because there it replaces whatever Python is on your machine; inside
 # a container the base image already pins the interpreter, so uv would be a
 # dependency buying nothing.
+# Stage one builds the front end. Node is needed to produce the bundle and
+# never to serve it, so it does not travel into the runtime image.
+FROM node:22-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 FROM python:3.12-slim
 
 # Fail loudly and log immediately: a container whose output is buffered looks
@@ -27,6 +38,13 @@ COPY scripts/ ./scripts/
 COPY config/ ./config/
 COPY tests/ ./tests/
 COPY pytest.ini ./
+COPY alembic.ini ./
+COPY alembic/ ./alembic/
+
+# The built front end, served by the API from the same origin. Same origin is
+# what lets the session cookie be SameSite=Lax with no CORS configuration to
+# get wrong.
+COPY --from=web /web/dist ./web/dist
 
 # Where the mounted volume lands. Tokens rotate, and a rotation written to the
 # container filesystem is a rotation lost on the next deploy.
@@ -35,9 +53,12 @@ RUN mkdir -p /data
 # Prove the image works while it is being built, so a broken one fails here
 # rather than at 07:00 on a Monday with nobody watching.
 RUN python -c "import sys; sys.path.insert(0,'src'); \
-import lnp.models, lnp.sheets, lnp.drafting, lnp.linkedin, lnp.tokens; \
+import lnp.models, lnp.sheets, lnp.drafting, lnp.linkedin, lnp.tokens, \
+lnp.store, lnp.runner, lnp.db.store, lnp.api.app; \
 print('imports ok')" \
  && python -m pytest -x
 
-# Overridden per service. Defaults to the job that cannot post.
-CMD ["python", "jobs/curate.py"]
+# Overridden per service. Defaults to the web app: it is the service that has
+# to be up, and it is the one that cannot post.
+ENV PORT=8000
+CMD ["sh", "scripts/serve.sh"]

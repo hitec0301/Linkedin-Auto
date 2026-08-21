@@ -580,6 +580,8 @@ config/sources.yaml     three tiers of feeds, with weights and verify flags
 config/voice_card.md    the voice. Hand-editable. Edit this first when drafts are wrong.
 
 src/lnp/models.py       status machine, Row, column ownership, health metric
+src/lnp/store.py        the storage port, and the Sheets adapter behind it
+src/lnp/runner.py       one run per account: store, sources, card, meter
 src/lnp/sheets.py       the Sheet: every write goes through the two guards
 src/lnp/ingest.py       feeds, two-stage dedupe, education filtering
 src/lnp/scoring.py      batched scoring, tier weights, quota enforcement
@@ -589,9 +591,20 @@ src/lnp/tokens.py       OAuth storage, proactive refresh, rotation
 src/lnp/linkedin.py     Posts API, and the stuck-row recovery query
 src/lnp/alerts.py       Slack, SMTP, and always a log line
 
+src/lnp/db/schema.py    the multi-tenant tables
+src/lnp/db/store.py     the Postgres adapter — the only module that writes SQL
+src/lnp/db/crypto.py    encryption for stored credentials, as a column type
+src/lnp/db/usage.py     per-account metering and the cap
+src/lnp/db/provision.py what a new account starts with
+src/lnp/api/            FastAPI: sign-in, the pipeline, the account
+web/src/                React: Review, Published, Voice, Sources, Setup
+alembic/                migrations; the schema of record in production
+
 jobs/                   the four scheduled entry points
 scripts/                one-time and diagnostic tooling
 tests/test_pipeline.py  every invariant above, with the network mocked
+tests/test_store.py     the same conformance suite against both storage backends
+tests/test_api.py       tenancy, the human-side guard, and the two OAuth flows
 ```
 
 ### Local commands
@@ -697,6 +710,140 @@ I built and tested everything in this repo, but I have no Railway account, so
 the dashboard steps above come from how Railway works rather than from me
 having clicked them. If a field has moved, the shape still holds: one image,
 four services, four cron expressions, a volume at `/data`, restart policy NEVER.
+
+---
+
+## Running it as a product
+
+The same pipeline, hosted for other people. The difference is not the pipeline
+— it is where things are kept and who is asking.
+
+| | Single-tenant | Hosted |
+|---|---|---|
+| Storage | a Google Sheet you own | Postgres, one row set per account |
+| Interface | the Sheet | a web app |
+| LinkedIn app | yours, in `.env` | each customer's own, encrypted per account |
+| Model usage | your API key | the operator's, capped per account |
+| Setup | `./lnp setup` | sign in with LinkedIn, then a five-step wizard |
+
+Both run the same four jobs, the same status machine, and the same guards. The
+jobs ask `runner.runs()` for a store and never learn which one they got, so
+there is no second implementation of "approve" to keep in step.
+
+### The architecture, in one paragraph
+
+`PipelineStore` (`src/lnp/store.py`) is the interface the jobs use.
+`SheetsStore` and `PostgresStore` implement it. The two rules that matter live
+in the interface rather than in either adapter: `write` refuses to touch a
+human's column and `transition` refuses an illegal move, both before anything
+is persisted, and both call the abstract `_write_fields`. A third backend
+could not be written without them.
+
+The API is the second writer, and it gets the mirror rule: `write_as_human`
+refuses the model's columns. Above all it refuses `DraftText`, because the
+difference between what the model wrote and what you published is the only
+thing this system learns from, and folding an edit back into the draft erases
+it. Your edits go in `FinalText` and the draft stays as written.
+
+### The five services
+
+One image, built once, from the same `Dockerfile`. The web service serves the
+API and the built front end from the same origin, which is why the session
+cookie can be `SameSite=Lax` and there is no CORS configuration to get wrong.
+
+| Service | Start command | Schedule (UTC) |
+|---|---|---|
+| `web` | `sh scripts/serve.sh` | always on |
+| `curate` | `python jobs/curate.py` | `0 12 * * 1` |
+| `draft` | `python jobs/draft.py` | `0 * * * *` |
+| `publish` | `python jobs/publish.py` | `*/30 * * * *` |
+| `voice` | `python jobs/voice_amend.py` | `0 15 * * 0` |
+
+Restart policy `NEVER` on the four cron services; a cron job that exits 0 has
+finished. The web service restarts normally.
+
+Each job iterates every account whose subscription is `trialing` or `active`.
+One account's broken feed alerts and the loop moves on — the tenth customer
+does not lose their week because the third one's source list rotted.
+
+### Variables
+
+Add a Postgres service, then set these on the project so every service sees
+them.
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | reference the Postgres service's variable |
+| `LNP_SECRET_KEY` | from `python scripts/gen_keys.py` — signs session cookies |
+| `LNP_ENCRYPTION_KEY` | from the same command — encrypts stored credentials |
+| `LNP_BASE_URL` | e.g. `https://app.yourdomain.com`, no trailing slash |
+| `LNP_AUTH_CLIENT_ID` | your own LinkedIn app, used only for Sign in with LinkedIn |
+| `LNP_AUTH_CLIENT_SECRET` | the secret for that app |
+| `ANTHROPIC_API_KEY` | yours: the operator pays for drafting |
+| `SLACK_WEBHOOK_URL` | optional, and the only way you hear about a failed run |
+
+`LNP_ENCRYPTION_KEY` is not a rotatable value. Changing it makes every stored
+LinkedIn credential unreadable and every customer has to reconnect. Back it up
+somewhere that is not the database it protects.
+
+The redirect URL to register on your sign-in app is
+`${LNP_BASE_URL}/auth/linkedin/callback`. Each customer registers a different
+one on their own app — the setup screen shows it to them ready to paste.
+
+### Migrations
+
+Alembic owns the production schema, and `scripts/serve.sh` runs
+`alembic upgrade head` before starting the web service, so a deploy carries its
+own migration. A test asserts the models and the migrations still agree, which
+is what catches a column added to a model and nowhere else.
+
+```bash
+alembic revision --autogenerate -m "what changed"   # after editing schema.py
+alembic upgrade head
+```
+
+### Working on the front end
+
+```bash
+cd web && npm install && npm run dev     # localhost:5173, proxying to :8000
+DATABASE_URL=... uvicorn lnp.api.app:app --app-dir src --reload
+```
+
+The dev server proxies `/api` and `/auth` to the API, so the session cookie is
+first-party in development exactly as it is in production and nothing about
+auth behaves differently between the two.
+
+### What each customer has to do once
+
+Five steps, in the order LinkedIn's own screens ask for them, with every value
+shown ready to paste:
+
+1. Create a LinkedIn app (it needs a company page — making one takes a minute).
+2. Request the **Share on LinkedIn** and **Sign In with LinkedIn using OpenID
+   Connect** products. Both are granted automatically.
+3. Paste the Client ID and Secret into the setup screen.
+4. Copy the redirect URL it gives them back into the app's Auth tab.
+5. Authorise posting.
+
+Their own app rather than one shared app, deliberately: LinkedIn's rate limits
+and any suspension are per app. Sharing one would put every customer behind a
+single ceiling and let one customer's behaviour take down everybody's posting.
+
+### Per-account usage caps
+
+The operator pays for inference, so every model call is checked against a
+monthly token allowance before it is made and recorded after. Running out stops
+drafting and nothing else — approving and publishing what is already drafted
+are unaffected — and the customer is warned at 80% rather than discovering it
+at zero. At real prompt sizes the measured cost is a little over a dollar per
+active account per month.
+
+### What is not built yet
+
+Billing. `Tenant.status` and `plan` are read everywhere they need to be, so
+connecting a payment provider means writing to those two fields on a webhook
+and nothing else. There is no billing code to remove first, and no place where
+a subscription state is inferred from something other than that field.
 
 ---
 

@@ -441,3 +441,87 @@ def test_signing_out_clears_the_session(api):
     api.post("/auth/signout")
     api.cookies.clear()
     assert api.get("/api/me").status_code == 401
+
+
+# --------------------------------------------------------------------------
+# What a new account starts with
+# --------------------------------------------------------------------------
+
+
+def test_a_new_account_starts_ready_to_use(api, monkeypatch):
+    from lnp.api import routes_auth
+    from lnp.tokens import TokenSet
+
+    monkeypatch.setattr(routes_auth, "exchange_code",
+                        lambda code, uri, app=None: TokenSet(access_token="signin-token"))
+    monkeypatch.setattr(routes_auth, "userinfo",
+                        lambda token: {"sub": "sub-new", "email": "new@example.test"})
+
+    api.cookies.clear()
+    start = api.get("/auth/linkedin/start", follow_redirects=False)
+    state_cookie = start.cookies.get("lnp_oauth_state")
+    api.cookies.set("lnp_oauth_state", state_cookie)
+    import lnp.api.security as security_mod
+    issued = security_mod.serializer("oauth-state").loads(state_cookie)["v"]
+    api.get(f"/auth/linkedin/callback?code=abc&state={issued}", follow_redirects=False)
+
+    # A card to draft from and feeds to read: without both, the first run of
+    # every job fails and the customer sees an error, not a product.
+    assert "Voice card" in api.get("/api/voice-card").json()["content"]
+    assert len(api.get("/api/sources").json()) > 0
+    # And it cannot post until they say so.
+    assert api.get("/api/me").json()["paused"] is True
+
+
+def test_provisioning_twice_does_not_duplicate_anything(api):
+    from lnp.db.provision import provision_tenant
+    from lnp.db.schema import Tenant
+
+    with session_mod.session_scope() as session:
+        tenant = session.get(Tenant, TENANT)
+        provision_tenant(session, tenant)
+        first = len(api.get("/api/sources").json())
+        provision_tenant(session, tenant)
+    assert len(api.get("/api/sources").json()) == first
+
+
+def test_a_seeded_card_carries_the_amendment_markers(api):
+    """Without them the weekly job has nowhere to put an accepted rule."""
+    from lnp.db.provision import starter_card
+    from lnp.voice import AMENDMENTS_BEGIN, AMENDMENTS_END
+
+    card = starter_card()
+    assert AMENDMENTS_BEGIN in card
+    assert AMENDMENTS_END in card
+
+
+def test_the_shipped_schema_matches_the_migrations(tmp_path, monkeypatch):
+    """A model changed without a migration is a production table that is wrong.
+
+    Runs the real migrations through the real env.py against an empty database
+    and asks Alembic whether anything is still missing.
+    """
+    from alembic import command
+    from alembic.autogenerate import compare_metadata
+    from alembic.config import Config as AlembicConfig
+    from alembic.migration import MigrationContext
+    from sqlalchemy import create_engine
+
+    from lnp.db.schema import Base
+
+    root = Path(__file__).resolve().parents[1]
+    url = f"sqlite:///{tmp_path / 'migrated.db'}"
+    monkeypatch.setenv("DATABASE_URL", url)
+
+    cfg = AlembicConfig(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    command.upgrade(cfg, "head")
+
+    engine = create_engine(url)
+    with engine.connect() as connection:
+        diff = compare_metadata(MigrationContext.configure(connection), Base.metadata)
+
+    # Index shape differs harmlessly between SQLite and the models; a missing
+    # or extra table or column does not.
+    real = [d for d in diff if d[0] not in ("add_index", "remove_index")]
+    assert real == [], f"the models and the migrations disagree: {real}"

@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from .. import log
 from ..db.schema import Tenant
+from ..db.provision import provision_tenant
 from ..db.tokens import DbTokenBackend, app_credentials, save_app_credentials
 from ..tokens import AUTH_URL, USERINFO_URL, AppCredentials, TokenError, exchange_code
 from . import security
@@ -136,6 +137,10 @@ def finish_signin(
             picture_url=profile.get("picture", "") or "",
         )
         session.add(tenant)
+        session.commit()
+        # Seeded immediately, so the first curate run has feeds to read and the
+        # first draft has a card to write from.
+        provision_tenant(session, tenant)
         logger.info("tenant created", extra={"tenant": tenant.id})
     else:
         # Refresh the display fields; people change their name and their email.
