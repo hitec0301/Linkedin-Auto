@@ -11,10 +11,10 @@ from sqlalchemy.orm import Session
 
 from ..db.schema import LinkedInApp, LinkedInToken, Source, VoiceCard
 from ..db.schema import Tenant
-from ..db.store import PostgresStore
+from ..db.store import PipelineStore
 from ..db.usage import summary as usage_summary
 from ..models import health_stats
-from ..store import KEY_PAUSED, StoreError
+from ..db.store import KEY_PAUSED, StoreError
 from ..util import iso
 from .deps import active_tenant, config, current_store, current_tenant, db
 from .schemas import (
@@ -38,7 +38,7 @@ router = APIRouter(prefix="/api", tags=["account"])
 def me(
     session: Session = Depends(db),
     tenant: Tenant = Depends(current_tenant),
-    store: PostgresStore = Depends(current_store),
+    store: PipelineStore = Depends(current_store),
 ) -> MeOut:
     app = session.get(LinkedInApp, tenant.id)
     token = session.get(LinkedInToken, tenant.id)
@@ -63,7 +63,7 @@ def update_settings(
     body: SettingsIn,
     session: Session = Depends(db),
     tenant: Tenant = Depends(active_tenant),
-    store: PostgresStore = Depends(current_store),
+    store: PipelineStore = Depends(current_store),
 ) -> MeOut:
     if body.timezone:
         tenant.timezone = body.timezone
@@ -74,7 +74,7 @@ def update_settings(
 @router.put("/pause")
 def set_paused(
     body: PauseIn,
-    store: PostgresStore = Depends(current_store),
+    store: PipelineStore = Depends(current_store),
     tenant: Tenant = Depends(current_tenant),
 ) -> dict:
     """The kill switch.
@@ -179,7 +179,7 @@ def put_voice_card(
     body: VoiceCardIn,
     session: Session = Depends(db),
     tenant: Tenant = Depends(active_tenant),
-    store: PostgresStore = Depends(current_store),
+    store: PipelineStore = Depends(current_store),
 ) -> VoiceCardOut:
     """Replace the voice card.
 
@@ -193,7 +193,7 @@ def put_voice_card(
 
 
 @router.get("/amendments", response_model=List[AmendmentOut])
-def list_amendments(store: PostgresStore = Depends(current_store)) -> List[AmendmentOut]:
+def list_amendments(store: PipelineStore = Depends(current_store)) -> List[AmendmentOut]:
     return [
         AmendmentOut(
             id=r.id, created_at=r.created_at, rule=r.rule, rationale=r.rationale,
@@ -210,7 +210,7 @@ def decide_amendment(
     body: AmendmentDecision,
     session: Session = Depends(db),
     tenant: Tenant = Depends(active_tenant),
-    store: PostgresStore = Depends(current_store),
+    store: PipelineStore = Depends(current_store),
 ) -> AmendmentOut:
     """Tick or untick a proposed rule.
 
@@ -262,7 +262,7 @@ def usage(
 
 
 @router.get("/health-metric", response_model=HealthOut)
-def health(store: PostgresStore = Depends(current_store)) -> HealthOut:
+def health(store: PipelineStore = Depends(current_store)) -> HealthOut:
     """The measurement that decides whether this is worth paying for.
 
     Reported to the customer, not just to the operator, verdict included. A

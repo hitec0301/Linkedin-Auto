@@ -1,10 +1,8 @@
 """Per-tenant usage metering and the cap that goes with it.
 
-The operator pays for inference, which is a different business from the
-single-tenant tool where the owner's own API key was the natural limit. Here a
-tenant with an enthusiastic source list can spend somebody else's money, so
-every model call is counted against a monthly allowance and refused once it is
-gone.
+The operator pays for inference, so a customer with an enthusiastic source
+list is spending somebody else's money. Every model call is counted against a
+monthly allowance and refused once it is gone.
 
 Recorded per call, append-only, and summed on read. A running counter would be
 cheaper and would drift, and a drifting counter is either a customer cut off

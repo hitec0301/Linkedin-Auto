@@ -28,7 +28,7 @@ from lnp import log, runner, voice
 from lnp.alerts import job_guard
 from lnp.config import load_config
 from lnp.models import health_stats
-from lnp.store import AmendmentRecord, FeedbackRecord
+from lnp.db.store import AmendmentRecord, FeedbackRecord
 from lnp.util import iso
 
 logger = log.get("voice_amend")

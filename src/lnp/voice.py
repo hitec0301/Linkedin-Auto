@@ -1,8 +1,8 @@
 """Voice acquisition: the card, the feedback signals, and rule proposals.
 
-The voice card is a hand-editable markdown file. Not an embedding, not a
-fine-tune — a file the human can open and fix in thirty seconds, which is the
-property that matters when a draft comes out wrong on a Tuesday morning.
+The voice card is hand-editable markdown. Not an embedding, not a fine-tune —
+a text the customer can open and fix in thirty seconds, which is the property
+that matters when a draft comes out wrong on a Tuesday morning.
 
 Two feedback signals feed it, weighted differently:
 
@@ -19,13 +19,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from rapidfuzz import fuzz
 
 from . import log
-from .config import REPO_ROOT, Config
+from .config import Config
 from .llm import complete_json
 from .models import Row, Status
 from .util import normalized_edit_distance
@@ -50,18 +49,6 @@ class FeedbackItem:
     draft_text: str = ""
     final_text: str = ""
 
-    def as_values(self, created_at: str, item_id: str) -> List[str]:
-        return [
-            item_id,
-            created_at,
-            self.row_id,
-            self.signal,
-            self.instruction,
-            self.draft_text,
-            self.final_text,
-            "",  # Processed — set by the voice job once a proposal is made
-        ]
-
 
 @dataclass
 class Proposal:
@@ -76,21 +63,6 @@ class Proposal:
 # --------------------------------------------------------------------------
 # The card
 # --------------------------------------------------------------------------
-
-
-def card_path(config: Config) -> Path:
-    configured = config.get("voice.card_path", "config/voice_card.md")
-    path = Path(configured)
-    return path if path.is_absolute() else REPO_ROOT / path
-
-
-def load_card(config: Config) -> str:
-    path = card_path(config)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"voice card not found at {path}; the pipeline will not draft without it"
-        )
-    return path.read_text(encoding="utf-8")
 
 
 def existing_amendments(card: str) -> List[str]:
@@ -134,17 +106,6 @@ def amend_card_text(card: str, rules: Sequence[str], where: str = "the voice car
         return card, []
     insertion = "".join(f"- {rule}\n" for rule in written)
     return card.replace(AMENDMENTS_END, insertion + AMENDMENTS_END), written
-
-
-def append_amendments(config: Config, rules: Sequence[str]) -> List[str]:
-    """Amend the card on disk. The single-tenant path."""
-    path = card_path(config)
-    card, written = amend_card_text(path.read_text(encoding="utf-8"), rules, str(path))
-    if not written:
-        return []
-    path.write_text(card, encoding="utf-8")
-    logger.info("voice card amended", extra={"rules": written, "path": str(path)})
-    return written
 
 
 def amend_card_in_store(store, rules: Sequence[str]) -> List[str]:
@@ -199,14 +160,13 @@ def build_voice_context(
     angle: str = "",
     published: Optional[Sequence[Row]] = None,
     post_count: int = 0,
-    card: Optional[str] = None,
+    card: str = "",
 ) -> str:
     """The voice block that opens every drafting prompt.
 
-    `card` is passed in when the card belongs to a tenant rather than to this
-    checkout; omitted, it comes off disk as it always did.
+    The card is passed in because it belongs to a tenant, not to this checkout.
     """
-    parts = [(card if card is not None else load_card(config)).strip()]
+    parts = [card.strip()]
     threshold = int(config.get("voice.retrieval_min_posts", 20))
     published = [r for r in (published or []) if r.status == Status.POSTED]
 

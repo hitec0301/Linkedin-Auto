@@ -28,7 +28,7 @@ from .util import (
 
 
 class Status:
-    """The row lifecycle. Values are written verbatim into the Sheet."""
+    """The row lifecycle."""
 
     NEW = "NEW"
     DRAFTED = "DRAFTED"
@@ -107,7 +107,8 @@ def assert_transition(current: str, target: str) -> None:
 
 
 # Column order is load-bearing: it is the physical layout of the Pipeline tab.
-# Adding a column means migrating the Sheet, so append rather than insert.
+# Adding a column means a migration and a mapping in db.store.FIELDS, so
+# append rather than insert.
 COLUMNS: List[str] = [
     "ID",
     "CreatedAt",
@@ -227,8 +228,10 @@ ALL_THEMES: List[str] = [Theme.AI, Theme.PLATFORM, Theme.DELIVERY, Theme.STRATEG
 class Row:
     """One candidate item, from ingestion through to a published post.
 
-    Field names mirror `COLUMNS` exactly so `to_values`/`from_values` stay a
-    pure positional mapping.
+    Every field is a string. That is a leftover from when this pipeline stored
+    its rows in a spreadsheet, where a cell had no other type; the database
+    columns are properly typed and `db.store.FIELDS` is the one place the two
+    meet. Retyping this is worth doing and is a change on its own.
     """
 
     ID: str = ""
@@ -253,36 +256,6 @@ class Row:
     EditDistance: str = ""
     Reach: str = ""
     Error: str = ""
-
-    # Not a Sheet column: the 1-based row number this came from, so a job can
-    # write back to the right place.
-    row_number: Optional[int] = field(default=None, compare=False, repr=False)
-
-    # ---- serialisation -------------------------------------------------
-
-    def to_values(self) -> List[str]:
-        """Positional cell values in COLUMNS order."""
-        return ["" if getattr(self, name) is None else str(getattr(self, name)) for name in COLUMNS]
-
-    @classmethod
-    def from_values(
-        cls, values: Sequence, row_number: Optional[int] = None
-    ) -> "Row":
-        """Build a Row from a Sheet record. Short rows pad with blanks.
-
-        gspread truncates trailing empty cells, so a row that has never been
-        drafted arrives shorter than the header. That is normal, not an error.
-        """
-        padded = list(values) + [""] * (len(COLUMNS) - len(values))
-        kwargs = {
-            name: ("" if padded[i] is None else str(padded[i]))
-            for i, name in enumerate(COLUMNS)
-        }
-        return cls(row_number=row_number, **kwargs)
-
-    @classmethod
-    def from_dict(cls, record: Dict, row_number: Optional[int] = None) -> "Row":
-        return cls.from_values([record.get(name, "") for name in COLUMNS], row_number)
 
     # ---- derived views -------------------------------------------------
 

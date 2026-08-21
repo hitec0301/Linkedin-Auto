@@ -1,14 +1,10 @@
 # LinkedIn L&D publishing pipeline — configuration.
 # Secrets live in the environment, never here.
 
-sheet:
-  # Tab names. Changing one means renaming the tab in the Sheet too.
-  pipeline_tab: Pipeline
-  history_tab: History
-  feedback_tab: Feedback
-  amendments_tab: VoiceAmendments
-  config_tab: Config
-  # Rows older than this are moved from Pipeline to History. Nothing is deleted.
+retention:
+  # Finished rows older than this stop appearing in the pipeline. They are
+  # archived, never deleted: dedupe checks against them and the health metric
+  # is computed from them.
   archive_after_days: 90
 
 ingest:

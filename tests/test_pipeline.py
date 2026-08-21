@@ -34,6 +34,15 @@ from lnp.util import (
     utcnow,
 )
 
+from conftest import (
+    TENANT,
+    connect_linkedin,
+    make_run,
+    make_store,
+    pipeline_config,
+    rows_of,
+)
+
 
 # --------------------------------------------------------------------------
 # 1. Status state machine
@@ -144,40 +153,14 @@ def test_column_order_is_exact():
     ]
 
 
-def test_row_round_trips():
-    row = Row(
-        ID="01HZY",
-        CreatedAt="2026-01-01T00:00:00Z",
-        SourceURL="https://example.com/a",
-        SourceTitle="A title",
-        Audience="AUD_CORPORATE",
-        Theme="THM_AI",
-        WhyItMatters="It implies something.",
-        RelevanceScore="7.8",
-        Selected="TRUE",
-        Angle="The angle",
-        DraftText="draft",
-        FinalText="final",
-        RevisionNote="",
-        RevisionCount="1",
-        CharCount="1100",
-        Status=Status.APPROVED,
-        ScheduledFor="2026-01-02T12:00:00Z",
-        PostURN="urn:li:share:1",
-        PostedAt="",
-        EditDistance="0.1",
-        Reach="500",
-        Error="",
-    )
-    assert Row.from_values(row.to_values()) == row
+def test_every_column_has_a_field_and_a_place_to_be_stored():
+    """A column with no field, or no mapping, is a column the customer loses."""
+    from lnp.db.store import BY_COLUMN
 
-
-def test_short_row_pads_with_blanks():
-    """gspread truncates trailing empties; a never-drafted row is short."""
-    row = Row.from_values(["01HZY", "2026-01-01T00:00:00Z", "https://x.test/a"])
-    assert row.SourceTitle == ""
-    assert row.status == Status.NEW
-    assert len(row.to_values()) == len(COLUMNS)
+    row = Row()
+    for name in COLUMNS:
+        assert hasattr(row, name), f"{name} has no field on Row"
+        assert name in BY_COLUMN, f"{name} has nowhere to be stored"
 
 
 def test_final_text_takes_precedence_over_draft():
@@ -444,14 +427,12 @@ def test_extract_json_tolerates_fences_and_preamble():
 # 8. Voice card
 # --------------------------------------------------------------------------
 
-import shutil
-
 from lnp import voice
 from lnp.voice import (
     AMENDMENTS_BEGIN,
     AMENDMENTS_END,
     FeedbackItem,
-    append_amendments,
+    amend_card_text,
     build_voice_context,
     collect_feedback,
     existing_amendments,
@@ -459,42 +440,43 @@ from lnp.voice import (
     retrieve_examples,
 )
 
+STARTER_CARD = (
+    Path(__file__).resolve().parents[1] / "config" / "voice_card.md"
+).read_text()
+
 
 @pytest.fixture
-def card_config(tmp_path):
-    card = tmp_path / "voice_card.md"
-    shutil.copy(
-        Path(__file__).resolve().parents[1] / "config" / "voice_card.md", card
-    )
-    return Config({"voice": {"card_path": str(card), "retrieval_min_posts": 20}})
+def card_config():
+    return Config({"voice": {"retrieval_min_posts": 20}})
 
 
-def test_shipped_card_has_markers_and_banned_list():
-    text = (Path(__file__).resolve().parents[1] / "config" / "voice_card.md").read_text()
-    assert AMENDMENTS_BEGIN in text and AMENDMENTS_END in text
+def test_starter_card_has_markers_and_banned_list():
+    """Every new account is seeded from this, so it has to be usable as-is."""
+    assert AMENDMENTS_BEGIN in STARTER_CARD and AMENDMENTS_END in STARTER_CARD
     for banned in ["game-changer", "delve", "Thoughts?", "in today's rapidly evolving landscape"]:
-        assert banned in text
+        assert banned in STARTER_CARD
 
 
-def test_appending_amendments_is_idempotent(card_config):
+def test_amending_a_card_is_idempotent():
     rule = "Delete the closing question; end on the strongest declarative sentence."
-    assert append_amendments(card_config, [rule]) == [rule]
-    assert append_amendments(card_config, [rule]) == []
-    card = voice.card_path(card_config).read_text()
-    assert card.count(rule) == 1
-    assert existing_amendments(card) == [rule]
-    assert card.index(rule) < card.index(AMENDMENTS_END)
+    once, written = amend_card_text(STARTER_CARD, [rule])
+    assert written == [rule]
+    twice, written_again = amend_card_text(once, [rule])
+    assert written_again == []
+    assert twice.count(rule) == 1
+    assert existing_amendments(twice) == [rule]
+    assert twice.index(rule) < twice.index(AMENDMENTS_END)
 
 
-def test_appending_rejects_a_card_without_markers(card_config, tmp_path):
-    path = voice.card_path(card_config)
-    path.write_text("no markers here")
+def test_amending_rejects_a_card_without_markers():
     with pytest.raises(ValueError):
-        append_amendments(card_config, ["a rule"])
+        amend_card_text("no markers here", ["a rule"])
 
 
 def test_voice_context_says_there_is_no_corpus_before_twenty_posts(card_config):
-    context = build_voice_context(card_config, angle="an angle", published=[], post_count=0)
+    context = build_voice_context(
+        card_config, angle="an angle", published=[], post_count=0, card=STARTER_CARD
+    )
     assert "No corpus yet" in context
     assert "generic LinkedIn conventions" in context
 
@@ -507,7 +489,8 @@ def test_voice_context_uses_examples_once_the_corpus_exists(card_config):
             DraftText="Tutoring evidence text."),
     ]
     context = build_voice_context(
-        card_config, angle="LMS procurement is broken", published=published, post_count=25
+        card_config, angle="LMS procurement is broken", published=published,
+        post_count=25, card=STARTER_CARD,
     )
     assert "Published examples" in context
     assert "Procurement text" in context
@@ -683,193 +666,64 @@ def test_revision_prompt_carries_the_note_and_previous_draft():
 
 
 # --------------------------------------------------------------------------
-# 10. Sheet writes, and the publish invariants
+# 10. Store writes, and the publish invariants
 # --------------------------------------------------------------------------
 
-import re as _re
-
-from lnp import sheets as sheets_mod
 from lnp.models import COLUMN_INDEX, health_stats
-from lnp.sheets import Sheets
 
 
-class FakeWorksheet:
-    """In-memory stand-in for a gspread worksheet, A1 notation and all."""
-
-    def __init__(self, header, rows=None, title="Pipeline"):
-        self.title = title
-        self.id = 0
-        self.col_count = len(header)
-        self.values = [list(header)] + [list(r) for r in (rows or [])]
-
-    def get_all_values(self):
-        return [list(r) for r in self.values]
-
-    def row_values(self, n):
-        return list(self.values[n - 1])
-
-    def _cell(self, a1):
-        match = _re.match(r"([A-Z]+)(\d+)", a1)
-        letters, row = match.group(1), int(match.group(2))
-        col = 0
-        for ch in letters:
-            col = col * 26 + (ord(ch) - 64)
-        return row, col - 1
-
-    def _ensure(self, row, col):
-        while len(self.values) < row:
-            self.values.append([""] * len(self.values[0]))
-        while len(self.values[row - 1]) <= col:
-            self.values[row - 1].append("")
-
-    def batch_update(self, data, value_input_option=None):
-        for entry in data:
-            row, col = self._cell(entry["range"].split(":")[0])
-            self._ensure(row, col)
-            self.values[row - 1][col] = entry["values"][0][0]
-
-    def update(self, values=None, range_name=None, value_input_option=None):
-        row, col = self._cell(range_name.split(":")[0])
-        self._ensure(row, col)
-        self.values[row - 1][col] = values[0][0]
-
-    def append_rows(self, rows, value_input_option=None):
-        for row in rows:
-            self.values.append(list(row))
-
-    def append_row(self, row, value_input_option=None):
-        self.values.append(list(row))
-
-    def delete_rows(self, n):
-        del self.values[n - 1]
-
-
-class FakeSpreadsheet:
-    def __init__(self, tabs):
-        self.tabs = tabs
-        self.url = "https://sheets.test/fake"
-
-    def worksheet(self, title):
-        if title not in self.tabs:
-            raise sheets_mod.gspread.exceptions.WorksheetNotFound(title)
-        return self.tabs[title]
-
-    def worksheets(self):
-        return list(self.tabs.values())
-
-
-SHEET_CONFIG = Config({
-    "sheet": {
-        "pipeline_tab": "Pipeline", "history_tab": "History",
-        "feedback_tab": "Feedback", "amendments_tab": "VoiceAmendments",
-        "config_tab": "Config", "archive_after_days": 90,
-    },
-    "publish": {"staleness_hours": 48, "dry_run": True, "max_posts_per_run": 1},
-})
-
-
-def make_sheets(rows=(), paused="FALSE"):
-    pipeline = FakeWorksheet(COLUMNS, [r.to_values() for r in rows])
-    config_tab = FakeWorksheet(
-        ["Key", "Value", "Notes"], [["PAUSED", paused, ""], ["POST_COUNT", "3", ""]],
-        title="Config",
-    )
-    history = FakeWorksheet(sheets_mod.HISTORY_COLUMNS, title="History")
-    return Sheets(
-        FakeSpreadsheet({"Pipeline": pipeline, "Config": config_tab, "History": history}),
-        SHEET_CONFIG,
-    )
-
-
-def patch_store(monkeypatch, sheets):
-    """Point the job runner at a fake Sheet.
-
-    The jobs no longer know what storage is; they ask the runner for a store.
-    Patching the adapter's `open` is the one seam that leaves everything below
-    it — the real Sheets logic, the real guards — running.
-    """
-    from lnp import runner as runner_mod
-    from lnp.store import SheetsStore
-
-    monkeypatch.setattr(
-        runner_mod.SheetsStore, "open",
-        staticmethod(lambda config, sheet_id=None: SheetsStore(sheets, config)),
-    )
-
-
-def make_run(sheets, alerts=None):
-    """A `runner.Run` over a fake Sheet, with alerts captured if asked."""
-    from lnp import runner as runner_mod
-    from lnp.store import SheetsStore
-
-    run = runner_mod.Run(config=SHEET_CONFIG, store=SheetsStore(sheets, SHEET_CONFIG))
-    if alerts is not None:
-        run.alert = lambda title, body="", **kw: alerts.append(title)
-    return run
-
-
-def test_sheet_write_refuses_human_columns():
-    row = Row(ID="a", Status=Status.DRAFTED)
-    s = make_sheets([row])
-    live = s.pipeline_rows()[0]
+def test_store_write_refuses_human_columns():
+    store = make_store([Row(ID="01A", Status=Status.DRAFTED)])
+    live = store.pipeline_rows()[0]
     with pytest.raises(ColumnPermissionError):
-        s.write(live, {"Angle": "a job must never write this"})
+        store.write(live, {"Angle": "a job must never write this"})
     with pytest.raises(ColumnPermissionError):
-        s.write(live, {"FinalText": "nor this"})
-    s.write(live, {"DraftText": "but this is fine"})
-    assert s.pipeline_rows()[0].DraftText == "but this is fine"
+        store.write(live, {"FinalText": "nor this"})
+    store.write(live, {"DraftText": "but this is fine"})
+    assert rows_of(store)[0].DraftText == "but this is fine"
 
 
-def test_sheet_transition_refuses_illegal_moves_before_writing():
-    row = Row(ID="a", Status=Status.DRAFTED, DraftText="d")
-    s = make_sheets([row])
-    live = s.pipeline_rows()[0]
+def test_store_transition_refuses_illegal_moves_before_writing():
+    store = make_store([Row(ID="01A", Status=Status.DRAFTED, DraftText="d")])
+    live = store.pipeline_rows()[0]
     with pytest.raises(TransitionError):
-        s.transition(live, Status.POSTING, {"PostURN": "urn:li:share:1"})
-    stored = s.pipeline_rows()[0]
+        store.transition(live, Status.POSTED, {"PostURN": "urn:li:share:1"})
+    stored = rows_of(store)[0]
     assert stored.status == Status.DRAFTED
-    assert stored.PostURN == ""          # nothing was written
+    assert stored.PostURN == ""
 
 
 def test_revision_note_can_only_be_cleared_through_the_exception():
-    row = Row(ID="a", Status=Status.REVISE, RevisionNote="cut the question")
-    s = make_sheets([row])
-    live = s.pipeline_rows()[0]
+    store = make_store([Row(ID="01A", Status=Status.REVISE, RevisionNote="shorter")])
+    live = store.pipeline_rows()[0]
     with pytest.raises(ColumnPermissionError):
-        s.transition(live, Status.DRAFTED, {"RevisionNote": ""})
-    s.transition(live, Status.DRAFTED, {"RevisionNote": "", "DraftText": "new"},
-                 allow_revision_note=True)
-    assert s.pipeline_rows()[0].RevisionNote == ""
+        store.write(live, {"RevisionNote": ""})
+    store.write(live, {"RevisionNote": ""}, allow_revision_note=True)
+    assert rows_of(store)[0].RevisionNote == ""
 
 
 def test_kill_switch_reads_paused():
-    assert make_sheets(paused="TRUE").is_paused() is True
-    assert make_sheets(paused="true").is_paused() is True
-    assert make_sheets(paused="FALSE").is_paused() is False
+    assert make_store(paused="TRUE").is_paused() is True
+    assert make_store(paused="FALSE").is_paused() is False
 
 
 def test_missing_paused_key_counts_as_paused():
-    """If the human's stop button is unreachable, assume it might be pressed."""
-    s = make_sheets()
-    s.worksheet("Config").values = [["Key", "Value", "Notes"]]
-    assert s.is_paused() is True
+    """An unreachable stop button might be pressed. Assume it is."""
+    store = make_store()
+    store.set_config_value("PAUSED", "")
+    assert store.is_paused() is True
 
 
 def test_expire_stale_only_touches_drafted_and_approved():
-    now = utcnow()
-    old = (now - timedelta(hours=72)).isoformat()
-    rows = [
-        Row(ID="a", Status=Status.APPROVED, ScheduledFor=old),
-        Row(ID="b", Status=Status.DRAFTED, ScheduledFor=old),
-        Row(ID="c", Status=Status.POSTED, ScheduledFor=old, PostedAt=old),
-        Row(ID="d", Status=Status.APPROVED, ScheduledFor=(now - timedelta(hours=1)).isoformat()),
-    ]
-    s = make_sheets(rows)
-    expired = s.expire_stale(s.pipeline_rows(), 48)
-    assert {r.ID for r in expired} == {"a", "b"}
-    by_id = {r.ID: r.status for r in s.pipeline_rows()}
-    assert by_id == {"a": Status.EXPIRED, "b": Status.EXPIRED,
-                     "c": Status.POSTED, "d": Status.APPROVED}
+    old = (utcnow() - timedelta(hours=100)).isoformat()
+    store = make_store([
+        Row(ID="01A", Status=Status.DRAFTED, ScheduledFor=old),
+        Row(ID="01B", Status=Status.APPROVED, ScheduledFor=old),
+        Row(ID="01C", Status=Status.POSTED, ScheduledFor=old),
+        Row(ID="01D", Status=Status.NEW, ScheduledFor=old),
+    ])
+    expired = store.expire_stale(store.pipeline_rows(), 48)
+    assert {r.ID for r in expired} == {"01A", "01B"}
 
 
 # ---- Job C ---------------------------------------------------------------
@@ -891,7 +745,7 @@ def test_job_c_acts_only_on_approved():
         Row(ID="skipped", Status=Status.SKIPPED, ScheduledFor=past),
         Row(ID="expired", Status=Status.EXPIRED, ScheduledFor=past),
     ]
-    assert [r.ID for r in publish_job.due_rows(rows, SHEET_CONFIG, now)] == ["approved"]
+    assert [r.ID for r in publish_job.due_rows(rows, pipeline_config(), now)] == ["approved"]
 
 
 def test_job_c_skips_future_and_stale_rows():
@@ -904,13 +758,13 @@ def test_job_c_skips_future_and_stale_rows():
         Row(ID="due", Status=Status.APPROVED,
             ScheduledFor=(now - timedelta(minutes=5)).isoformat()),
     ]
-    assert [r.ID for r in publish_job.due_rows(rows, SHEET_CONFIG, now)] == ["due"]
+    assert [r.ID for r in publish_job.due_rows(rows, pipeline_config(), now)] == ["due"]
 
 
 def test_stuck_posting_row_is_never_blindly_retried():
     """Unverifiable means leave it alone and tell a human. Never republish."""
     row = Row(ID="stuck", Status=Status.POSTING, DraftText="body text")
-    s = make_sheets([row])
+    store = make_store([row])
     alerts = []
 
     class UnhelpfulAPI:
@@ -920,11 +774,11 @@ def test_stuck_posting_row_is_never_blindly_retried():
         def create_post(self, payload):  # pragma: no cover - must never run
             raise AssertionError("a stuck row must never be republished")
 
-    run = make_run(s, alerts)
+    run = make_run(store, alerts)
     publish_job.resolve_stuck_rows(
         run, run.store.pipeline_rows(), UnhelpfulAPI(), "urn:li:person:x"
     )
-    assert s.pipeline_rows()[0].status == Status.POSTING   # untouched
+    assert rows_of(store)[0].status == Status.POSTING   # untouched
     # Untouched, but not unreported: this is the one case only a human can
     # resolve, so silence here would be the worst outcome.
     assert len(alerts) == 1
@@ -933,57 +787,57 @@ def test_stuck_posting_row_is_never_blindly_retried():
 
 def test_stuck_row_confirmed_live_becomes_posted():
     row = Row(ID="stuck", Status=Status.POSTING, DraftText="body text")
-    s = make_sheets([row])
+    store = make_store([row])
 
     class ConfirmingAPI:
         def find_recent_post(self, author, text):
             return True, "urn:li:share:999"
 
-    run = make_run(s)
+    run = make_run(store)
     publish_job.resolve_stuck_rows(
         run, run.store.pipeline_rows(), ConfirmingAPI(), "urn:li:person:x"
     )
-    stored = s.pipeline_rows()[0]
+    stored = rows_of(store)[0]
     assert stored.status == Status.POSTED
     assert stored.PostURN == "urn:li:share:999"
 
 
 def test_stuck_row_confirmed_absent_becomes_failed():
     row = Row(ID="stuck", Status=Status.POSTING, DraftText="body text")
-    s = make_sheets([row])
+    store = make_store([row])
 
     class DenyingAPI:
         def find_recent_post(self, author, text):
             return False, None
 
-    run = make_run(s)
+    run = make_run(store)
     publish_job.resolve_stuck_rows(
         run, run.store.pipeline_rows(), DenyingAPI(), "urn:li:person:x"
     )
-    assert s.pipeline_rows()[0].status == Status.FAILED
+    assert rows_of(store)[0].status == Status.FAILED
 
 
 from lnp.linkedin import LinkedIn, LinkedInError, PostNotConfirmed
 
 
 def test_posting_is_written_to_the_sheet_before_the_http_call():
-    """A crashed run must leave evidence in the Sheet, not a silent gap."""
+    """A crashed run must leave evidence in the row, not a silent gap."""
     row = Row(ID="a", Status=Status.APPROVED, DraftText="body")
-    s = make_sheets([row])
-    live = s.pipeline_rows()[0]
+    store = make_store([row])
+    live = store.pipeline_rows()[0]
     seen = {}
 
     class WatchingAPI:
         def create_post(self, payload):
-            seen["status_during_call"] = s.pipeline_rows()[0].status
+            seen["status_during_call"] = store.pipeline_rows()[0].status
             return "urn:li:share:1"
 
-    s.transition(live, Status.POSTING, {"Error": ""})
+    store.transition(live, Status.POSTING, {"Error": ""})
     urn = WatchingAPI().create_post({})
-    s.transition(live, Status.POSTED, {"PostURN": urn, "PostedAt": iso_now()})
+    store.transition(live, Status.POSTED, {"PostURN": urn, "PostedAt": iso_now()})
 
     assert seen["status_during_call"] == Status.POSTING
-    assert s.pipeline_rows()[0].status == Status.POSTED
+    assert rows_of(store)[0].status == Status.POSTED
 
 
 def iso_now():
@@ -997,14 +851,14 @@ def test_ambiguous_row_with_both_variants_is_refused():
     row = Row(ID="a", Status=Status.APPROVED, DraftText=text)
     assert contains_both_variants(row.effective_text) is True
 
-    s = make_sheets([row])
+    store = make_store([row])
     alerts = []
-    run = make_run(s, alerts)
+    run = make_run(store, alerts)
 
     live = run.store.pipeline_rows()[0]
     publish_job.flag(run, live, "ambiguous: both variants are still present",
                      "title", "body")
-    stored = s.pipeline_rows()[0]
+    stored = rows_of(store)[0]
     assert stored.status == Status.APPROVED           # nothing was posted, nothing broken
     assert "ambiguous" in stored.Error
     assert len(alerts) == 1
@@ -1130,7 +984,7 @@ def test_publish_dry_run_logs_a_full_payload_and_posts_nothing(monkeypatch, caps
     row = Row(ID="01ROW", Status=Status.APPROVED,
               ScheduledFor=(now - timedelta(minutes=10)).isoformat(),
               DraftText="The claim.\n\nThe evidence.\n\nhttps://x.test/a")
-    s = make_sheets([row])
+    store = connect_linkedin(make_store([row], tenants=(TENANT,)))
 
     class FakeAPI:
         base = "https://api.linkedin.com"
@@ -1148,11 +1002,6 @@ def test_publish_dry_run_logs_a_full_payload_and_posts_nothing(monkeypatch, caps
             raise AssertionError("dry run must not call the API")
 
     monkeypatch.setattr(publish_job, "load_config", real_config)
-    patch_store(monkeypatch, s)
-    monkeypatch.setattr(publish_job.token_mod, "load_fresh",
-                        lambda config, **kw: TokenSet(access_token="t"))
-    monkeypatch.setattr(publish_job.token_mod, "cache_person_urn",
-                        lambda *a, **kw: None)
     monkeypatch.setattr(publish_job, "LinkedIn", FakeAPI)
     monkeypatch.setattr(sys, "argv", ["publish.py", "--dry-run"])
 
@@ -1171,26 +1020,25 @@ def test_publish_dry_run_logs_a_full_payload_and_posts_nothing(monkeypatch, caps
     assert payload["distribution"]["feedDistribution"] == "MAIN_FEED"
 
     # Nothing moved: the row is still waiting for a real run.
-    assert s.pipeline_rows()[0].status == Status.APPROVED
+    assert rows_of(store)[0].status == Status.APPROVED
 
 
 def test_publish_stops_at_the_kill_switch(monkeypatch, capsys):
     row = Row(ID="01ROW", Status=Status.APPROVED,
               ScheduledFor=(utcnow() - timedelta(minutes=10)).isoformat(),
               DraftText="body")
-    s = make_sheets([row], paused="TRUE")
+    store = make_store([row], paused="TRUE", tenants=(TENANT,))
 
     def explode(*a, **kw):  # pragma: no cover - must never run
         raise AssertionError("PAUSED must stop the job before tokens are touched")
 
     monkeypatch.setattr(publish_job, "load_config", real_config)
-    patch_store(monkeypatch, s)
     monkeypatch.setattr(publish_job.token_mod, "load_fresh", explode)
     monkeypatch.setattr(sys, "argv", ["publish.py"])
 
     assert publish_job.main() == 0
     assert "paused" in capsys.readouterr().out.lower()
-    assert s.pipeline_rows()[0].status == Status.APPROVED
+    assert rows_of(store)[0].status == Status.APPROVED
 
 
 def test_draft_job_drafts_a_selected_row_and_regenerates_a_revise_row(monkeypatch):
@@ -1205,11 +1053,10 @@ def test_draft_job_drafts_a_selected_row_and_regenerates_a_revise_row(monkeypatc
         Row(ID="01UNS", Status=Status.NEW, Selected="", Angle="",
             SourceURL="https://x.test/c", SourceTitle="C title"),
     ]
-    s = make_sheets(rows)
+    store = make_store(rows, tenants=(TENANT,))
     seen = {}
 
     monkeypatch.setattr(draft_job, "load_config", real_config)
-    patch_store(monkeypatch, s)
     monkeypatch.setattr(draft_job.voice, "build_voice_context",
                         lambda config, **kw: "VOICE CONTEXT")
     def fake_draft(config, row, ctx, **kw):
@@ -1226,7 +1073,7 @@ def test_draft_job_drafts_a_selected_row_and_regenerates_a_revise_row(monkeypatc
 
     assert draft_job.main() == 0
 
-    stored = {r.ID: r for r in s.pipeline_rows()}
+    stored = {r.ID: r for r in rows_of(store)}
 
     drafted = stored["01NEW"]
     assert drafted.status == Status.DRAFTED
@@ -1251,11 +1098,10 @@ def test_draft_job_skips_a_row_that_hit_the_revision_cap(monkeypatch):
     row = Row(ID="01CAP", Status=Status.REVISE, Selected="TRUE", Angle="an angle",
               DraftText="draft", RevisionNote="try again", RevisionCount="3",
               SourceURL="https://x.test/a", SourceTitle="T")
-    s = make_sheets([row])
+    store = make_store([row], tenants=(TENANT,))
     alerts = []
 
     monkeypatch.setattr(draft_job, "load_config", real_config)
-    patch_store(monkeypatch, s)
     monkeypatch.setattr(
         "lnp.runner.alert",
         lambda cfg, title, body="", **kw: alerts.append(f"{title} {body}"),
@@ -1265,7 +1111,7 @@ def test_draft_job_skips_a_row_that_hit_the_revision_cap(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["draft.py"])
 
     assert draft_job.main() == 0
-    assert s.pipeline_rows()[0].status == Status.SKIPPED
+    assert rows_of(store)[0].status == Status.SKIPPED
     assert any("angle is the problem, not the prose" in a for a in alerts)
 
 
@@ -1331,16 +1177,15 @@ def test_curate_job_writes_ten_tagged_candidates(monkeypatch, capsys):
             for item in items
         ]
 
-    s = make_sheets()
+    store = make_store(tenants=(TENANT,))
     monkeypatch.setattr(curate_job, "load_config", real_config)
-    patch_store(monkeypatch, s)
     monkeypatch.setattr(curate_job.ingest, "fetch_feed", fake_fetch)
     monkeypatch.setattr("lnp.scoring.complete_json", fake_scorer)
     monkeypatch.setattr(sys, "argv", ["curate.py"])
 
     assert curate_job.main() == 0
 
-    rows = s.pipeline_rows()
+    rows = rows_of(store)
     assert len(rows) == 10
     assert all(r.Audience in audiences for r in rows)
     assert all(r.Theme in themes for r in rows)
@@ -1422,229 +1267,3 @@ def test_every_logging_call_in_the_repo_survives_its_own_field_names():
             records = _capture(lambda lg, k=keys: lg.info("e", extra={n: 1 for n in k}))
             assert records, f"logging call in {path.name} produced no record"
     assert checked > 10, f"expected to find many logging calls, found {checked}"
-
-
-# --------------------------------------------------------------------------
-# 14. Setup / onboarding
-# --------------------------------------------------------------------------
-
-import json as _json
-
-from lnp import onboarding as onb
-
-
-def test_sheet_id_accepted_as_url_or_bare_id():
-    """People have the URL in front of them, not the id."""
-    real = "1b3j52JEZ7tfDI5vmN1D_g9m3udBNmTxsjJ72YYevclc"
-    for text in [
-        real,
-        f"https://docs.google.com/spreadsheets/d/{real}/edit#gid=0",
-        f"https://docs.google.com/spreadsheets/d/{real}/edit?usp=sharing",
-        f"  https://docs.google.com/spreadsheets/d/{real}/  ",
-        f'"{real}"',
-    ]:
-        assert onb.parse_sheet_id(text) == real, text
-
-
-def test_sheet_id_rejects_things_that_are_not_one():
-    for text in ["", "   ", "not-an-id", "https://docs.google.com/document/d/" + "x" * 40]:
-        assert onb.parse_sheet_id(text) is None, text
-
-
-def test_sheet_check_explains_a_google_url_that_is_not_a_sheet():
-    check = onb.check_sheet_id("https://docs.google.com/document/d/" + "x" * 40)
-    assert check.ok is False
-    assert "spreadsheets" in check.fix
-
-
-def test_key_file_accepted_by_path_and_reports_the_share_address(tmp_path):
-    key = tmp_path / "link-auto-506113-e2ffa28879eb.json"
-    key.write_text(_json.dumps({
-        "client_email": "lnp@link-auto-506113.iam.gserviceaccount.com",
-        "private_key": "-----BEGIN PRIVATE KEY-----",
-        "project_id": "link-auto-506113",
-    }))
-    check = onb.check_key_file(str(key))
-    assert check.ok is True
-    assert check.extra["client_email"] == "lnp@link-auto-506113.iam.gserviceaccount.com"
-
-
-def test_key_file_accepted_as_inline_json():
-    """GitHub Actions holds the whole blob rather than a path."""
-    blob = _json.dumps({"client_email": "a@b.iam.gserviceaccount.com",
-                        "private_key": "k", "project_id": "p"})
-    assert onb.check_key_file(blob).ok is True
-
-
-def test_key_file_errors_are_specific(tmp_path):
-    missing = onb.check_key_file(str(tmp_path / "nope.json"))
-    assert missing.ok is False and "no file at" in missing.detail
-
-    not_json = tmp_path / "x.json"; not_json.write_text("not json at all")
-    assert "not JSON" in onb.check_key_file(str(not_json)).detail
-
-    wrong = tmp_path / "oauth.json"
-    wrong.write_text(_json.dumps({"installed": {"client_id": "x"}}))
-    check = onb.check_key_file(str(wrong))
-    assert check.ok is False
-    assert "client_email" in check.detail
-    assert "Keys tab" in check.fix
-
-
-def test_find_key_files_looks_where_the_file_actually_is(tmp_path):
-    """The exact situation that cost a round: filed under .secrets with the
-    name Google gave it, while .env expected the template name."""
-    root = tmp_path / "repo"; (root / ".secrets").mkdir(parents=True)
-    home = tmp_path / "home"; (home / "Downloads").mkdir(parents=True)
-    good = _json.dumps({"client_email": "a@b.iam.gserviceaccount.com",
-                        "private_key": "k", "project_id": "p"})
-    (root / ".secrets" / "link-auto-506113-e2ffa28879eb.json").write_text(good)
-    (home / "Downloads" / "unrelated.json").write_text('{"hello": "world"}')
-    (home / "Downloads" / "another-key.json").write_text(good)
-
-    found = onb.find_key_files(root, home)
-    assert found[0].name == "link-auto-506113-e2ffa28879eb.json"   # .secrets first
-    assert any(p.name == "another-key.json" for p in found)
-    assert not any(p.name == "unrelated.json" for p in found)      # not a key
-
-
-def test_install_key_keeps_googles_filename(tmp_path):
-    root = tmp_path / "repo"; root.mkdir()
-    src = tmp_path / "link-auto-506113-e2ffa28879eb.json"
-    src.write_text(_json.dumps({"client_email": "a@b.iam.gserviceaccount.com",
-                                "private_key": "k", "project_id": "p"}))
-    target = onb.install_key_file(src, root)
-    assert target.name == src.name          # renaming is what let the two facts disagree
-    assert target.parent.name == ".secrets"
-    assert oct(target.stat().st_mode)[-3:] == "600"
-
-
-def test_env_upsert_preserves_comments_and_other_keys(tmp_path):
-    env = tmp_path / ".env"
-    env.write_text("# my notes\nANTHROPIC_API_KEY=sk-ant-...\nCUSTOM=keepme\n")
-    onb.upsert_env(env, {"SHEET_ID": "abc123", "ANTHROPIC_API_KEY": "sk-ant-real"})
-    text = env.read_text()
-    assert "# my notes" in text
-    assert "CUSTOM=keepme" in text
-    values = onb.read_env(env)
-    assert values["ANTHROPIC_API_KEY"] == "sk-ant-real"
-    assert values["SHEET_ID"] == "abc123"
-    assert text.count("ANTHROPIC_API_KEY=") == 1     # replaced, not appended
-
-
-def test_env_upsert_creates_the_file_with_tight_permissions(tmp_path):
-    env = tmp_path / ".env"
-    onb.upsert_env(env, {"SHEET_ID": "abc"})
-    assert onb.read_env(env) == {"SHEET_ID": "abc"}
-    assert oct(env.stat().st_mode)[-3:] == "600"
-
-
-def test_placeholders_do_not_count_as_set():
-    """A placeholder reading as 'set' is worse than a blank; it looks done."""
-    assert onb.is_placeholder("sk-ant-...") is True
-    assert onb.is_placeholder("<your key here>") is True
-    assert onb.is_set("sk-ant-...") is False
-    assert onb.is_set("sk-ant-api03-realkey") is True
-    assert onb.is_set("") is False
-    assert onb.missing_required({"ANTHROPIC_API_KEY": "sk-ant-...",
-                                 "SHEET_ID": "abc", "GOOGLE_SA_JSON": "k.json"}) \
-        == ["ANTHROPIC_API_KEY"]
-
-
-def test_pasted_values_keep_their_label_stripped():
-    """Consoles show 'Client secret : value', and that is what gets pasted."""
-    assert onb.clean_pasted("client secret :  WPL_AP1.abc==") == "WPL_AP1.abc=="
-    assert onb.clean_pasted("Client ID: 77exampleid123") == "77exampleid123"
-    assert onb.clean_pasted('  "77exampleid123"  ') == "77exampleid123"
-    assert onb.clean_pasted("77exampleid123") == "77exampleid123"
-
-
-def test_linkedin_client_id_shape():
-    good = onb.check_linkedin_client_id("Client ID: 77exampleid123")
-    assert good.ok is True and good.extra["value"] == "77exampleid123"
-    assert onb.check_linkedin_client_id("").ok is False
-    assert onb.check_linkedin_client_id("772vtx01 ov0awb").ok is False   # pasted two fields
-    assert onb.check_linkedin_client_id("short").ok is False
-
-
-def test_linkedin_secret_shape():
-    good = onb.check_linkedin_secret("client secret :  WPL_AP1.EXAMPLE0000FAKE.aBcDeF==")
-    assert good.ok is True
-    assert good.extra["value"] == "WPL_AP1.EXAMPLE0000FAKE.aBcDeF=="
-    assert onb.check_linkedin_secret("").ok is False
-    assert onb.check_linkedin_secret("two words here").ok is False
-
-
-def test_a_secret_never_appears_whole_in_a_check_detail():
-    """Details get printed and logged; the value itself must not ride along."""
-    secret = "WPL_AP1.EXAMPLE0000FAKE.aBcDeF=="
-    check = onb.check_linkedin_secret(secret)
-    assert secret not in check.detail
-
-
-# --------------------------------------------------------------------------
-# 15. Token storage on a host with a volume
-# --------------------------------------------------------------------------
-
-from lnp import tokens as tok
-
-
-def _token_blob(**over):
-    base = {"access_token": "at", "refresh_token": "rt",
-            "expires_at": "2030-01-01T00:00:00Z",
-            "refresh_expires_at": "2030-06-01T00:00:00Z"}
-    base.update(over)
-    return base
-
-
-def test_tokens_seed_from_the_environment_when_the_volume_is_empty(tmp_path, monkeypatch):
-    """First deploy: the variable is the only source, and it must land on disk
-    so the next rotation has somewhere to go."""
-    monkeypatch.setenv("LINKEDIN_TOKENS_JSON", _json_mod.dumps(_token_blob()))
-    store = tok.SeededFileBackend(tmp_path / "linkedin_tokens.json")
-
-    loaded = store.load()
-    assert loaded.access_token == "at"
-    assert (tmp_path / "linkedin_tokens.json").exists(), "seed was not persisted"
-
-
-def test_the_volume_wins_over_the_seed_once_a_refresh_has_happened(tmp_path, monkeypatch):
-    """The whole point: a rotated token must not be overwritten by the stale
-    value still sitting in the variable."""
-    store = tok.SeededFileBackend(tmp_path / "linkedin_tokens.json")
-    store.save(tok.TokenSet(**_token_blob(access_token="rotated", refresh_token="rotated-rt")))
-    monkeypatch.setenv("LINKEDIN_TOKENS_JSON", _json_mod.dumps(_token_blob(access_token="stale")))
-
-    assert store.load().access_token == "rotated"
-
-
-def test_a_wiped_volume_re_seeds_rather_than_failing(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINKEDIN_TOKENS_JSON", _json_mod.dumps(_token_blob()))
-    store = tok.SeededFileBackend(tmp_path / "linkedin_tokens.json")
-    store.load()
-    (tmp_path / "linkedin_tokens.json").unlink()          # volume lost
-    assert store.load().access_token == "at"
-
-
-def test_a_malformed_seed_says_so_rather_than_looking_like_no_tokens(tmp_path, monkeypatch):
-    monkeypatch.setenv("LINKEDIN_TOKENS_JSON", "not json")
-    store = tok.SeededFileBackend(tmp_path / "linkedin_tokens.json")
-    with pytest.raises(tok.TokenError) as exc:
-        store.load()
-    assert "oauth_bootstrap" in str(exc.value)
-
-
-def test_backend_choice_follows_where_it_is_running(tmp_path, monkeypatch):
-    config = Config({"tokens": {"backend": "file", "file_path": str(tmp_path / "t.json")}})
-    for var in ("GITHUB_ACTIONS", "GIST_ID", "LINKEDIN_TOKENS_JSON", "RAILWAY_ENVIRONMENT"):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(tok, "env", lambda name, default=None: os.environ.get(name, default))
-
-    assert isinstance(tok.make_backend(config), tok.FileBackend)
-    assert not isinstance(tok.make_backend(config), tok.SeededFileBackend)
-
-    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
-    monkeypatch.setenv("LNP_DATA_DIR", str(tmp_path / "data"))
-    hosted = tok.make_backend(config)
-    assert isinstance(hosted, tok.SeededFileBackend)
-    assert str(hosted.path).startswith(str(tmp_path / "data")), "must write to the volume"

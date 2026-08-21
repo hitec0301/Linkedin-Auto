@@ -109,7 +109,7 @@ def curate(run: runner.Run, args) -> int:
         return 0
 
     store.append_rows(rows)
-    archived = store.archive_old_rows(int(config.get("sheet.archive_after_days", 90)))
+    archived = store.archive_old_rows(int(config.get("retention.archive_after_days", 90)))
     store.set_config_value("LAST_CURATE", iso())
 
     logger.info(

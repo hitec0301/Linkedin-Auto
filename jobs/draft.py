@@ -40,7 +40,7 @@ def next_slot(config, taken: Set[str], now: Optional[datetime] = None) -> str:
     """The next configured posting slot that no other row already holds.
 
     Slots are local-time weekday times from config; they come back as UTC ISO
-    strings because everything in the Sheet is UTC.
+    strings because every timestamp in this system is UTC.
     """
     now = now or utcnow()
     tz = ZoneInfo(config.get("schedule.timezone", "America/New_York"))

@@ -1,8 +1,8 @@
 """Engine and session handling.
 
 One engine per process, created lazily so importing the package does not
-require a database — the single-tenant install has none, and the tests build
-their own.
+require a database: the tests build their own, and a module import should not
+depend on a network service being up.
 """
 
 from __future__ import annotations

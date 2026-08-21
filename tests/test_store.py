@@ -1,29 +1,14 @@
-"""Conformance tests for the storage port.
-
-Every test in the parametrised section runs twice: once against the Sheet and
-once against Postgres. That is the point of the file. A port whose two
-implementations are only ever tested separately is not a port, it is two
-modules that happen to share method names, and the first sign of the
-difference is a customer's row going somewhere the tests never looked.
-
-The database tests run on SQLite in-memory by default so the suite needs no
-server. Set TEST_DATABASE_URL to run the same tests against real Postgres.
-"""
-
 from __future__ import annotations
 
-import os
 import sys
 from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from conftest import make_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from lnp.config import Config
 from lnp.models import (
     COLUMNS,
     ColumnPermissionError,
@@ -31,85 +16,37 @@ from lnp.models import (
     Status,
     TransitionError,
 )
-from lnp.store import AmendmentRecord, FeedbackRecord, SheetsStore, StoreError
 from lnp.util import iso, utcnow
 
 from lnp.db import crypto
-from lnp.db.schema import Base, Tenant, VoiceCard
-from lnp.db.store import BY_COLUMN, FIELDS, PostgresStore, from_db, to_db
-
-from lnp import sheets as sheets_mod
-from lnp.sheets import AMENDMENT_COLUMNS, FEEDBACK_COLUMNS, Sheets
-
-from test_pipeline import (  # the existing fake gspread
-    SHEET_CONFIG,
-    FakeSpreadsheet,
-    FakeWorksheet,
+from lnp.db.schema import Tenant
+from lnp.db.store import (
+    BY_COLUMN,
+    FIELDS,
+    AmendmentRecord,
+    FeedbackRecord,
+    PipelineStore,
+    StoreError,
+    from_db,
+    to_db,
 )
 
-TENANT = "01J000000000000000000000AA"
-OTHER_TENANT = "01J000000000000000000000BB"
-
-
-@pytest.fixture(autouse=True)
-def encryption_key(monkeypatch):
-    monkeypatch.setenv(crypto.ENV_KEY, crypto.generate_key())
-
-
-def new_engine():
-    engine = make_engine()
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
-    return engine
-
-
-def make_pg_store(rows=(), paused="FALSE", tenant_id=TENANT):
-    from sqlalchemy.orm import Session
-
-    engine = new_engine()
-    session = Session(engine)
-    for tid in {tenant_id, OTHER_TENANT}:
-        session.add(Tenant(id=tid, email=f"{tid}@example.test"))
-    session.commit()
-    store = PostgresStore(session, tenant_id, SHEET_CONFIG)
-    store.set_config_value("PAUSED", paused)
-    store.set_config_value("POST_COUNT", "3")
-    if rows:
-        store.append_rows([Row(**{c: getattr(r, c) for c in COLUMNS}) for r in rows])
-    return store
-
-
-def make_sheet_store(rows=(), paused="FALSE", tmp_path=None):
-    """The Sheet with all five tabs, so the port's whole surface is exercised."""
-    tabs = {
-        "Pipeline": FakeWorksheet(COLUMNS, [r.to_values() for r in rows]),
-        "Config": FakeWorksheet(
-            ["Key", "Value", "Notes"],
-            [["PAUSED", paused, ""], ["POST_COUNT", "3", ""]],
-            title="Config",
-        ),
-        "History": FakeWorksheet(sheets_mod.HISTORY_COLUMNS, title="History"),
-        "Feedback": FakeWorksheet(FEEDBACK_COLUMNS, title="Feedback"),
-        "VoiceAmendments": FakeWorksheet(AMENDMENT_COLUMNS, title="VoiceAmendments"),
-    }
-    return SheetsStore(Sheets(FakeSpreadsheet(tabs), SHEET_CONFIG), SHEET_CONFIG)
-
-
-BACKENDS = {"sheets": make_sheet_store, "postgres": make_pg_store}
-
-
-@pytest.fixture(params=sorted(BACKENDS))
-def make_store(request):
-    """A factory for one backend, so each test builds the state it needs."""
-    return BACKENDS[request.param]
+from conftest import (
+    OTHER_TENANT,
+    TENANT,
+    make_run,
+    make_store,
+    new_database,
+    pipeline_config,
+)
 
 
 # --------------------------------------------------------------------------
-# The guarantees, on every backend
+# The guarantees
 # --------------------------------------------------------------------------
 
 
-def test_store_refuses_to_write_human_columns(make_store):
+def test_store_refuses_to_write_human_columns():
     store = make_store([Row(ID="01AAA", Status=Status.DRAFTED, DraftText="d")])
     row = store.pipeline_rows()[0]
     for column in ("Angle", "FinalText", "Selected", "RevisionNote", "Reach"):
@@ -117,7 +54,7 @@ def test_store_refuses_to_write_human_columns(make_store):
             store.write(row, {column: "a job must never write this"})
 
 
-def test_rejected_write_leaves_storage_untouched(make_store):
+def test_rejected_write_leaves_storage_untouched():
     store = make_store([Row(ID="01AAA", Status=Status.DRAFTED, DraftText="original")])
     row = store.pipeline_rows()[0]
     with pytest.raises(ColumnPermissionError):
@@ -125,7 +62,7 @@ def test_rejected_write_leaves_storage_untouched(make_store):
     assert store.pipeline_rows()[0].DraftText == "original"
 
 
-def test_store_refuses_illegal_transitions(make_store):
+def test_store_refuses_illegal_transitions():
     store = make_store([Row(ID="01AAA", Status=Status.DRAFTED, DraftText="d")])
     row = store.pipeline_rows()[0]
     with pytest.raises(TransitionError):
@@ -133,7 +70,7 @@ def test_store_refuses_illegal_transitions(make_store):
     assert store.pipeline_rows()[0].Status == Status.DRAFTED
 
 
-def test_illegal_transition_writes_nothing_at_all(make_store):
+def test_illegal_transition_writes_nothing_at_all():
     """The other columns in the same call must not land either."""
     store = make_store([Row(ID="01AAA", Status=Status.DRAFTED, DraftText="d")])
     row = store.pipeline_rows()[0]
@@ -144,14 +81,14 @@ def test_illegal_transition_writes_nothing_at_all(make_store):
     assert live.PostURN == ""
 
 
-def test_legal_transition_writes_both_status_and_fields(make_store):
+def test_legal_transition_writes_both_status_and_fields():
     store = make_store([Row(ID="01AAA", Status=Status.APPROVED, DraftText="d")])
     row = store.pipeline_rows()[0]
     store.transition(row, Status.POSTING, {"Error": ""})
     assert store.pipeline_rows()[0].Status == Status.POSTING
 
 
-def test_revision_note_is_writable_only_on_the_revision_path(make_store):
+def test_revision_note_is_writable_only_on_the_revision_path():
     store = make_store([Row(ID="01AAA", Status=Status.REVISE, RevisionNote="shorter")])
     row = store.pipeline_rows()[0]
     with pytest.raises(ColumnPermissionError):
@@ -160,13 +97,13 @@ def test_revision_note_is_writable_only_on_the_revision_path(make_store):
     assert store.pipeline_rows()[0].RevisionNote == ""
 
 
-def test_missing_paused_key_reads_as_paused(make_store):
+def test_missing_paused_key_reads_as_paused():
     store = make_store([])
     store.set_config_value("PAUSED", "")
     assert store.is_paused() is True
 
 
-def test_paused_values_the_human_might_type(make_store):
+def test_paused_values_the_human_might_type():
     store = make_store([])
     for value in ("TRUE", "true", "yes", "1", "on"):
         store.set_config_value("PAUSED", value)
@@ -176,14 +113,14 @@ def test_paused_values_the_human_might_type(make_store):
         assert store.is_paused() is False, value
 
 
-def test_post_count_round_trips(make_store):
+def test_post_count_round_trips():
     store = make_store([])
     assert store.post_count() == 3
     assert store.bump_post_count() == 4
     assert store.post_count() == 4
 
 
-def test_expire_stale_only_touches_drafted_and_approved(make_store):
+def test_expire_stale_only_touches_drafted_and_approved():
     old = iso(utcnow() - timedelta(hours=100))
     store = make_store([
         Row(ID="01AAA", Status=Status.DRAFTED, ScheduledFor=old),
@@ -198,13 +135,13 @@ def test_expire_stale_only_touches_drafted_and_approved(make_store):
     assert by_id["01DDD"] == Status.NEW
 
 
-def test_append_rows_stamps_created_at(make_store):
+def test_append_rows_stamps_created_at():
     store = make_store([])
     store.append_rows([Row(ID="01AAA", SourceURL="https://example.test/a")])
     assert store.pipeline_rows()[0].CreatedAt
 
 
-def test_recent_index_returns_urls_and_titles(make_store):
+def test_recent_index_returns_urls_and_titles():
     store = make_store([
         Row(ID="01AAA", SourceURL="https://example.test/a", SourceTitle="A",
             CreatedAt=iso()),
@@ -214,7 +151,7 @@ def test_recent_index_returns_urls_and_titles(make_store):
     assert "A" in titles
 
 
-def test_archive_removes_finished_rows_from_the_pipeline(make_store):
+def test_archive_removes_finished_rows_from_the_pipeline():
     old = iso(utcnow() - timedelta(days=200))
     store = make_store([
         Row(ID="01AAA", Status=Status.POSTED, CreatedAt=old,
@@ -225,7 +162,7 @@ def test_archive_removes_finished_rows_from_the_pipeline(make_store):
     assert [r.ID for r in store.pipeline_rows()] == ["01BBB"]
 
 
-def test_published_rows_are_only_posted_ones(make_store):
+def test_published_rows_are_only_posted_ones():
     store = make_store([
         Row(ID="01AAA", Status=Status.POSTED),
         Row(ID="01BBB", Status=Status.DRAFTED),
@@ -233,7 +170,7 @@ def test_published_rows_are_only_posted_ones(make_store):
     assert [r.ID for r in store.published_rows()] == ["01AAA"]
 
 
-def test_feedback_round_trips(make_store):
+def test_feedback_round_trips():
     store = make_store([])
     store.append_feedback([
         FeedbackRecord(id="01FFF", created_at=iso(), row_id="01AAA", signal="NOTE",
@@ -246,7 +183,7 @@ def test_feedback_round_trips(make_store):
     assert records[0].ref  # a handle back to the record
 
 
-def test_amendments_round_trip_and_report_pending(make_store):
+def test_amendments_round_trip_and_report_pending():
     store = make_store([])
     store.append_amendments([
         AmendmentRecord(id="01AM1", created_at=iso(), rule="No em dashes",
@@ -269,7 +206,7 @@ def test_amendments_round_trip_and_report_pending(make_store):
     assert store.pending_amendments() == []
 
 
-def test_row_survives_a_round_trip_through_every_column(make_store):
+def test_row_survives_a_round_trip_through_every_column():
     """A column that gets dropped in storage is a column the human loses."""
     original = Row(
         ID="01AAA", CreatedAt=iso(), SourceURL="https://example.test/a",
@@ -290,7 +227,7 @@ def test_row_survives_a_round_trip_through_every_column(make_store):
 
 
 # --------------------------------------------------------------------------
-# Postgres-only: tenant isolation and the field map
+# Tenant isolation and the field map
 # --------------------------------------------------------------------------
 
 
@@ -311,17 +248,17 @@ def test_blank_is_stored_as_unset_not_zero():
 
 
 def test_one_tenant_cannot_see_another_tenants_rows():
-    store = make_pg_store([Row(ID="01AAA", Status=Status.DRAFTED)])
-    other = PostgresStore(store.session, OTHER_TENANT, SHEET_CONFIG)
+    store = make_store([Row(ID="01AAA", Status=Status.DRAFTED)], provision=False)
+    other = PipelineStore(store.session, OTHER_TENANT, pipeline_config())
     assert other.pipeline_rows() == []
     assert other.config_values() == {}
     assert other.recent_index(365) == ([], [])
 
 
 def test_writing_across_tenants_is_refused():
-    store = make_pg_store([Row(ID="01AAA", Status=Status.DRAFTED, DraftText="d")])
+    store = make_store([Row(ID="01AAA", Status=Status.DRAFTED, DraftText="d")])
     row = store.pipeline_rows()[0]
-    other = PostgresStore(store.session, OTHER_TENANT, SHEET_CONFIG)
+    other = PipelineStore(store.session, OTHER_TENANT, pipeline_config())
     with pytest.raises(StoreError):
         other.write(row, {"DraftText": "reaching into someone else's account"})
     assert store.pipeline_rows()[0].DraftText == "d"
@@ -330,7 +267,7 @@ def test_writing_across_tenants_is_refused():
 def test_archive_keeps_the_row_for_dedupe():
     """Archived is not deleted: dedupe still has to see it."""
     old = iso(utcnow() - timedelta(days=200))
-    store = make_pg_store([
+    store = make_store([
         Row(ID="01AAA", Status=Status.POSTED, CreatedAt=old,
             SourceURL="https://example.test/a", SourceTitle="A"),
     ])
@@ -342,12 +279,12 @@ def test_archive_keeps_the_row_for_dedupe():
 
 
 def test_voice_card_round_trips_per_tenant():
-    store = make_pg_store([])
+    store = make_store([], provision=False)
     with pytest.raises(StoreError):
         store.load_voice_card()
     store.save_voice_card("# Voice\n\nWrite plainly.")
     assert "Write plainly" in store.load_voice_card()
-    other = PostgresStore(store.session, OTHER_TENANT, SHEET_CONFIG)
+    other = PipelineStore(store.session, OTHER_TENANT, pipeline_config())
     with pytest.raises(StoreError):
         other.load_voice_card()
 
@@ -358,7 +295,7 @@ def test_secrets_are_encrypted_at_rest():
 
     from lnp.db.schema import LinkedInApp, LinkedInToken
 
-    store = make_pg_store([])
+    store = make_store([])
     store.session.add(LinkedInApp(tenant_id=TENANT, client_id="772vtx01ov0awb",
                                   client_secret="WPL_AP1.EXAMPLE0000FAKE.aBcDeF=="))
     store.session.add(LinkedInToken(tenant_id=TENANT, access_token="AQV-not-real",
@@ -384,7 +321,7 @@ def test_wrong_encryption_key_is_an_error_not_garbage(monkeypatch):
     """Silently returning nonsense would look like a revoked token."""
     from lnp.db.schema import LinkedInToken
 
-    store = make_pg_store([])
+    store = make_store([])
     store.session.add(LinkedInToken(tenant_id=TENANT, access_token="AQV-not-real"))
     store.session.commit()
     store.session.expire_all()
@@ -417,7 +354,7 @@ def test_database_url_shapes_hosts_hand_out():
 def make_meter(job="draft", cap=None, alerter=None):
     from lnp.db.usage import TenantMeter
 
-    store = make_pg_store([])
+    store = make_store([])
     if cap is not None:
         store.tenant().monthly_token_cap = cap
         store.session.commit()
@@ -517,7 +454,7 @@ def test_every_model_call_goes_through_the_meter():
     recorder = Recorder()
     llm.set_meter(recorder)
     try:
-        text = llm.complete(SHEET_CONFIG, system="s", user="u", api=FakeAPI())
+        text = llm.complete(pipeline_config(), system="s", user="u", api=FakeAPI())
     finally:
         llm.set_meter(None)
     assert text == "hello"
@@ -539,7 +476,7 @@ def test_the_cap_refuses_the_call_rather_than_warning():
     llm.set_meter(Blocked())
     try:
         with pytest.raises(llm.UsageCapExceeded):
-            llm.complete(SHEET_CONFIG, system="s", user="u", api=object())
+            llm.complete(pipeline_config(), system="s", user="u", api=object())
     finally:
         llm.set_meter(None)
 
@@ -553,7 +490,7 @@ def test_tokens_round_trip_through_the_database():
     from lnp.db.tokens import DbTokenBackend
     from lnp.tokens import TokenSet
 
-    store = make_pg_store([])
+    store = make_store([])
     backend = DbTokenBackend(store.session, TENANT)
     assert backend.load() is None
     backend.save(TokenSet(access_token="AQV-x", refresh_token="AQW-x",
@@ -567,7 +504,7 @@ def test_disconnect_forgets_the_tokens():
     from lnp.db.tokens import DbTokenBackend
     from lnp.tokens import TokenSet
 
-    store = make_pg_store([])
+    store = make_store([])
     backend = DbTokenBackend(store.session, TENANT)
     backend.save(TokenSet(access_token="AQV-x"))
     backend.forget()
@@ -580,7 +517,7 @@ def test_refresh_uses_the_tenants_own_app_not_the_environment(monkeypatch):
     from lnp.db.tokens import app_credentials, save_app_credentials
     from lnp.tokens import AppCredentials, TokenSet
 
-    store = make_pg_store([])
+    store = make_store([])
     save_app_credentials(store.session, TENANT, "tenantclientid",
                          "WPL_AP1.EXAMPLE0000FAKE.aBcDeF==", "https://app.test/callback")
     app = app_credentials(store.session, TENANT)
@@ -609,7 +546,7 @@ def test_a_tenant_without_an_app_is_told_what_to_do():
     from lnp.db.tokens import app_credentials
     from lnp.tokens import TokenError
 
-    store = make_pg_store([])
+    store = make_store([])
     with pytest.raises(TokenError) as excinfo:
         app_credentials(store.session, TENANT)
     assert "developer.linkedin.com" in str(excinfo.value)
@@ -621,29 +558,25 @@ def test_a_tenant_without_an_app_is_told_what_to_do():
 
 
 @pytest.fixture
-def hosted(monkeypatch):
-    """Point the runner at a throwaway database with two live tenants."""
-    from lnp.db import session as session_mod
-    from lnp.db.schema import Tenant
-
-    engine = new_engine()
-    session_mod.configure(engine)
-    monkeypatch.setenv("DATABASE_URL", "postgresql://test/test")
-
-    with session_mod.session_scope() as session:
-        session.add(Tenant(id=TENANT, email="one@example.test", status="active"))
-        session.add(Tenant(id=OTHER_TENANT, email="two@example.test", status="active"))
-    return engine
+def accounts():
+    """A throwaway database with two live, provisioned accounts."""
+    return new_database()
 
 
-def test_hosted_mode_yields_one_run_per_account(hosted):
+@pytest.fixture
+def bare_accounts():
+    """Two accounts with nothing seeded, for tests that seed their own."""
+    return new_database(provision=False)
+
+
+def test_a_job_serves_every_live_account(accounts):
     from lnp import runner
 
-    labels = [run.label for run in runner.runs("draft", SHEET_CONFIG)]
+    labels = [run.label for run in runner.runs("draft", pipeline_config())]
     assert labels == ["one@example.test", "two@example.test"]
 
 
-def test_cancelled_accounts_are_not_run(hosted):
+def test_cancelled_accounts_are_not_run(accounts):
     from lnp import runner
     from lnp.db import session as session_mod
     from lnp.db.schema import Tenant
@@ -651,46 +584,42 @@ def test_cancelled_accounts_are_not_run(hosted):
     with session_mod.session_scope() as session:
         session.get(Tenant, OTHER_TENANT).status = "canceled"
 
-    labels = [run.label for run in runner.runs("draft", SHEET_CONFIG)]
+    labels = [run.label for run in runner.runs("draft", pipeline_config())]
     assert labels == ["one@example.test"]
 
 
-def test_one_account_can_be_named(hosted):
+def test_one_account_can_be_named(accounts):
     from lnp import runner
 
-    labels = [run.label for run in runner.runs("draft", SHEET_CONFIG, OTHER_TENANT)]
+    labels = [run.label for run in runner.runs("draft", pipeline_config(), OTHER_TENANT)]
     assert labels == ["two@example.test"]
 
 
-def test_one_accounts_failure_does_not_stop_the_others(hosted):
-    """The tenth customer must not lose their week because the third had a bad feed."""
+def test_one_accounts_failure_does_not_stop_the_others(accounts, monkeypatch):
+    """The tenth customer must not lose their week because the third had a bad feed.
+
+    And the failure is contained, not swallowed: it alerts on its way past.
+    """
     from lnp import runner
 
+    alerts = []
+    monkeypatch.setattr("lnp.runner.alert",
+                        lambda cfg, title, body="", **kw: alerts.append(title))
     served = []
-    for run in runner.runs("draft", SHEET_CONFIG):
+    for run in runner.runs("draft", pipeline_config()):
         with runner.isolated(run, "draft"):
             served.append(run.label)
             if run.label == "one@example.test":
                 raise RuntimeError("this account's feed is broken")
     assert served == ["one@example.test", "two@example.test"]
+    assert any("feed is broken" in a for a in alerts)
 
 
-def test_a_local_failure_still_stops_the_job(monkeypatch):
-    """Locally there is nobody else to protect, and a non-zero exit is the signal."""
-    from lnp import runner
-
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-    run = runner.Run(config=SHEET_CONFIG, store=make_sheet_store())
-    with pytest.raises(RuntimeError):
-        with runner.isolated(run, "draft"):
-            raise RuntimeError("broken")
-
-
-def test_the_meter_follows_the_account_and_is_removed_after(hosted):
+def test_the_meter_follows_the_account_and_is_removed_after(accounts):
     from lnp import llm, runner
 
     seen = []
-    for run in runner.runs("draft", SHEET_CONFIG):
+    for run in runner.runs("draft", pipeline_config()):
         meter = llm.current_meter()
         assert meter is not None
         seen.append(meter.tenant_id)
@@ -698,17 +627,17 @@ def test_the_meter_follows_the_account_and_is_removed_after(hosted):
     assert llm.current_meter() is None
 
 
-def test_the_meter_is_removed_even_when_a_tenant_fails(hosted):
+def test_the_meter_is_removed_even_when_a_tenant_fails(accounts):
     """A crashed run must not leave one account's meter on another's calls."""
     from lnp import llm, runner
 
     with pytest.raises(RuntimeError):
-        for run in runner.runs("draft", SHEET_CONFIG):
+        for run in runner.runs("draft", pipeline_config()):
             raise RuntimeError("something went wrong mid-tenant")
     assert llm.current_meter() is None
 
 
-def test_a_run_reads_that_accounts_sources(hosted):
+def test_a_run_reads_that_accounts_sources(bare_accounts):
     from lnp import runner
     from lnp.db import session as session_mod
     from lnp.db.schema import Source
@@ -721,13 +650,13 @@ def test_a_run_reads_that_accounts_sources(hosted):
         session.add(Source(id="01S3", tenant_id=TENANT, name="Switched off",
                            url="https://off.test/feed", tier=2, active=False))
 
-    by_label = {run.label: run.sources() for run in runner.runs("curate", SHEET_CONFIG)}
+    by_label = {run.label: run.sources() for run in runner.runs("curate", pipeline_config())}
     assert [f["name"] for f in by_label["one@example.test"]] == ["Mine"]
     assert [f["name"] for f in by_label["two@example.test"]] == ["Theirs"]
     assert by_label["one@example.test"][0]["weight"] == 0.7
 
 
-def test_a_run_reads_that_accounts_voice_card(hosted):
+def test_a_run_reads_that_accounts_voice_card(bare_accounts):
     from lnp import runner
     from lnp.db import session as session_mod
     from lnp.db.schema import VoiceCard
@@ -736,18 +665,18 @@ def test_a_run_reads_that_accounts_voice_card(hosted):
         session.add(VoiceCard(tenant_id=TENANT, content="# One's voice"))
         session.add(VoiceCard(tenant_id=OTHER_TENANT, content="# Two's voice"))
 
-    cards = {run.label: run.voice_card() for run in runner.runs("draft", SHEET_CONFIG)}
+    cards = {run.label: run.voice_card() for run in runner.runs("draft", pipeline_config())}
     assert cards["one@example.test"] == "# One's voice"
     assert cards["two@example.test"] == "# Two's voice"
 
 
-def test_alerts_name_the_account_by_email_not_by_token(hosted, monkeypatch):
+def test_alerts_name_the_account_by_email_not_by_token(accounts, monkeypatch):
     from lnp import runner
 
     seen = []
     monkeypatch.setattr("lnp.runner.alert",
                         lambda cfg, title, body="", **kw: seen.append(title))
-    for run in runner.runs("draft", SHEET_CONFIG):
+    for run in runner.runs("draft", pipeline_config()):
         run.alert("a feed returned nothing")
     assert seen == [
         "[one@example.test] a feed returned nothing",
@@ -755,7 +684,7 @@ def test_alerts_name_the_account_by_email_not_by_token(hosted, monkeypatch):
     ]
 
 
-def test_the_voice_job_never_ticks_its_own_proposals(hosted):
+def test_the_voice_job_never_ticks_its_own_proposals(bare_accounts):
     """The model does not get to accept its own instructions."""
     import jobs.voice_amend as voice_job
     from lnp import runner, voice
@@ -768,7 +697,7 @@ def test_the_voice_job_never_ticks_its_own_proposals(hosted):
             content=f"# Voice\n\n{voice.AMENDMENTS_BEGIN}\n{voice.AMENDMENTS_END}\n",
         ))
 
-    run = next(runner.runs("voice_amend", SHEET_CONFIG, TENANT))
+    run = next(runner.runs("voice_amend", pipeline_config(), TENANT))
     proposal = voice.Proposal(rule="No em dashes", rationale="edited out twice",
                               signal="DIFF", occurrences=2, source_row_ids=["01AAA"])
     run.store.append_amendments([
@@ -786,7 +715,7 @@ def test_the_voice_job_never_ticks_its_own_proposals(hosted):
     assert "No em dashes" not in run.store.load_voice_card()
 
 
-def test_an_accepted_rule_reaches_the_card_exactly_once(hosted):
+def test_an_accepted_rule_reaches_the_card_exactly_once(bare_accounts):
     import jobs.voice_amend as voice_job
     from lnp import runner, voice
     from lnp.db import session as session_mod
@@ -798,7 +727,7 @@ def test_an_accepted_rule_reaches_the_card_exactly_once(hosted):
             content=f"# Voice\n\n{voice.AMENDMENTS_BEGIN}\n{voice.AMENDMENTS_END}\n",
         ))
 
-    run = next(runner.runs("voice_amend", SHEET_CONFIG, TENANT))
+    run = next(runner.runs("voice_amend", pipeline_config(), TENANT))
     run.store.append_amendments([
         AmendmentRecord(rule="No em dashes", signal="DIFF", accepted=True),
     ])

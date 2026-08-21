@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from ..config import Config, load_config
 from ..db.schema import Tenant
 from ..db.session import session_factory
-from ..db.store import PostgresStore
+from ..db.store import PipelineStore
 from .security import SESSION_COOKIE, read_session
 
 _config: Optional[Config] = None
@@ -56,8 +56,8 @@ def current_tenant(
 def current_store(
     session: Session = Depends(db),
     tenant: Tenant = Depends(current_tenant),
-) -> PostgresStore:
-    return PostgresStore(session, tenant.id, config())
+) -> PipelineStore:
+    return PipelineStore(session, tenant.id, config())
 
 
 def active_tenant(tenant: Tenant = Depends(current_tenant)) -> Tenant:

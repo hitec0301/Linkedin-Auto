@@ -45,10 +45,10 @@ def iso(dt: Optional[datetime] = None) -> str:
 
 
 def parse_dt(value: Optional[str]) -> Optional[datetime]:
-    """Parse a timestamp from the Sheet. Returns None for blank or unparseable.
+    """Parse a stored timestamp. Returns None for blank or unparseable.
 
-    Naive values are assumed UTC. Sheet cells are hand-edited, so unparseable
-    input is common and must not raise.
+    Naive values are assumed UTC. Some of these values were typed by a person,
+    so unparseable input is expected and must not raise.
     """
     if value is None:
         return None
@@ -135,7 +135,7 @@ def normalized_edit_distance(a: str, b: str) -> float:
 
 
 def parse_bool(value) -> bool:
-    """Read a Google Sheets checkbox or hand-typed truthy string."""
+    """Read a checkbox or a hand-typed truthy string."""
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in {"true", "yes", "y", "1", "x", "✓"}

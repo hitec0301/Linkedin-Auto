@@ -59,7 +59,7 @@ _meter: Optional[Meter] = None
 
 
 def set_meter(meter: Optional[Meter]) -> None:
-    """Install the meter for this process. The single-tenant install has none."""
+    """Install the meter for this run. Cleared between accounts."""
     global _meter
     _meter = meter
 

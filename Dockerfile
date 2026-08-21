@@ -2,11 +2,6 @@
 # image, one build, and the only difference between the services is the start
 # command - so a job can never be running different code from the API that
 # shows its results.
-#
-# Plain python:3.12-slim rather than a uv image. uv earns its place in
-# setup.sh because there it replaces whatever Python is on your machine; inside
-# a container the base image already pins the interpreter, so uv would be a
-# dependency buying nothing.
 # Stage one builds the front end. Node is needed to produce the bundle and
 # never to serve it, so it does not travel into the runtime image.
 FROM node:22-slim AS web
@@ -23,8 +18,7 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    LNP_DATA_DIR=/data
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
@@ -46,15 +40,11 @@ COPY alembic/ ./alembic/
 # get wrong.
 COPY --from=web /web/dist ./web/dist
 
-# Where the mounted volume lands. Tokens rotate, and a rotation written to the
-# container filesystem is a rotation lost on the next deploy.
-RUN mkdir -p /data
-
 # Prove the image works while it is being built, so a broken one fails here
 # rather than at 07:00 on a Monday with nobody watching.
 RUN python -c "import sys; sys.path.insert(0,'src'); \
-import lnp.models, lnp.sheets, lnp.drafting, lnp.linkedin, lnp.tokens, \
-lnp.store, lnp.runner, lnp.db.store, lnp.api.app; \
+import lnp.models, lnp.drafting, lnp.linkedin, lnp.tokens, \
+lnp.runner, lnp.db.store, lnp.api.app; \
 print('imports ok')" \
  && python -m pytest -x
 

@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from .. import log
 from ..config import DEFAULT_SOURCES_PATH, VOICE_CARD_PATH, load_sources
-from ..store import KEY_PAUSED, KEY_POST_COUNT
+from .store import KEY_PAUSED, KEY_POST_COUNT
 from .schema import Setting, Source, Tenant, VoiceCard
 
 logger = log.get(__name__)

@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from .. import log
 from ..config import REPO_ROOT
 from ..llm import UsageCapExceeded
-from ..store import StoreError
+from ..db.store import StoreError
 from ..tokens import TokenError
 from . import security
 from .routes_account import router as account_router

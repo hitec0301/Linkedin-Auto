@@ -1,9 +1,7 @@
 """Per-tenant LinkedIn credentials and tokens.
 
-The single-tenant tool kept tokens in a chmod-600 file, or a Gist in CI. Here
-they belong to a customer, so they live in their row, encrypted, and the
-rotation logic in `lnp.tokens` writes back through this backend without knowing
-the difference.
+Tokens belong to a customer, so they live in their row, encrypted, and the
+rotation logic in `lnp.tokens` writes back through this backend.
 
 The tenant's *app* credentials live here too. One LinkedIn app per tenant is a
 deliberate cost: it means an extra setup step, and it means LinkedIn's per-app

@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from ..db.schema import Tenant
-from ..db.store import PostgresStore
+from ..db.store import PipelineStore
 from ..models import (
     ColumnPermissionError,
     LEGAL_TRANSITIONS,
@@ -23,7 +23,7 @@ from ..models import (
     Status,
     TransitionError,
 )
-from ..store import StoreError
+from ..db.store import StoreError
 from .deps import active_tenant, current_store
 from .schemas import ROW_COLUMN_BY_FIELD, ReviseIn, RowEdit, RowOut
 
@@ -48,7 +48,7 @@ def allowed_actions(row: Row) -> List[str]:
     return list(ACTIONS.get(row.status, []))
 
 
-def find(store: PostgresStore, row_id: str) -> Row:
+def find(store: PipelineStore, row_id: str) -> Row:
     for row in store.pipeline_rows():
         if row.ID == row_id:
             return row
@@ -58,7 +58,7 @@ def find(store: PostgresStore, row_id: str) -> Row:
 @router.get("", response_model=List[RowOut])
 def list_rows(
     status_filter: Optional[str] = None,
-    store: PostgresStore = Depends(current_store),
+    store: PipelineStore = Depends(current_store),
 ) -> List[RowOut]:
     rows = store.pipeline_rows()
     if status_filter:
@@ -68,7 +68,7 @@ def list_rows(
 
 
 @router.get("/{row_id}", response_model=RowOut)
-def get_row(row_id: str, store: PostgresStore = Depends(current_store)) -> RowOut:
+def get_row(row_id: str, store: PipelineStore = Depends(current_store)) -> RowOut:
     row = find(store, row_id)
     return RowOut.of(row, allowed_actions(row))
 
@@ -77,7 +77,7 @@ def get_row(row_id: str, store: PostgresStore = Depends(current_store)) -> RowOu
 def edit_row(
     row_id: str,
     body: RowEdit,
-    store: PostgresStore = Depends(current_store),
+    store: PipelineStore = Depends(current_store),
     tenant: Tenant = Depends(active_tenant),
 ) -> RowOut:
     """Edit the columns a person owns.
@@ -106,7 +106,7 @@ def edit_row(
     return RowOut.of(row, allowed_actions(row))
 
 
-def _move(store: PostgresStore, row: Row, target: str, updates=None) -> RowOut:
+def _move(store: PipelineStore, row: Row, target: str, updates=None) -> RowOut:
     try:
         store.transition(row, target, updates, allow_revision_note=True)
     except TransitionError as exc:
@@ -124,7 +124,7 @@ def _move(store: PostgresStore, row: Row, target: str, updates=None) -> RowOut:
 @router.post("/{row_id}/approve", response_model=RowOut)
 def approve(
     row_id: str,
-    store: PostgresStore = Depends(current_store),
+    store: PipelineStore = Depends(current_store),
     tenant: Tenant = Depends(active_tenant),
 ) -> RowOut:
     """Approve a draft for publishing.
@@ -145,7 +145,7 @@ def approve(
 @router.post("/{row_id}/unapprove", response_model=RowOut)
 def unapprove(
     row_id: str,
-    store: PostgresStore = Depends(current_store),
+    store: PipelineStore = Depends(current_store),
     tenant: Tenant = Depends(active_tenant),
 ) -> RowOut:
     """Take an approval back.
@@ -164,7 +164,7 @@ def unapprove(
 def revise(
     row_id: str,
     body: ReviseIn,
-    store: PostgresStore = Depends(current_store),
+    store: PipelineStore = Depends(current_store),
     tenant: Tenant = Depends(active_tenant),
 ) -> RowOut:
     """Send a draft back with an instruction.
@@ -181,7 +181,7 @@ def revise(
 @router.post("/{row_id}/skip", response_model=RowOut)
 def skip(
     row_id: str,
-    store: PostgresStore = Depends(current_store),
+    store: PipelineStore = Depends(current_store),
     tenant: Tenant = Depends(active_tenant),
 ) -> RowOut:
     row = find(store, row_id)

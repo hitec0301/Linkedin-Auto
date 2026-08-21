@@ -66,7 +66,7 @@ def setup(level: str | None = None) -> None:
     root.handlers = [handler]
     root.setLevel((level or os.environ.get("LOG_LEVEL") or "INFO").upper())
     # These libraries narrate every HTTP call at INFO; we log what matters.
-    for noisy in ("urllib3", "google", "googleapiclient", "httpx", "anthropic"):
+    for noisy in ("urllib3", "httpx", "anthropic", "sqlalchemy.engine"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     _CONFIGURED = True
 

@@ -1,8 +1,10 @@
 """Configuration and secrets.
 
-Config is a YAML file in the repo; secrets are environment variables and never
-touch the repo. `.env` is read for local runs only — GitHub Actions injects the
-same names from repository secrets.
+Config is a YAML file in the repo: the product's own tunables, the same for
+every account. Anything that differs per customer lives in their row, not here.
+
+Secrets are environment variables and never touch the repo. `.env` is read for
+local runs only; a deployment injects the same names itself.
 """
 
 from __future__ import annotations
@@ -135,25 +137,3 @@ def require_env(name: str) -> str:
     return value
 
 
-def google_credentials_info() -> Dict[str, Any]:
-    """Read GOOGLE_SA_JSON as either a filesystem path or a raw JSON blob.
-
-    Local runs point at a downloaded key file; GitHub Actions pastes the whole
-    JSON into a secret. Both must work with no other change.
-    """
-    raw = require_env("GOOGLE_SA_JSON")
-    candidate = Path(raw).expanduser()
-    try:
-        if candidate.is_file():
-            raw = candidate.read_text(encoding="utf-8")
-    except OSError:
-        pass  # A JSON blob makes an invalid path on some platforms; fall through.
-    try:
-        info = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ConfigError(
-            "GOOGLE_SA_JSON is neither a readable file path nor valid JSON"
-        ) from exc
-    if "client_email" not in info:
-        raise ConfigError("GOOGLE_SA_JSON does not look like a service account key")
-    return info

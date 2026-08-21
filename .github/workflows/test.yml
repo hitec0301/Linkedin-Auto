@@ -18,12 +18,39 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Run the test suite
         run: python -m pytest -v
-      - name: Check the config files parse
+
+      # The suite runs on SQLite so it needs no server. Postgres is what
+      # production uses, so run it there too rather than finding out later.
+      - name: Run the suite against Postgres
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: python -m pytest -q
+
+      - name: Check the config parses and ships safe
         run: |
           python -c "
           import sys; sys.path.insert(0, 'src')
           from lnp.config import load_config, load_sources
           c = load_config(); s = load_sources()
-          print(f'config ok, {len(s)} sources configured')
+          print(f'config ok, {len(s)} starter sources')
           assert c.dry_run is True, 'ship with dry_run on'
           "
+
+      - name: Build the front end
+        run: |
+          cd web
+          npm ci
+          npm run build
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432

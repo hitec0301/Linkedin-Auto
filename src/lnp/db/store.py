@@ -1,31 +1,44 @@
-"""The Postgres implementation of the storage port.
+"""One tenant's pipeline, in Postgres.
 
 This is the only module in the product that writes SQL. Every query filters on
 `tenant_id`, and the tenant id comes from the store object rather than from an
-argument, so there is no call site that can forget it.
+argument, so there is no call site that can forget which customer it is
+serving. A row id belonging to another tenant reads exactly like one that does
+not exist.
 
-The Sheet's columns become typed columns here, which is the one place the two
-adapters genuinely differ: a Sheet cell is a string and a database column is
-not. `FIELDS` is that mapping, written once, and used in both directions.
+Two rules live in the write path rather than at the call sites, because a call
+site is a place somebody can forget:
+
+  * `write` refuses to touch a human's column,
+  * `write_as_human` refuses to touch the model's,
+
+and both refuse before anything is persisted. `transition` checks the status
+machine on the same terms. Everything else in the class is plumbing.
+
+`Row` is still a record of strings, a leftover from when this pipeline stored
+its rows in a spreadsheet. `FIELDS` is where that meets real column types,
+written once and used in both directions; retyping `Row` itself is worth doing
+and is a change on its own.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import ulid
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import log
-from ..models import COLUMNS, Row, Status
-from ..store import (
-    KEY_POST_COUNT,
-    AmendmentRecord,
-    FeedbackRecord,
-    PipelineStore,
-    StoreError,
+from ..models import (
+    COLUMNS,
+    Row,
+    Status,
+    assert_human_writable,
+    assert_transition,
+    assert_writable,
 )
 from ..util import iso, parse_bool, parse_dt, parse_float, parse_int, utcnow
 from .schema import (
@@ -39,9 +52,60 @@ from .schema import (
 
 logger = log.get(__name__)
 
-# (Sheet column, ORM attribute, kind). The order is COLUMNS' order, and the
-# test suite asserts every column appears exactly once — a column added to the
-# model without a mapping here would otherwise be silently dropped on write.
+# Settings the pipeline reads back out of storage. PAUSED is the kill switch.
+KEY_PAUSED = "PAUSED"
+KEY_POST_COUNT = "POST_COUNT"
+KEY_PERSON_URN = "PERSON_URN"
+
+TRUTHY = {"true", "yes", "1", "on", "paused"}
+
+
+class StoreError(Exception):
+    pass
+
+
+@dataclass
+class FeedbackRecord:
+    """One correction the human made, as stored."""
+
+    id: str = ""
+    created_at: str = ""
+    row_id: str = ""
+    signal: str = ""
+    instruction: str = ""
+    draft_text: str = ""
+    final_text: str = ""
+    processed: str = ""
+    # Opaque handle back to the record this came from. Callers pass it back;
+    # they never parse it.
+    ref: str = ""
+
+
+@dataclass
+class AmendmentRecord:
+    """One proposed voice rule, awaiting or carrying the human's decision."""
+
+    id: str = ""
+    created_at: str = ""
+    rule: str = ""
+    rationale: str = ""
+    signal: str = ""
+    occurrences: int = 0
+    recurring: bool = False
+    accepted: bool = False
+    applied: str = ""
+    source_row_ids: List[str] = field(default_factory=list)
+    ref: str = ""
+
+    @property
+    def is_pending(self) -> bool:
+        """Ticked by the human and not yet written into the card."""
+        return self.accepted and not (self.applied or "").strip()
+
+
+# (Row field, ORM attribute, kind). The order is COLUMNS' order, and the test
+# suite asserts every column appears exactly once — a column added to the model
+# without a mapping here would otherwise be silently dropped on write.
 FIELDS: List[Tuple[str, str, str]] = [
     ("ID", "id", "text"),
     ("CreatedAt", "created_at", "ts"),
@@ -71,7 +135,7 @@ BY_COLUMN: Dict[str, Tuple[str, str]] = {c: (a, k) for c, a, k in FIELDS}
 
 
 def to_db(value: Any, kind: str) -> Any:
-    """A Sheet-shaped string into a typed column value.
+    """A Row's string into a typed column value.
 
     Blank means *unset*, not zero: a row that has never been scored has no
     RelevanceScore, and storing 0.0 would make it look like a scored one that
@@ -110,8 +174,8 @@ def to_row(orm: PipelineRow) -> Row:
     return Row(**{col: from_db(getattr(orm, attr), kind) for col, attr, kind in FIELDS})
 
 
-class PostgresStore(PipelineStore):
-    """One tenant's pipeline, in the database."""
+class PipelineStore:
+    """Everything the four jobs and the API do to one tenant's state."""
 
     def __init__(self, session: Session, tenant_id: str, config=None):
         self.session = session
@@ -119,7 +183,7 @@ class PostgresStore(PipelineStore):
         self.config = config
 
     @classmethod
-    def for_tenant(cls, tenant_id: str, config=None) -> "PostgresStore":
+    def for_tenant(cls, tenant_id: str, config=None) -> "PipelineStore":
         from .session import session_factory
 
         return cls(session_factory()(), tenant_id, config)
@@ -163,7 +227,7 @@ class PostgresStore(PipelineStore):
             logger.info("appended pipeline rows", extra={"count": count})
         return count
 
-    def _write_fields(self, row: Row, updates: Dict[str, Any], *, allow_revision_note: bool) -> None:
+    def _write_fields(self, row: Row, updates: Dict[str, Any]) -> None:
         orm = self._orm_row(row)
         for name, value in updates.items():
             attr, kind = BY_COLUMN[name]
@@ -211,6 +275,123 @@ class PostgresStore(PipelineStore):
         if stale:
             logger.info("archived rows", extra={"count": len(stale)})
         return len(stale)
+
+
+    # ---- the guarded write path ------------------------------------------
+
+    def write(
+        self, row: Row, updates: Dict[str, Any], *, allow_revision_note: bool = False
+    ) -> None:
+        """A job writing to a row.
+
+        Refuses the human's columns, and refuses before touching the database,
+        so a rejected write leaves nothing half-applied.
+        """
+        if not updates:
+            return
+        assert_writable(list(updates), allow_revision_note=allow_revision_note)
+        self._write_fields(row, updates)
+        for name, value in updates.items():
+            setattr(row, name, "" if value is None else str(value))
+
+    def write_as_human(self, row: Row, updates: Dict[str, Any]) -> None:
+        """A person's edit, from the interface they use.
+
+        The opposite guard: a job may not touch the human's columns, and the
+        human's interface may not touch the model's. Both exist for the same
+        reason - the gap between the draft and what was published is the
+        measurement, and either side writing over the other destroys it.
+        """
+        if not updates:
+            return
+        assert_human_writable(list(updates))
+        self._write_fields(row, updates)
+        for name, value in updates.items():
+            setattr(row, name, "" if value is None else str(value))
+
+    def transition(
+        self,
+        row: Row,
+        target: str,
+        updates: Optional[Dict[str, Any]] = None,
+        *,
+        allow_revision_note: bool = False,
+    ) -> None:
+        """Move a row to `target`, writing any other columns in the same call.
+
+        The move is checked before anything is written: an illegal transition
+        leaves the database untouched.
+        """
+        assert_transition(row.status, target)
+        payload: Dict[str, Any] = dict(updates or {})
+        payload["Status"] = target
+        self.write(row, payload, allow_revision_note=allow_revision_note)
+        logger.info("status changed", extra={"row_id": row.ID, "to": target})
+
+    def published_rows(self) -> List[Row]:
+        return [r for r in self.pipeline_rows() if r.status == Status.POSTED]
+
+    def expire_stale(
+        self,
+        rows: Sequence[Row],
+        staleness_hours: int,
+        now: Optional[datetime] = None,
+    ) -> List[Row]:
+        """Retire rows too far past their slot to be worth posting.
+
+        A four-day-old take is worse than no post. Only DRAFTED and APPROVED
+        rows can expire: a row stuck in POSTING is a different problem, and
+        resolving it needs the LinkedIn API, not a clock.
+        """
+        expired: List[Row] = []
+        for row in rows:
+            if row.status not in {Status.DRAFTED, Status.APPROVED}:
+                continue
+            if not row.is_stale(staleness_hours, now=now):
+                continue
+            self.transition(
+                row,
+                Status.EXPIRED,
+                {
+                    "Error": (
+                        f"expired: more than {staleness_hours}h past "
+                        f"ScheduledFor ({row.ScheduledFor})"
+                    )
+                },
+            )
+            expired.append(row)
+            logger.warning(
+                "row expired",
+                extra={"row_id": row.ID, "scheduled_for": row.ScheduledFor},
+            )
+        return expired
+
+    def is_paused(self) -> bool:
+        """The kill switch.
+
+        A settings store that cannot be read counts as paused, and so does a
+        missing key. If the customer's stop button is unreachable, the only
+        safe reading is that it might be pressed.
+        """
+        try:
+            values = self.config_values()
+        except Exception:  # noqa: BLE001 - any storage failure means "unknown"
+            logger.error("settings unreadable; treating pipeline as PAUSED")
+            return True
+        raw = values.get(KEY_PAUSED, "")
+        if raw == "":
+            logger.error("PAUSED is not set; treating pipeline as PAUSED")
+            return True
+        return str(raw).strip().lower() in TRUTHY
+
+    def post_count(self) -> int:
+        try:
+            return int(float(self.config_values().get(KEY_POST_COUNT, "0") or 0))
+        except (ValueError, StoreError):
+            return 0
+
+    def pending_amendments(self) -> List[AmendmentRecord]:
+        return [r for r in self.amendment_records() if r.is_pending]
 
     # ---- settings --------------------------------------------------------
 

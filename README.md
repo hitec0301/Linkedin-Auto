@@ -1,46 +1,35 @@
-# LinkedIn L&D publishing pipeline
+# LinkedIn publishing pipeline
 
-A human-in-the-loop pipeline for publishing to LinkedIn three or four times a
-week, for someone writing to corporate L&D practitioners and academic educators
-at the same time.
+A hosted, human-in-the-loop tool for publishing to LinkedIn three or four times
+a week. Customers subscribe, connect their LinkedIn account, and spend about
+ten minutes a week deciding what goes out.
 
 **The human decides, the model drafts.** The system surfaces candidate source
-material; you pick items and write a one-line angle; the model drafts from that
-angle; you approve, revise, or rewrite; the system publishes. It never posts
-unattended, and there is no mode that makes it do so. If you find yourself
-wanting one, the thing to change is the voice card, not the architecture.
+material; the customer picks items and writes a one-line angle; the model
+drafts from that angle; they approve, revise, or rewrite; the system publishes.
+It never posts unattended, and there is no mode that makes it do so. If a draft
+is wrong, the thing to change is the voice card, not the architecture.
 
-Your time cost is about ten minutes on Monday plus a few minutes per draft.
-
-### Two ways to run it
-
-|  | **Single-tenant** | **Hosted** |
-|---|---|---|
-| For | you, on your own account | subscribers, on your servers |
-| Storage | a Google Sheet you own | Postgres |
-| Interface | the Sheet | a web app |
-| Where it runs | Railway cron services | Railway: a web service and four cron services |
-| Set up with | `./lnp setup` | [Running it as a product](#running-it-as-a-product) |
-
-Everything down to [Running it on Railway](#running-it-on-railway-single-tenant)
-describes the single-tenant tool, and all of it is still true of the hosted one
-apart from where things are stored and which screen you press the buttons on.
-Both run the same four jobs, the same status machine, and the same guards.
+The shipped voice and source list are written for an L&D leader in edtech
+posting to corporate L&D practitioners and academic educators. Both are
+per-account and fully editable, so that is a starting position rather than a
+constraint.
 
 ---
 
 ## How it runs
 
-Four scheduled jobs. No long-running process in single-tenant mode; the hosted
-one adds a web service and nothing else.
+A web service and four scheduled jobs, all from one image. Each job serves
+every live account in turn.
 
 ```
-JOB A  curate       Mon 12:00 UTC   feeds -> dedupe -> score -> 10 candidates into the Sheet
-       [you: tick Selected on 3-4 rows, write a one-line Angle]     ~10 min/week
-JOB B  draft        hourly          drafts selected rows; regenerates rows marked REVISE
-       [you: edit FinalText, or write a RevisionNote, then set Status=APPROVED]
-JOB C  publish      every 30 min    posts rows whose ScheduledFor is due
-JOB D  voice_amend  Sun 15:00 UTC   proposes voice rules from your corrections; you tick to accept
+JOB A  curate       Mon 12:00 UTC   feeds -> dedupe -> score -> 10 candidates
+       [them: tick 3-4, write a one-line angle for each]        ~10 min/week
+JOB B  draft        hourly          drafts ticked rows; regenerates rows sent back
+       [them: edit their version, or send it back with a note, then approve]
+JOB C  publish      every 30 min    posts approved rows whose slot is due
+JOB D  voice_amend  Sun 15:00 UTC   proposes voice rules from their corrections
+       [them: tick the ones they agree with; nothing else reaches the card]
 ```
 
 Cron is UTC and does not follow daylight saving, so the local times drift by an
@@ -56,10 +45,10 @@ any -> SKIPPED ;  DRAFTED/APPROVED -> EXPIRED ;  POSTED, SKIPPED, EXPIRED are te
 ```
 
 Every transition goes through `assert_transition()`, which raises on anything
-not in that diagram, whichever storage is underneath and whichever interface
-asked. In the Sheet, the Status column also carries data validation, so a
-mistyped cell cannot inject a state the code has never heard of; in the web app
-a button only exists for a move the machine actually has.
+not in that diagram, whichever interface asked. The web app derives the
+buttons it offers from the same table, so a button only exists for a move the
+machine actually has - the rule is written once and read twice, rather than
+restated in the browser where the two copies can drift.
 
 ### What the jobs will not do
 
@@ -67,7 +56,7 @@ These are enforced in code and each has a test:
 
 1. Job C acts only on `APPROVED`. Every other status is a no-op. There is no
    flag that changes this.
-2. `POSTING` is written to the Sheet before the HTTP call and `POSTED` after, so
+2. `POSTING` is written to the row before the HTTP call and `POSTED` after, so
    a crashed run cannot double-publish.
 3. A row stuck in `POSTING` is never blindly retried. The Posts API is asked
    whether the post exists; if that cannot be answered, you are alerted and the
@@ -75,429 +64,67 @@ These are enforced in code and each has a test:
 4. A row more than 48 hours past its `ScheduledFor` becomes `EXPIRED` and is
    never published. A four-day-old take is worse than no post.
 5. Jobs never write `Selected`, `Angle`, `FinalText`, `RevisionNote` or `Reach`.
-   Those columns are yours; an attempt to write one raises. The single exception
-   is clearing `RevisionNote` after a successful regenerate.
-6. `DraftText` is model output and is never overwritten with your edits. The
-   difference between `DraftText` and what you published is the only learning
-   signal the system has.
-7. `PAUSED` stops Job C immediately — a cell in the Config tab, or the switch on
-   the Setup screen.
+   Those columns belong to the customer; an attempt to write one raises. The
+   single exception is clearing `RevisionNote` after a successful regenerate.
+6. The reverse holds too: the web app cannot write `DraftText`. The difference
+   between what the model wrote and what actually went out is the only learning
+   signal the system has, so an edit goes to `FinalText` and the draft stays.
+7. `PAUSED` stops Job C immediately, from the switch on the Setup screen.
 8. A row approved with both drafts still in it is refused, not guessed at.
 9. The drafting prompt forbids any number that is not in the fetched source
    extract.
-10. Every job crash alerts. A silent pipeline looks like a working one.
+10. Every job crash alerts, and names the account it concerns. A silent
+    pipeline looks like a working one.
+11. No query reaches data without a tenant id, and the tenant id comes from the
+    session rather than from a parameter. Another account's row id reads
+    exactly like one that does not exist.
 
 ---
 
-## Setup
+## The customer's week
 
-Roughly an hour, most of it waiting on LinkedIn's UI.
+**Monday, ten minutes.** Job A has put ten candidates on the Review screen,
+each with an audience tag, a theme tag, and a sentence on why it matters. They
+tick three or four and write a one-line angle for each.
 
-### 1. Install
-
-```bash
-git clone <this repo> && cd Linkedin-Auto
-./setup.sh
-```
-
-That is the whole install. It takes about a minute and is safe to re-run.
-
-`setup.sh` does not use the Python on your machine. It installs
-[uv](https://docs.astral.sh/uv/), which fetches a known-good CPython of its own,
-builds the environment, installs the dependencies, runs the test suite, and then
-walks you through configuration. Every setup failure this project has actually
-hit came from a system Python — a broken pip, an interpreter whose regex engine
-could not run modern packaging, missing CA certificates, C extensions built from
-source against the wrong toolchain. An interpreter we bring ourselves cannot
-have any of them.
-
-Afterwards, every command runs through one launcher, with nothing to activate:
-
-```bash
-./lnp setup      configure credentials, checking each one against its service
-./lnp check      re-verify the install and the credentials
-./lnp curate     put this week's candidates in the sheet
-./lnp draft      draft the rows you selected
-./lnp publish    post approved rows (dry run until you turn it off)
-./lnp voice      propose voice rules from your corrections
-./lnp doctor     diagnose and repair the environment
-./lnp test       run the test suite
-```
-
-The setup step checks each value against the real service as you enter it — the
-Anthropic key by calling the API, the sheet by opening it — so a wrong value is
-caught where you typed it rather than three steps later as an error naming
-something else. Nothing is written until it passes. It accepts your sheet's full
-web address rather than asking you to extract the id, takes the key file under
-whatever name Google gave it, and finds it if it is still in your Downloads.
-
-### 2. Google Sheet
-
-The pipeline reads and writes one Google Sheet. It does that as a **service
-account** — a robot Google account with its own email address, which you invite
-to your sheet exactly like you would invite a colleague. That is the whole
-mental model: everything below is either creating that robot, or introducing it
-to your sheet.
-
-Budget fifteen minutes. Nothing here costs money.
-
-#### 2a. Create the sheet and copy its id
-
-Go to [sheets.new](https://sheets.new). That creates an empty sheet. Give it a
-name — "LinkedIn pipeline" — so you can find it later.
-
-Now look at the address bar. The URL is:
-
-```
-https://docs.google.com/spreadsheets/d/1a2B3cD4eFgHiJkLmNoPqRsTuVwXyZ_example/edit#gid=0
-                                       └──────────── this part is the id ────┘
-```
-
-The id is the long string between `/d/` and `/edit`. It is around 44
-characters, letters and numbers with the odd dash or underscore. Copy it
-somewhere; you need it in step 2e.
-
-#### 2b. Create a Google Cloud project
-
-Go to [console.cloud.google.com](https://console.cloud.google.com). First time
-in, it may ask you to accept terms and pick a country. There is no billing
-setup and no credit card for what we are doing.
-
-At the top of the page, next to the "Google Cloud" logo, is a project picker —
-it either says "Select a project" or shows a project name. Click it, then click
-**New Project** at the top right of the dialog.
-
-Name it something like `linkedin-pipeline`. Leave "Location" as "No
-organisation". Click **Create**, then wait a few seconds and make sure the
-project picker at the top now shows your new project. If it still shows
-something else, click the picker and select the one you just made — every step
-after this applies to whichever project is selected.
-
-#### 2c. Turn on the Sheets API
-
-In the search bar at the top, type `Google Sheets API` and pick it out of the
-results (it appears under "Marketplace" or "APIs & Services"). You will land on
-a page with a blue **Enable** button. Click it. Wait for the page to reload
-into the API's dashboard.
-
-That is the only API this pipeline needs. It never touches Google Drive: the
-sheet is opened directly by its id rather than searched for by name, so there
-is no Drive permission to grant and no second API to enable.
-
-#### 2d. Create the service account and download its key
-
-In the left sidebar go to **APIs & Services** → **Credentials**. (No sidebar?
-Click the hamburger menu at the top left.)
-
-1. Click **+ Create Credentials** at the top, then **Service account**.
-2. **Service account name**: `lnp-pipeline`. The account id fills itself in.
-   Click **Create and Continue**.
-3. **Grant this service account access to project** — *skip this*. Click
-   **Continue**. This trips people up because it looks required. It is not, and
-   it is genuinely not needed: those roles control access to Google Cloud
-   resources, whereas access to your sheet comes from sharing the sheet in the
-   next step. An account with no roles at all is exactly right here.
-4. **Grant users access to this service account** — skip it too. Click **Done**.
-
-You are back on the Credentials page with your service account listed under
-"Service Accounts". Now get its key:
-
-1. Click the service account's email to open it.
-2. Open the **Keys** tab.
-3. **Add Key** → **Create new key** → choose **JSON** → **Create**.
-
-A `.json` file downloads immediately. **This file is a password.** Anyone
-holding it can act as this account. It is shown to you exactly once — if you
-lose it you delete the key and create another.
-
-Move it into the repo's gitignored secrets folder:
-
-```bash
-mkdir -p .secrets
-mv ~/Downloads/linkedin-pipeline-*.json .secrets/service-account.json
-chmod 600 .secrets/service-account.json
-```
-
-(Adjust the download filename — it is your project name plus a random suffix.)
-`.secrets/` is already in `.gitignore`, so it will not be committed.
-
-#### 2e. Share the sheet with the service account
-
-Open the JSON file and find the `client_email` line:
-
-```bash
-grep client_email .secrets/service-account.json
-```
-
-It looks like `lnp-pipeline@linkedin-pipeline-123456.iam.gserviceaccount.com`.
-
-Now open your Google Sheet, click the green **Share** button at the top right,
-paste that address in, and set the role to **Editor** — not Viewer, not
-Commenter; the pipeline writes to the sheet. Untick **Notify people** (it is
-not a real mailbox and the mail bounces). Click **Share**.
-
-**This is the step people skip, and it is why the first run 403s.** Enabling
-the API in step 2c grants nothing on its own — it only makes the API callable.
-The sheet is still private until you share it, the same as any document.
-
-#### 2f. Fill in `.env` and verify
-
-Open `.env` and set two values:
-
-```bash
-GOOGLE_SA_JSON=.secrets/service-account.json
-SHEET_ID=1a2B3cD4eFgHiJkLmNoPqRsTuVwXyZ_example
-```
-
-`GOOGLE_SA_JSON` takes either a path to that file (what you want locally) or
-the entire JSON pasted on one line (what you will use for GitHub Actions
-later). Both work; the code checks whether the value is a readable path first.
-
-Check the wiring before changing anything:
-
-```bash
-python scripts/setup_sheet.py --check
-```
-
-It prints the service account address, the project, the sheet id, and the tabs
-it can see — or it tells you which of the three usual problems you have. When
-it says access is working, build the tabs:
-
-```bash
-python scripts/setup_sheet.py
-```
-
-That creates `Pipeline`, `History`, `Feedback`, `VoiceAmendments` and `Config`,
-with headers, a frozen bold header row, the Status enum as a dropdown, a
-`Selected` checkbox, per-status row colouring, and text wrapping on the long
-columns. Refresh the sheet in your browser and you should see all five tabs.
-
-It is idempotent — run it again any time the sheet looks wrong, and after any
-upgrade that changes the columns. It repairs headers and formatting in place
-and never deletes your rows.
-
-#### If something fails
-
-| What you see | What it means | Fix |
-|---|---|---|
-| `missing required secret GOOGLE_SA_JSON` | `.env` is missing or the line is not filled in | Check you are in the repo root and `.env` exists (`cp .env.example .env`) |
-| `GOOGLE_SA_JSON is neither a readable file path nor valid JSON` | The path is wrong | `ls -l .secrets/` — the path in `.env` is relative to the repo root |
-| `403 ... PERMISSION_DENIED` or `The caller does not have permission` | The sheet was never shared with the service account | Step 2e. Check you pasted the `client_email`, not your own address |
-| `Google Sheets API has not been used in project ... or it is disabled` | Step 2c was skipped, or you enabled it on a different project | Enable the Sheets API on the project the key belongs to — the `project_id` in the JSON file |
-| `404` / `Requested entity was not found` | `SHEET_ID` is wrong | It is only the part between `/d/` and `/edit`, not the whole URL |
-| Newly enabled API still 403s | Enabling propagates for a minute or two | Wait sixty seconds and re-run `--check` |
-
-Two failures that happen before the script reaches Google at all:
-
-| What you see | What it means | Fix |
-|---|---|---|
-| `TypeError: Metaclasses with custom tp_new are not supported` from `yaml/_yaml` | A PyYAML built from source with an old Cython, which cannot import on Python 3.12. Usually a stale wheel in pip's cache | Upgrade pip first, then reinstall (below) |
-| `ModuleNotFoundError: No module named 'yaml'` right after trying that fix | The reinstall uninstalled the old copy and then failed to install the new one | Same fix — it is safe to re-run |
-| Any `pip` command tracebacks inside `pip/_vendor/packaging`, e.g. `InvalidVersion: Invalid version: '0.dev0'` | pip's own install is broken or half-upgraded, so it cannot install anything at all | Rebuild the venv (below). Do not try to fix pip with pip |
-| `InvalidVersion: Invalid version: '0.dev0'` from pip, even a freshly downloaded one | Your Python's `re` module mishandles the possessive quantifiers in packaging's version pattern, so modern pip cannot start. Python 3.12.0 is one such build | Use a different interpreter — `doctor.sh` now detects this and picks a working one, or `brew install python@3.12` |
-| `TypeError: Metaclasses with custom tp_new are not supported` on import, after pip reported a successful install | pip was too old to use the prebuilt wheels, so it built C extensions from source with an outdated Cython. They install fine and fail on import | `bash scripts/doctor.sh --fix` — it installs a current pip first |
-| `SSL: CERTIFICATE_VERIFY_FAILED` from Python (but not from curl or pip) | A python.org build whose CA certificates were never installed. pip bundles its own, so only stdlib HTTPS breaks | Optional — the doctor uses curl instead. To fix Python itself: `find /Applications /Library/Frameworks/Python.framework -name 'Install Certificates.command'` and run it, or point Python at certifi by hand (the script prints the exact command) |
-| `ModuleNotFoundError: No module named 'lnp'` | Run from the repo root, not from inside `scripts/` | `cd` to the repo root and use `python scripts/setup_sheet.py` |
-
-For either of those two, upgrade pip before reinstalling. An old pip is the
-root cause: it is worse at matching prebuilt wheels, so it falls back to
-building from source.
-
-```bash
-python -m pip install --upgrade pip
-python -m pip install --no-cache-dir -r requirements.txt
-python -c "import yaml; print(yaml.__version__)"
-```
-
-Use `python -m pip` rather than bare `pip` so the install definitely lands in
-the active venv. Avoid `--only-binary :all:` here: if it cannot match a wheel
-it fails outright, and combined with `--force-reinstall` that removes the
-working copy before discovering it has nothing to replace it with.
-
-### First: run the doctor
-
-Before reading the table above, run this. It checks everything in one pass and
-repairs the common breakages itself:
-
-```bash
-bash scripts/doctor.sh          # report only, changes nothing
-bash scripts/doctor.sh --fix    # rebuild the venv and reinstall
-```
-
-It reports which Python interpreters you have, whether pip itself is working,
-which packages are missing, whether the tests pass, whether `.env` is filled in
-(placeholders count as empty), whether the service-account key file is actually
-where `.env` says it is, and whether the sheet is reachable. It is plain bash,
-so it still runs when the Python environment is too broken to import anything —
-which is exactly when you need it.
-
-### Rebuilding the venv
-
-The fix for anything environment-shaped — a broken pip, a C extension that will
-not import, packages that never installed. It takes a minute and discards
-nothing you care about: the venv holds no configuration, only downloaded
-packages.
-
-```bash
-deactivate                     # ignore "command not found" if it is not active
-rm -rf .venv
-python3.12 -m venv --upgrade-deps .venv
-source .venv/bin/activate
-python -m pip install --no-cache-dir -r requirements.txt
-pytest
-```
-
-`--upgrade-deps` gives the new venv a current pip and setuptools up front,
-rather than the older pair bundled with your Python. That matters because a
-broken pip cannot repair itself — `pip install --upgrade pip` needs a working
-pip to run. Building a new venv sidesteps it entirely: the pip inside comes
-from Python's own bundled wheel, not from the broken copy.
-
-That creates the five tabs (`Pipeline`, `History`, `Feedback`,
-`VoiceAmendments`, `Config`) with headers, a frozen bold header row, the Status
-enum as data validation, a `Selected` checkbox, per-status row colouring, and
-text wrapping. It is idempotent — run it again any time the Sheet looks wrong.
-
-### 3. Feeds
-
-```bash
-python scripts/validate_sources.py
-```
-
-Every feed marked `verify: true` in `config/sources.yaml` is one whose URL has
-not been confirmed against the live web. Run the validator, fix or disable
-whatever fails, and drop the `verify` flag from the ones that work. A dead feed
-left configured is worse than a removed one, because a quiet week and a broken
-feed look identical from the outside.
-
-Fosway and HolonIQ publish by newsletter rather than RSS. They are configured
-with `ingest: gmail` and disabled. To use them, subscribe with a Gmail account,
-label the messages, set `ingest.sources.gmail_label: true` in `config.yaml`, and
-put `GMAIL_USER` / `GMAIL_APP_PASSWORD` (an app password, not your account
-password) in the environment.
-
-### 4. LinkedIn app
-
-Do this by hand at [developer.linkedin.com](https://developer.linkedin.com).
-
-1. **Create an app.** It must be linked to a Company Page even though you are
-   only posting to your personal profile. A placeholder page you create yourself
-   is fine — nothing is ever posted to it.
-2. **Verify the app** from the page's Settings. LinkedIn emails a verification
-   link to a page admin; the app does nothing until this is done.
-3. **Products tab** — request these two self-serve products:
-   - *Sign In with LinkedIn using OpenID Connect* (gives `openid`, `profile`)
-   - *Share on LinkedIn* (gives `w_member_social`)
-
-   They are granted automatically, usually within minutes.
-4. **Do not apply for the Marketing Developer Platform.** Posting to your own
-   profile does not need it, and the partner review queue runs for months.
-5. **Auth tab** — add this exact redirect URL:
-   `http://localhost:8765/callback`
-6. Copy the Client ID and Client Secret into `.env`.
-
-Then run the OAuth flow once, on your own machine:
-
-```bash
-python scripts/oauth_bootstrap.py
-```
-
-It opens a browser, catches the redirect on `localhost:8765`, validates the
-`state` parameter, and writes the tokens to `.secrets/linkedin_tokens.json`
-(chmod 600). If LinkedIn returns no refresh token it says so loudly — that means
-a product is missing, and you should fix it and run the script again rather than
-continuing.
-
-### 5. Tokens in CI
-
-Access tokens last 60 days; refresh tokens last 365. The pipeline refreshes
-proactively 7 days before expiry, on every publish run, and persists the rotated
-token.
-
-A GitHub Actions run cannot write back to its own repository secrets, so
-rotation in CI is persisted to a **private Gist**:
-
-1. Create a private Gist containing one file, `linkedin_tokens.json`, with the
-   contents of your local `.secrets/linkedin_tokens.json`.
-2. Note the Gist id from its URL.
-3. Create a fine-grained personal access token with **gist** read/write
-   permission and nothing else.
-4. Add `GIST_ID` and `GIST_TOKEN` as repository secrets.
-
-The publish job switches to the Gist backend automatically when it detects
-`GITHUB_ACTIONS` and a `GIST_ID`.
-
-You will get an alert 30 days before the **refresh** token expires. That one
-needs you at a browser — re-run `scripts/oauth_bootstrap.py` and update the
-Gist. Ignoring it means the pipeline stops dead a month later.
-
-### 6. Repository secrets
-
-`ANTHROPIC_API_KEY`, `GOOGLE_SA_JSON` (paste the whole JSON blob),
-`SHEET_ID`, `LINKEDIN_CLIENT_ID`, `LINKEDIN_CLIENT_SECRET`, `GIST_ID`,
-`GIST_TOKEN`, and `SLACK_WEBHOOK_URL` (or the `SMTP_*` variables).
-
-Nothing goes in the repo. `.gitignore` covers `.env`, `.secrets/`, and
-service-account JSON.
-
-### 7. Leave dry run on for two weeks
-
-`config/config.yaml` ships with `publish.dry_run: true`. Job C logs the exact
-payload it would send and posts nothing. Leave it that way for two weeks: read
-what it would have published each morning and fix the voice card until you would
-have been happy for those posts to go out. Then set it to `false`.
-
----
-
-## Your week
-
-**Monday, ten minutes.** Job A has put ten candidates in the Pipeline tab, each
-with an audience tag, a theme tag, and a one-sentence note on why it matters.
-Tick `Selected` on three or four. For each one, write a one-line `Angle`.
-
-The angle is the whole system. It is your thesis, and the source article is
+The angle is the whole system. It is their thesis, and the source article is
 evidence for it. "Districts are buying AI tutoring seats faster than they can
 staff the humans who supervise them" is an angle. "AI tutoring adoption is
-growing" is a summary, and you will get a summary back.
+growing" is a summary, and a summary is what comes back.
 
-**Within the hour.** Job B drafts each selected row and assigns a slot. For your
-first twenty posts you get two variants, so you can see the range.
+**Within the hour.** Job B drafts each ticked row and assigns a slot. For the
+first twenty posts it produces two variants, so they can see the range.
 
-**Then, per draft, one of four things:**
+**Then, per draft, one of four buttons:**
 
-| You want | Do this |
+| They want | They press |
 |---|---|
-| It's good | Set `Status` to `APPROVED` |
-| Small fix | Edit `FinalText`, then `APPROVED` |
-| Structural fix | Write a `RevisionNote`, set `Status` to `REVISE` |
-| It's wrong | Set `Status` to `SKIPPED` |
+| It's good | **Approve for publishing** |
+| Small fix | edit *your version*, then **Approve** |
+| Structural fix | **Send back with a note** |
+| It's wrong | **Skip** |
 
-If you were given two variants, put the one you want in `FinalText` before
-approving. A row approved with both still in it is refused, not guessed at.
+The draft is shown but not editable. Edits go in a separate field, and that
+separation is the measurement: the distance between the two is what the health
+metric and the weekly voice job are computed from.
 
-`FinalText` always wins over `DraftText`. A `FinalText` cell containing only
-whitespace falls through to the draft rather than publishing nothing.
+If they were given two variants, one has to go before approving. A row approved
+with both still in it is refused, not guessed at.
 
 **Job C** posts approved rows when their slot arrives, and writes back the URN,
 the timestamp, and the edit distance.
 
-*Hosted: the same week, in a browser. Candidates and drafts are on the Review
-screen, the four decisions are four buttons, and your edits go in a field next
-to the draft rather than over it.*
+**Sunday.** Job D reads their corrections and proposes voice rules on the Voice
+screen. They tick the ones they agree with; the next Sunday run writes those
+into their card. Nothing edits the card without a tick.
 
-**Sunday.** Job D reads your corrections and proposes voice rules into the
-`VoiceAmendments` tab. Tick `Accepted` on the ones you agree with; the next
-Sunday run writes them into `config/voice_card.md`. Nothing edits that file
-without your tick.
+**They should not wait for Sunday.** When a draft comes out wrong, the Voice
+screen has the whole card in a text box. That is the fastest fix available, it
+takes thirty seconds, and it takes effect on the next hourly draft run. Job D
+exists to catch what they would not have thought to write down.
 
-**Do not wait for Sunday.** When a draft comes out wrong, open
-`config/voice_card.md` and fix it yourself. It is a plain markdown file, it takes
-thirty seconds, and it takes effect on the next hourly draft run. That is the
-intended primary path; Job D exists to catch what you would not have thought to
-write down.
-
-`Reach` is yours to fill in by hand. Automated engagement retrieval needs
-`r_member_social`, a restricted permission this app deliberately does not
+Impressions are theirs to fill in by hand. Automated engagement retrieval needs
+`r_member_social`, a restricted permission this product deliberately does not
 request.
 
 ---
@@ -505,16 +132,20 @@ request.
 ## Is it working?
 
 The system logs the normalised edit distance between what the model drafted and
-what you actually published, per post, and reports:
+what actually got published, per post, and reports:
 
 - **clean-publish rate** — posts published with zero revisions and zero edits
 - **mean edit distance**, first 10 posts versus last 10
 
-If the clean-publish rate is below 50% after 30 days, you get an alert saying
-the pipeline is costing more editing time than it saves and should be shut off.
-That message is deliberate. A drafting system you rewrite every time is worse
-than a blank page, because it anchors you to someone else's framing before you
-have thought about your own.
+If the clean-publish rate is below 50% after 30 days, the verdict says the
+pipeline is costing more editing time than it saves and should be shut off.
+
+That verdict is shown to the customer, on their Published screen, in those
+words. A drafting tool someone rewrites every time is worse than a blank page,
+because it anchors them to someone else's framing before they have thought
+about their own — and the person paying for it is the one who most needs to be
+told. A product that hides its own failure metric is a product that keeps
+charging for something that stopped working.
 
 ---
 
@@ -522,250 +153,147 @@ have thought about your own.
 
 ### The kill switch
 
-Config tab, `PAUSED` cell, set to `TRUE`. Job C exits immediately without
-posting. Editable from a phone in five seconds — it is the first thing the job
-checks. If the Config tab or the `PAUSED` key is unreadable, the job treats
-itself as paused rather than guessing.
+The switch on a customer's Setup screen, or `PAUSED` in their settings. Job C
+checks it before anything else and exits without posting. If the settings are
+unreadable, or the key is missing, the job treats itself as paused rather than
+guessing: an unreachable stop button might be pressed.
 
-### Failure mode 1: expired refresh token
+### Failure mode 1: a customer's LinkedIn access expired
 
-**Symptom.** Every publish run fails with a 401, or the job's log says
-`token refresh failed`. You will normally have had 30 days of alerts first.
+**Symptom.** Every publish run for that account fails with a 401, or the log
+says `token refresh failed`. They will have had 30 days of warnings first.
 
-**Why.** Refresh tokens last 365 days. Renewing one needs a human in a browser;
-there is no way to automate it, by design.
+**Why.** Refresh tokens last 365 days. Renewing one needs the customer in a
+browser; there is no way to do it on their behalf, by design.
 
-**Fix.**
+**Fix.** They open Setup and press **Authorise posting** again. Nothing on the
+operator's side is involved, and no other account is affected.
 
-```bash
-# on your own machine, not in CI
-python scripts/oauth_bootstrap.py
-cat .secrets/linkedin_tokens.json
-```
-
-Paste the contents into the private Gist referenced by `GIST_ID`, keeping the
-filename `linkedin_tokens.json`. Then run the publish workflow manually with
-dry-run on and check the log shows a valid payload.
-
-Rows that expired while you were fixing it are `EXPIRED` and stay that way.
-That is correct: they were stale before you got there.
+Rows that expired while it was broken stay `EXPIRED`. That is correct: they
+were stale before anyone got to them.
 
 ### Failure mode 2: a row stuck in POSTING
 
-**Symptom.** A row sits at `POSTING`. You have an alert saying it could not be
-verified.
+**Symptom.** A row sits at `POSTING` and you have an alert saying it could not
+be verified.
 
 **Why.** The job writes `POSTING`, calls LinkedIn, then writes `POSTED`. If it
 dies between those, the row is left mid-flight. The next run does **not** retry
 it — it asks the Posts API whether the post exists:
 
 - confirmed present → the row becomes `POSTED` and the URN is recorded;
-- confirmed absent → the row becomes `FAILED`, ready for you to re-approve;
-- **cannot tell** → the row is left untouched and you are alerted.
+- confirmed absent → the row becomes `FAILED`, ready to be re-approved;
+- **cannot tell** → the row is left untouched and a human is alerted.
 
-The third case is the one you have to resolve, and it usually means the Posts
+The third case is the one that needs resolving, and it usually means the Posts
 API refused the read.
 
-**Fix.** Open your LinkedIn profile and look.
-
-- The post is there: set `Status` to `POSTED` and paste the URN into `PostURN`
-  (it looks like `urn:li:share:7123...`, visible in the post's permalink).
-- The post is not there: set `Status` to `FAILED`, then to `APPROVED`. The next
-  run publishes it — if its slot has not gone stale.
-
-Never set a stuck row straight back to `APPROVED` without checking. That is the
-one action that double-posts, which is why the code will not do it either.
+**Fix.** Look at the profile. If the post is there, set the row to `POSTED` and
+record the URN; if it is not, set it to `FAILED` so it can be re-approved.
+Never move a stuck row straight back to `APPROVED` without checking — that is
+the one action that double-posts, which is why the code will not do it either.
 
 ### Other things that happen
 
-**A feed returns nothing.** You get an alert naming the feed. Run
-`python scripts/validate_sources.py`, then fix the URL or set `enabled: false`.
+**A feed returns nothing.** The account's owner gets an alert naming the feed;
+the Sources screen shows the error against it. They fix the URL or remove it.
 
 **A row hits the revision cap.** After three revisions the row is `SKIPPED` and
-you get an alert. Three instructions that did not land almost always means the
-angle is the problem, not the prose. Write a new angle on a fresh row instead of
-revising a fourth time.
+they are told why. Three instructions that did not land almost always means the
+angle is the problem, not the prose — a new angle on a fresh row beats a fourth
+revision.
 
 **The same correction keeps recurring.** If one instruction appears on three or
 more different posts, Job D flags it `RECURRING`, sorts it to the top of the
-review queue, and alerts. Accept the rule, or write it into the voice card
-yourself. A rule you keep repeating is the clearest sign the system is not
-learning.
+Voice screen, and alerts. A rule that keeps being repeated is the clearest sign
+the system is not learning.
+
+**An account runs out of allowance.** Drafting stops for that account until the
+next period. Approving and publishing what is already drafted are unaffected,
+and they were warned at 80%.
 
 ---
 
 ## Layout
 
 ```
-config/config.yaml      all tunables: quotas, character limits, schedule, thresholds
-config/sources.yaml     three tiers of feeds, with weights and verify flags
-config/voice_card.md    the voice. Hand-editable. Edit this first when drafts are wrong.
+config/config.yaml      product tunables: quotas, character limits, thresholds
+config/sources.yaml     the starter feed list every new account is seeded with
+config/voice_card.md    the starter voice card, likewise
 
 src/lnp/models.py       status machine, Row, column ownership, health metric
-src/lnp/store.py        the storage port, and the Sheets adapter behind it
-src/lnp/runner.py       one run per account: store, sources, card, meter
-src/lnp/sheets.py       the Sheet: every write goes through the two guards
+src/lnp/runner.py       one run per account: store, sources, card, tokens, meter
 src/lnp/ingest.py       feeds, two-stage dedupe, education filtering
 src/lnp/scoring.py      batched scoring, tier weights, quota enforcement
 src/lnp/drafting.py     extraction, prompts, post-processing, revision
 src/lnp/voice.py        the card, feedback signals, rule proposals
-src/lnp/tokens.py       OAuth storage, proactive refresh, rotation
+src/lnp/tokens.py       OAuth rotation, proactive refresh, expiry warnings
 src/lnp/linkedin.py     Posts API, and the stuck-row recovery query
+src/lnp/llm.py          Anthropic access, and the metering hook every call passes
 src/lnp/alerts.py       Slack, SMTP, and always a log line
 
 src/lnp/db/schema.py    the multi-tenant tables
-src/lnp/db/store.py     the Postgres adapter — the only module that writes SQL
+src/lnp/db/store.py     one account's pipeline; the only module that writes SQL
 src/lnp/db/crypto.py    encryption for stored credentials, as a column type
+src/lnp/db/tokens.py    per-account LinkedIn app and tokens
 src/lnp/db/usage.py     per-account metering and the cap
 src/lnp/db/provision.py what a new account starts with
+
 src/lnp/api/            FastAPI: sign-in, the pipeline, the account
 web/src/                React: Review, Published, Voice, Sources, Setup
 alembic/                migrations; the schema of record in production
 
 jobs/                   the four scheduled entry points
-scripts/                one-time and diagnostic tooling
+scripts/gen_keys.py     the two secrets a deployment needs
+scripts/serve.sh        migrate, then start the web service
 tests/test_pipeline.py  every invariant above, with the network mocked
-tests/test_store.py     the same conformance suite against both storage backends
+tests/test_store.py     the store guards, tenant isolation, the cap, the runner
 tests/test_api.py       tenancy, the human-side guard, and the two OAuth flows
 ```
 
-### Local commands
+### Commands
 
 ```bash
-bash scripts/doctor.sh --fix            # diagnose and repair the environment
-python scripts/setup_sheet.py --check   # verify Google access, change nothing
-./lnp sheet                             # create or repair the Sheet
-python scripts/validate_sources.py      # per-feed status, non-zero if any is dead
-python scripts/oauth_bootstrap.py       # one-time LinkedIn OAuth
+pytest                                  # 179 tests, no network, no server
+TEST_DATABASE_URL=postgresql://localhost/lnp_test pytest    # on real Postgres
 
+alembic upgrade head                    # apply migrations
+alembic revision --autogenerate -m "…"  # after editing schema.py
+python scripts/gen_keys.py              # the two secrets, printed once
+
+python jobs/curate.py                   # every live account
+python jobs/curate.py --tenant 01J…     # one account
 python jobs/curate.py --no-write        # score and print, write nothing
 python jobs/draft.py --print            # draft and print, write nothing
-python jobs/draft.py --row 01HZY...     # one row
 python jobs/publish.py --dry-run        # log the payload, post nothing
 python jobs/voice_amend.py --dry-run    # propose rules, write nothing
-
-pytest
 ```
 
-## Running it on Railway (single-tenant)
-
-The jobs run on Railway as four scheduled services, all built from the same
-image. There is no server here — each job starts, does a few seconds of work,
-and exits — so a cron service is the right shape and you pay only for the
-seconds it runs.
-
-The GitHub Actions job workflows have been removed so the jobs run in exactly
-one place. `test.yml` stays, running the suite on every push. **Never run both
-at once**: two schedulers on one Sheet can both pick up the same APPROVED row,
-and the guard against double-publishing protects against a crashed run, not
-against a second scheduler.
-
-### 1. Create the project
-
-In Railway: **New Project → Deploy from GitHub repo**, pick this repository.
-Railway reads `railway.json` and builds the `Dockerfile`. The build runs the
-test suite, so a broken commit fails at build time rather than at 07:00 on a
-Monday.
-
-### 2. Set the variables once, on the project
-
-Project → **Variables**. Set them at project level so all four services share
-them.
-
-| Variable | Value |
-|---|---|
-| `ANTHROPIC_API_KEY` | your key |
-| `SHEET_ID` | the id from your sheet's URL |
-| `GOOGLE_SA_JSON` | **the whole contents of the key file**, pasted in |
-| `SLACK_WEBHOOK_URL` | optional, but a pipeline with no alerting is a pipeline you will not notice failing |
-| `LINKEDIN_CLIENT_ID` | from your LinkedIn app |
-| `LINKEDIN_CLIENT_SECRET` | from your LinkedIn app |
-| `LINKEDIN_TOKENS_JSON` | the contents of `.secrets/linkedin_tokens.json` after `./lnp oauth` |
-
-`GOOGLE_SA_JSON` takes a path or the JSON itself, and on a container there is no
-file to point at, so paste the JSON. Same for `LINKEDIN_TOKENS_JSON`.
-
-### 3. Add the volume, then the four services
-
-Add a **volume mounted at `/data`** on the publish service. Then create four
-services from the same repo, each with a start command and a cron schedule
-(service → Settings → **Cron Schedule**):
-
-| Service | Start command | Cron (UTC) |
-|---|---|---|
-| `curate` | `python jobs/curate.py` | `0 12 * * 1` |
-| `draft` | `python jobs/draft.py` | `0 * * * *` |
-| `publish` | `python jobs/publish.py` | `*/30 * * * *` |
-| `voice` | `python jobs/voice_amend.py` | `0 15 * * 0` |
-
-Set **restart policy to NEVER** on all four. A cron job that exits 0 has
-finished; restarting it would run it again immediately, and on `publish` that
-is the one behaviour you do not want.
-
-### Why the volume, when the tokens are already a variable
-
-Because tokens rotate. The access token lasts 60 days and the publish job
-refreshes it automatically — and a process cannot write to its own environment,
-so the refreshed value would have nowhere to go.
-
-So the store reads `LINKEDIN_TOKENS_JSON` when the volume is empty, and writes
-every rotation to the volume. You paste once, rotations survive restarts and
-deploys, and if the volume is ever wiped it re-seeds from the variable and
-carries on. Only `publish` touches tokens, so only `publish` needs the volume.
-
-You still re-authorise from your laptop once a year, with `./lnp oauth` — there
-is no public callback URL, and nothing to attack.
-
-### First deploy
-
-Leave `dry_run: true` in `config/config.yaml`. The publish service will log the
-exact payload it would send and post nothing. Watch it for a few days, then set
-it to `false` and redeploy.
-
-The kill switch works from anywhere: set `PAUSED` to `TRUE` in the Sheet's
-Config tab and the publish service exits without posting, whatever the schedule
-says.
-
-### What I could not verify here
-
-I have no Railway account, so the dashboard steps above come from how Railway
-documents itself rather than from me having clicked them. If a field has moved,
-the shape still holds: one image, four services, four cron expressions, a volume
-at `/data`, restart policy NEVER.
+Every job takes `--tenant`, which is how you reproduce one customer's problem
+without touching anybody else's account.
 
 ---
 
-## Running it as a product
+## Running it
 
-The same pipeline, hosted for other people. The difference is not the pipeline
-— it is where things are kept and who is asking.
+### The architecture, in three paragraphs
 
-| | Single-tenant | Hosted |
-|---|---|---|
-| Storage | a Google Sheet you own | Postgres, one row set per account |
-| Interface | the Sheet | a web app |
-| LinkedIn app | yours, in `.env` | each customer's own, encrypted per account |
-| Model usage | your API key | the operator's, capped per account |
-| Setup | `./lnp setup` | sign in with LinkedIn, then a five-step wizard |
+`PipelineStore` (`src/lnp/db/store.py`) is everything the jobs and the API do
+to one account's state, and the only module in the product that writes SQL.
+Every query filters on `tenant_id`, and the tenant id comes from the store
+object rather than from an argument, so no call site can forget which customer
+it is serving.
 
-Both run the same four jobs, the same status machine, and the same guards. The
-jobs ask `runner.runs()` for a store and never learn which one they got, so
-there is no second implementation of "approve" to keep in step.
+Two rules live in its write path rather than at the call sites, because a call
+site is a place somebody can forget. `write` refuses to touch a human's column;
+`write_as_human` refuses to touch the model's. Both refuse before anything is
+persisted, and `transition` checks the status machine on the same terms.
 
-### The architecture, in one paragraph
-
-`PipelineStore` (`src/lnp/store.py`) is the interface the jobs use.
-`SheetsStore` and `PostgresStore` implement it. The two rules that matter live
-in the interface rather than in either adapter: `write` refuses to touch a
-human's column and `transition` refuses an illegal move, both before anything
-is persisted, and both call the abstract `_write_fields`. A third backend
-could not be written without them.
-
-The API is the second writer, and it gets the mirror rule: `write_as_human`
-refuses the model's columns. Above all it refuses `DraftText`, because the
-difference between what the model wrote and what you published is the only
-thing this system learns from, and folding an edit back into the draft erases
-it. Your edits go in `FinalText` and the draft stays as written.
+The one that matters most is `DraftText`. The difference between what the model
+wrote and what actually went out is the only thing this system learns from, so
+the customer's edits go in `FinalText` and the draft stays as written. That is
+why the web app shows the draft read-only next to a field of their own, and why
+"send it back with a note" is a separate action rather than a retype.
 
 ### The five services
 
@@ -912,9 +440,9 @@ so a failure tells you exactly which one broke:
    payload it would send and posts nothing. Read those logs each morning, fix
    the voice card, and only then set `dry_run: false` and redeploy.
 
-The kill switch works throughout and from anywhere: the switch on Setup, or
-`PAUSED` in the Config tab in single-tenant mode. Publishing stops within half
-an hour and everything else keeps running.
+The kill switch works throughout, for each account, from the switch on their
+Setup screen. Publishing stops within half an hour and everything else keeps
+running.
 
 ### What I could not verify
 

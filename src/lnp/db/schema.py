@@ -2,7 +2,7 @@
 
 Every table that holds tenant data carries `tenant_id` and is indexed on it.
 There is no table a query can reach without naming a tenant, and no code path
-outside `PostgresStore` that builds a query at all — which is how a
+outside `PipelineStore` that builds a query at all — which is how a
 multi-tenant product avoids the failure where one customer sees another's
 drafts.
 
@@ -121,7 +121,7 @@ class LinkedInApp(Base):
     One app per tenant rather than one app for the product: LinkedIn's rate
     limits are per app, and a shared app makes every customer share one
     ceiling and one suspension. The cost is a setup step, which the onboarding
-    wizard walks them through.
+    setup screen walks them through.
     """
 
     __tablename__ = "linkedin_apps"
@@ -164,9 +164,8 @@ class LinkedInToken(Base):
 class PipelineRow(Base):
     """One candidate item, from ingestion to published post.
 
-    The columns are the Sheet's columns, given real types. `archived_at`
-    replaces the separate History tab: a retired row stops appearing in the
-    pipeline but is never deleted, because the archive is what dedupe checks
+    `archived_at` retires a row rather than deleting it: it stops appearing in
+    the pipeline, and it stays, because the archive is what dedupe checks
     against and what the health metric is computed from.
     """
 

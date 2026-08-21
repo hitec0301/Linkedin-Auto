@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lnp.db import crypto
 from lnp.db import session as session_mod
 from lnp.db.schema import Base, Source, Tenant, VoiceAmendment, VoiceCard
-from lnp.db.store import PostgresStore
+from lnp.db.store import PipelineStore
 from lnp.models import Row, Status
 from lnp.util import iso, utcnow
 
@@ -70,7 +70,7 @@ def store_for(tenant_id=TENANT):
 
     from lnp.config import Config
 
-    return PostgresStore(Session(session_mod.engine()), tenant_id, Config({}))
+    return PipelineStore(Session(session_mod.engine()), tenant_id, Config({}))
 
 
 def seed(rows, tenant_id=TENANT):
