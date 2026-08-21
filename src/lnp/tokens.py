@@ -41,6 +41,26 @@ class TokenError(Exception):
 
 
 @dataclass
+class AppCredentials:
+    """The LinkedIn app a token exchange is performed against.
+
+    Passed in rather than read from the environment, because in the hosted
+    product every tenant has their own app. When it is omitted the environment
+    supplies it, which is the single-tenant install.
+    """
+
+    client_id: str
+    client_secret: str
+
+    @classmethod
+    def from_env(cls) -> "AppCredentials":
+        return cls(
+            client_id=require_env("LINKEDIN_CLIENT_ID"),
+            client_secret=require_env("LINKEDIN_CLIENT_SECRET"),
+        )
+
+
+@dataclass
 class TokenSet:
     access_token: str = ""
     refresh_token: str = ""
@@ -226,16 +246,19 @@ def make_backend(config: Config):
 # --------------------------------------------------------------------------
 
 
-def exchange_code(code: str, redirect_uri: str) -> TokenSet:
-    """Authorization code -> tokens. Used only by the OAuth bootstrap script."""
+def exchange_code(
+    code: str, redirect_uri: str, app: Optional[AppCredentials] = None
+) -> TokenSet:
+    """Authorization code -> tokens."""
+    app = app or AppCredentials.from_env()
     response = requests.post(
         TOKEN_URL,
         data={
             "grant_type": "authorization_code",
             "code": code,
             "redirect_uri": redirect_uri,
-            "client_id": require_env("LINKEDIN_CLIENT_ID"),
-            "client_secret": require_env("LINKEDIN_CLIENT_SECRET"),
+            "client_id": app.client_id,
+            "client_secret": app.client_secret,
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30,
@@ -245,18 +268,19 @@ def exchange_code(code: str, redirect_uri: str) -> TokenSet:
     return TokenSet.from_response(response.json())
 
 
-def refresh(tokens: TokenSet) -> TokenSet:
+def refresh(tokens: TokenSet, app: Optional[AppCredentials] = None) -> TokenSet:
     if not tokens.refresh_token:
         raise TokenError(
             "no refresh token stored; re-run `python scripts/oauth_bootstrap.py`"
         )
+    app = app or AppCredentials.from_env()
     response = requests.post(
         TOKEN_URL,
         data={
             "grant_type": "refresh_token",
             "refresh_token": tokens.refresh_token,
-            "client_id": require_env("LINKEDIN_CLIENT_ID"),
-            "client_secret": require_env("LINKEDIN_CLIENT_SECRET"),
+            "client_id": app.client_id,
+            "client_secret": app.client_secret,
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         timeout=30,
@@ -269,7 +293,9 @@ def refresh(tokens: TokenSet) -> TokenSet:
     return TokenSet.from_response(response.json(), previous=tokens)
 
 
-def load_fresh(config: Config, backend=None, alerter=None) -> TokenSet:
+def load_fresh(
+    config: Config, backend=None, alerter=None, app: Optional[AppCredentials] = None
+) -> TokenSet:
     """Return a usable access token, refreshing and persisting if needed.
 
     Called on every publish run. The refresh-token warning is deliberately loud
@@ -290,7 +316,7 @@ def load_fresh(config: Config, backend=None, alerter=None) -> TokenSet:
             "refreshing access token",
             extra={"days_left": tokens.days_until_expiry()},
         )
-        rotated = refresh(tokens)
+        rotated = refresh(tokens, app)
         rotated.person_urn = tokens.person_urn
         backend.save(rotated)
         tokens = rotated

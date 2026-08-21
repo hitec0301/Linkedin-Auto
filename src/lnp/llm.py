@@ -10,7 +10,8 @@ import json
 import random
 import re
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Protocol
 
 import anthropic
 
@@ -22,6 +23,49 @@ logger = log.get(__name__)
 
 class LLMError(Exception):
     pass
+
+
+class UsageCapExceeded(LLMError):
+    """The tenant has spent their allowance for the period.
+
+    A hard stop rather than a warning: the operator pays for inference, and a
+    cap that only warns is not a cap.
+    """
+
+
+@dataclass
+class Usage:
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+class Meter(Protocol):
+    """Somewhere to check an allowance and record what a call cost.
+
+    A module-level hook rather than an argument threaded through every caller:
+    metering has to cover *every* model call, and an argument is something a
+    new call site can be written without.
+    """
+
+    def check(self) -> None:
+        """Raise UsageCapExceeded if this tenant has no allowance left."""
+
+    def record(self, usage: Usage) -> None:
+        ...
+
+
+_meter: Optional[Meter] = None
+
+
+def set_meter(meter: Optional[Meter]) -> None:
+    """Install the meter for this process. The single-tenant install has none."""
+    global _meter
+    _meter = meter
+
+
+def current_meter() -> Optional[Meter]:
+    return _meter
 
 
 def client() -> anthropic.Anthropic:
@@ -55,10 +99,24 @@ def complete(
     if temperature is not None:
         kwargs["temperature"] = temperature
 
+    if _meter is not None:
+        _meter.check()
+
     last: Optional[Exception] = None
     for attempt in range(max_retries):
         try:
             response = api.messages.create(**kwargs)
+            if _meter is not None:
+                # Recorded before the response is validated: a refusal or an
+                # empty completion still cost tokens, and an allowance that
+                # only counts useful calls is not the one being paid for.
+                _meter.record(
+                    Usage(
+                        model=model,
+                        input_tokens=response.usage.input_tokens,
+                        output_tokens=response.usage.output_tokens,
+                    )
+                )
             if response.stop_reason == "refusal":
                 raise LLMError(
                     f"model declined the request "
@@ -134,6 +192,8 @@ def complete_json(
 def web_search(config: Config, query: str, api: Optional[anthropic.Anthropic] = None) -> List[Dict[str, str]]:
     """Server-side web search. Only reachable when ingest.sources.web_search is on."""
     api = api or client()
+    if _meter is not None:
+        _meter.check()
     response = api.messages.create(
         model=config.get("scoring.model", "claude-sonnet-4-6"),
         max_tokens=4000,
@@ -154,6 +214,15 @@ def web_search(config: Config, query: str, api: Optional[anthropic.Anthropic] = 
             }
         ],
     )
+    if _meter is not None:
+        _meter.record(
+            Usage(
+                model=str(getattr(response, "model", "")),
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+            )
+        )
+
     results: List[Dict[str, str]] = []
     for block in response.content:
         if block.type != "web_search_tool_result":
