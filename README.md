@@ -12,11 +12,27 @@ wanting one, the thing to change is the voice card, not the architecture.
 
 Your time cost is about ten minutes on Monday plus a few minutes per draft.
 
+### Two ways to run it
+
+|  | **Single-tenant** | **Hosted** |
+|---|---|---|
+| For | you, on your own account | subscribers, on your servers |
+| Storage | a Google Sheet you own | Postgres |
+| Interface | the Sheet | a web app |
+| Where it runs | Railway cron services | Railway: a web service and four cron services |
+| Set up with | `./lnp setup` | [Running it as a product](#running-it-as-a-product) |
+
+Everything down to [Running it on Railway](#running-it-on-railway-single-tenant)
+describes the single-tenant tool, and all of it is still true of the hosted one
+apart from where things are stored and which screen you press the buttons on.
+Both run the same four jobs, the same status machine, and the same guards.
+
 ---
 
 ## How it runs
 
-Four scheduled GitHub Actions jobs. No server.
+Four scheduled jobs. No long-running process in single-tenant mode; the hosted
+one adds a web service and nothing else.
 
 ```
 JOB A  curate       Mon 12:00 UTC   feeds -> dedupe -> score -> 10 candidates into the Sheet
@@ -27,8 +43,8 @@ JOB C  publish      every 30 min    posts rows whose ScheduledFor is due
 JOB D  voice_amend  Sun 15:00 UTC   proposes voice rules from your corrections; you tick to accept
 ```
 
-Cron in GitHub Actions is UTC and does not follow daylight saving, so the local
-times drift by an hour twice a year. Nothing depends on the exact minute.
+Cron is UTC and does not follow daylight saving, so the local times drift by an
+hour twice a year. Nothing depends on the exact minute.
 
 ### The status machine
 
@@ -40,9 +56,10 @@ any -> SKIPPED ;  DRAFTED/APPROVED -> EXPIRED ;  POSTED, SKIPPED, EXPIRED are te
 ```
 
 Every transition goes through `assert_transition()`, which raises on anything
-not in that diagram. The Status column also carries Google Sheets data
-validation, so a mistyped cell cannot inject a state the code has never heard
-of.
+not in that diagram, whichever storage is underneath and whichever interface
+asked. In the Sheet, the Status column also carries data validation, so a
+mistyped cell cannot inject a state the code has never heard of; in the web app
+a button only exists for a move the machine actually has.
 
 ### What the jobs will not do
 
@@ -63,7 +80,8 @@ These are enforced in code and each has a test:
 6. `DraftText` is model output and is never overwritten with your edits. The
    difference between `DraftText` and what you published is the only learning
    signal the system has.
-7. `PAUSED` in the Config tab stops Job C immediately.
+7. `PAUSED` stops Job C immediately — a cell in the Config tab, or the switch on
+   the Setup screen.
 8. A row approved with both drafts still in it is refused, not guessed at.
 9. The drafting prompt forbids any number that is not in the fetched source
    extract.
@@ -463,6 +481,10 @@ whitespace falls through to the draft rather than publishing nothing.
 **Job C** posts approved rows when their slot arrives, and writes back the URN,
 the timestamp, and the edit distance.
 
+*Hosted: the same week, in a browser. Candidates and drafts are on the Review
+screen, the four decisions are four buttons, and your edits go in a field next
+to the draft rather than over it.*
+
 **Sunday.** Job D reads your corrections and proposes voice rules into the
 `VoiceAmendments` tab. Tick `Accepted` on the ones you agree with; the next
 Sunday run writes them into `config/voice_card.md`. Nothing edits that file
@@ -625,7 +647,7 @@ python jobs/voice_amend.py --dry-run    # propose rules, write nothing
 pytest
 ```
 
-## Running it on Railway
+## Running it on Railway (single-tenant)
 
 The jobs run on Railway as four scheduled services, all built from the same
 image. There is no server here — each job starts, does a few seconds of work,
@@ -704,12 +726,12 @@ The kill switch works from anywhere: set `PAUSED` to `TRUE` in the Sheet's
 Config tab and the publish service exits without posting, whatever the schedule
 says.
 
-### What I could not verify
+### What I could not verify here
 
-I built and tested everything in this repo, but I have no Railway account, so
-the dashboard steps above come from how Railway works rather than from me
-having clicked them. If a field has moved, the shape still holds: one image,
-four services, four cron expressions, a volume at `/data`, restart policy NEVER.
+I have no Railway account, so the dashboard steps above come from how Railway
+documents itself rather than from me having clicked them. If a field has moved,
+the shape still holds: one image, four services, four cron expressions, a volume
+at `/data`, restart policy NEVER.
 
 ---
 
@@ -766,29 +788,143 @@ Each job iterates every account whose subscription is `trialing` or `active`.
 One account's broken feed alerts and the loop moves on — the tenth customer
 does not lose their week because the third one's source list rotted.
 
-### Variables
+### Connecting the repo to Railway
 
-Add a Postgres service, then set these on the project so every service sees
-them.
+Roughly twenty minutes, most of it waiting on builds.
+
+**1. Make your sign-in LinkedIn app.** This one is yours, not a customer's, and
+it only ever identifies people — it cannot post. At
+[developer.linkedin.com](https://developer.linkedin.com/) create an app, and on
+its **Products** tab request **Sign In with LinkedIn using OpenID Connect**.
+Leave the Auth tab open; you come back to it in step 5.
+
+**2. Generate the two secrets.**
+
+```bash
+python scripts/gen_keys.py
+```
+
+Keep that output. `LNP_ENCRYPTION_KEY` is not rotatable — changing it makes
+every stored LinkedIn credential unreadable and every customer has to
+reconnect. Back it up somewhere that is not the database it protects.
+
+**3. Create the project and the database.** In Railway: **New Project → Deploy
+from GitHub repo**, pick this repository, and let the first build run. Then
+**New → Database → Add PostgreSQL** in the same project.
+
+**4. Set the variables on the project**, not on a service, so all five share
+them. Project → **Variables**:
 
 | Variable | Value |
 |---|---|
-| `DATABASE_URL` | reference the Postgres service's variable |
-| `LNP_SECRET_KEY` | from `python scripts/gen_keys.py` — signs session cookies |
-| `LNP_ENCRYPTION_KEY` | from the same command — encrypts stored credentials |
-| `LNP_BASE_URL` | e.g. `https://app.yourdomain.com`, no trailing slash |
-| `LNP_AUTH_CLIENT_ID` | your own LinkedIn app, used only for Sign in with LinkedIn |
+| `DATABASE_URL` | `${{Postgres.DATABASE_URL}}` — reference it, do not paste it |
+| `LNP_SECRET_KEY` | from step 2 — signs session cookies |
+| `LNP_ENCRYPTION_KEY` | from step 2 — encrypts stored credentials |
+| `LNP_BASE_URL` | your public URL, no trailing slash (step 5) |
+| `LNP_AUTH_CLIENT_ID` | the sign-in app from step 1 |
 | `LNP_AUTH_CLIENT_SECRET` | the secret for that app |
 | `ANTHROPIC_API_KEY` | yours: the operator pays for drafting |
 | `SLACK_WEBHOOK_URL` | optional, and the only way you hear about a failed run |
 
-`LNP_ENCRYPTION_KEY` is not a rotatable value. Changing it makes every stored
-LinkedIn credential unreadable and every customer has to reconnect. Back it up
-somewhere that is not the database it protects.
+Referencing `${{Postgres.DATABASE_URL}}` rather than copying the string means a
+database that gets recreated does not leave five services pointing at a
+hostname that no longer resolves. `postgres://` and `postgresql://` are both
+accepted; the code rewrites either to the driver it actually uses.
 
-The redirect URL to register on your sign-in app is
-`${LNP_BASE_URL}/auth/linkedin/callback`. Each customer registers a different
-one on their own app — the setup screen shows it to them ready to paste.
+**5. Give the web service a domain.** Service → Settings → Networking →
+**Generate Domain**. Put that URL in `LNP_BASE_URL`, and add
+`<that URL>/auth/linkedin/callback` to your sign-in app's **Authorized redirect
+URLs** on LinkedIn. It has to match character for character.
+
+**6. Add the four cron services.** Each is **New → GitHub Repo**, same
+repository, then Settings → **Custom Start Command** and **Cron Schedule**:
+
+| Service | Start command | Cron (UTC) | Restart policy |
+|---|---|---|---|
+| `curate` | `python jobs/curate.py` | `0 12 * * 1` | NEVER |
+| `draft` | `python jobs/draft.py` | `0 * * * *` | NEVER |
+| `publish` | `python jobs/publish.py` | `*/30 * * * *` | NEVER |
+| `voice` | `python jobs/voice_amend.py` | `0 15 * * 0` | NEVER |
+
+Restart policy **NEVER** on all four: a cron job that exits 0 has finished, and
+restarting it runs it again immediately — on `publish` that is the one
+behaviour you do not want. The web service keeps the default restart policy.
+
+The build runs the test suite, so a broken commit fails at build time rather
+than at 07:00 on a Monday with nobody watching.
+
+### Testing it
+
+**Locally first, without a database server.** SQLite is enough to exercise
+everything except Postgres-specific behaviour, and the whole flow works:
+
+```bash
+export DATABASE_URL="sqlite:///$PWD/local.db"
+eval "$(python scripts/gen_keys.py | grep '^LNP_' | sed 's/^/export /')"
+export LNP_BASE_URL=http://localhost:8000 LNP_INSECURE_COOKIES=1
+export LNP_AUTH_CLIENT_ID=... LNP_AUTH_CLIENT_SECRET=...   # your sign-in app
+
+alembic upgrade head
+uvicorn lnp.api.app:app --app-dir src --reload      # :8000
+cd web && npm install && npm run dev                # :5173, proxies to :8000
+```
+
+`LNP_INSECURE_COOKIES=1` is only for plain-HTTP local runs; without it the
+session cookie is `Secure` and a browser on `http://` will drop it. Never set it
+on a deployment.
+
+Signing in needs a LinkedIn app with
+`http://localhost:8000/auth/linkedin/callback` registered as a redirect URL,
+which LinkedIn does accept for localhost. Without `LNP_AUTH_CLIENT_ID` set,
+`/auth/linkedin/start` answers **503** rather than failing obscurely — that is
+the deployment saying sign-in is not configured, not a bug.
+
+Every other screen works without it, and the test suite covers the OAuth paths
+with no browser at all:
+
+```bash
+pytest                              # 218 tests, no network
+pytest tests/test_api.py -v         # tenancy, the guards, both OAuth flows
+TEST_DATABASE_URL=postgresql://localhost/lnp_test pytest   # against real Postgres
+```
+
+**Then on Railway,** in this order — each step is the precondition for the next,
+so a failure tells you exactly which one broke:
+
+1. `curl https://<your-domain>/healthz` → `{"ok":true}`. The image built, the
+   process started, and migrations applied.
+2. `curl -i https://<your-domain>/api/rows` → **401**. The API is refusing
+   anonymous requests, which is the one failure mode worth checking by hand.
+3. Open the domain in a browser and sign in with LinkedIn. A redirect back to
+   the app means `LNP_BASE_URL` and the registered redirect URL agree; a
+   LinkedIn error page means they do not.
+4. You should land on **Setup** with the five-step wizard, because a new account
+   has no posting grant yet. Check the Sources screen has feeds and the Voice
+   screen has a card — that is provisioning having run.
+5. Walk the wizard with a throwaway LinkedIn app of your own, as a customer
+   would. It ends with **Authorise posting** and a green "Connected".
+6. Run curate by hand rather than waiting until Monday: the `curate` service →
+   **Deploy** (or `railway run python jobs/curate.py`). Candidates should appear
+   on the Review screen within a minute.
+7. Tick one, write an angle, and run `draft` the same way. A draft appears.
+8. **Leave `publish.dry_run: true` in `config/config.yaml` for the first
+   fortnight.** Approve a row and run `publish` by hand: it logs the exact
+   payload it would send and posts nothing. Read those logs each morning, fix
+   the voice card, and only then set `dry_run: false` and redeploy.
+
+The kill switch works throughout and from anywhere: the switch on Setup, or
+`PAUSED` in the Config tab in single-tenant mode. Publishing stops within half
+an hour and everything else keeps running.
+
+### What I could not verify
+
+I built and tested all of this, and ran the web service against a real database
+to confirm migrations apply, the app serves, and the API refuses an
+unauthenticated request. But I have no Railway account and no LinkedIn app, so
+the dashboard steps and the two OAuth round-trips above come from how those
+services document themselves rather than from me having clicked them. The shape
+holds either way: one image, five services, one database, and two LinkedIn apps
+that must never be confused.
 
 ### Migrations
 
