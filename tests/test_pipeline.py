@@ -1513,3 +1513,34 @@ def test_placeholders_do_not_count_as_set():
     assert onb.missing_required({"ANTHROPIC_API_KEY": "sk-ant-...",
                                  "SHEET_ID": "abc", "GOOGLE_SA_JSON": "k.json"}) \
         == ["ANTHROPIC_API_KEY"]
+
+
+def test_pasted_values_keep_their_label_stripped():
+    """Consoles show 'Client secret : value', and that is what gets pasted."""
+    assert onb.clean_pasted("client secret :  WPL_AP1.abc==") == "WPL_AP1.abc=="
+    assert onb.clean_pasted("Client ID: 77exampleid123") == "77exampleid123"
+    assert onb.clean_pasted('  "77exampleid123"  ') == "77exampleid123"
+    assert onb.clean_pasted("77exampleid123") == "77exampleid123"
+
+
+def test_linkedin_client_id_shape():
+    good = onb.check_linkedin_client_id("Client ID: 77exampleid123")
+    assert good.ok is True and good.extra["value"] == "77exampleid123"
+    assert onb.check_linkedin_client_id("").ok is False
+    assert onb.check_linkedin_client_id("772vtx01 ov0awb").ok is False   # pasted two fields
+    assert onb.check_linkedin_client_id("short").ok is False
+
+
+def test_linkedin_secret_shape():
+    good = onb.check_linkedin_secret("client secret :  WPL_AP1.EXAMPLE0000FAKE.aBcDeF==")
+    assert good.ok is True
+    assert good.extra["value"] == "WPL_AP1.EXAMPLE0000FAKE.aBcDeF=="
+    assert onb.check_linkedin_secret("").ok is False
+    assert onb.check_linkedin_secret("two words here").ok is False
+
+
+def test_a_secret_never_appears_whole_in_a_check_detail():
+    """Details get printed and logged; the value itself must not ride along."""
+    secret = "WPL_AP1.EXAMPLE0000FAKE.aBcDeF=="
+    check = onb.check_linkedin_secret(secret)
+    assert secret not in check.detail

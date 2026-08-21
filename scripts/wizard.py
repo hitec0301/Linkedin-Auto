@@ -12,6 +12,7 @@ error that names something else. Nothing is written until it has passed.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
 from pathlib import Path
@@ -244,6 +245,65 @@ def step_anthropic(env: dict) -> str:
             note(check.fix)
 
 
+def ask_secret(prompt: str) -> str:
+    """Read a secret without echoing it, so it stays out of the screen.
+
+    Falls back to a normal prompt where the terminal cannot hide input, saying
+    so rather than silently echoing a secret the person expected to be masked.
+    """
+    try:
+        return getpass.getpass(f"  {prompt}\n  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        say("\n\nStopped.")
+        raise SystemExit(1)
+    except Exception:  # noqa: BLE001 - no tty, e.g. piped input
+        note("(this terminal cannot hide input, so the value will be visible)")
+        return ask(prompt)
+
+
+def step_linkedin(env: dict) -> dict:
+    """Collect the LinkedIn app credentials.
+
+    Shape is checked here; whether they actually work is proved by `./lnp oauth`,
+    which is the only thing that exercises them. Saying so beats implying a
+    verification that has not happened.
+    """
+    heading("5. LinkedIn app (optional - needed only to publish)")
+    if onb.is_set(env.get("LINKEDIN_CLIENT_ID")) and onb.is_set(env.get("LINKEDIN_CLIENT_SECRET")):
+        ok(f"client id {env['LINKEDIN_CLIENT_ID']} already set")
+        if not confirm("Replace them?", default=False):
+            return {}
+
+    say("  From developer.linkedin.com -> your app -> Auth tab.")
+    say(f"  {DIM}Skip with Enter if you are not publishing yet.{RESET}")
+
+    answer = ask("Client ID (Enter to skip)")
+    if not answer.strip():
+        note("skipped - dry_run stays on and nothing can post")
+        return {}
+    while True:
+        check = onb.check_linkedin_client_id(answer)
+        if check.ok:
+            ok(check.detail)
+            client_id = check.extra["value"]
+            break
+        bad(check.detail)
+        note(check.fix)
+        answer = ask("Client ID")
+
+    while True:
+        check = onb.check_linkedin_secret(ask_secret("Client Secret (hidden as you type)"))
+        if check.ok:
+            ok(check.detail)
+            secret = check.extra["value"]
+            break
+        bad(check.detail)
+        note(check.fix)
+
+    note("shape looks right; ./lnp oauth is what proves they work")
+    return {"LINKEDIN_CLIENT_ID": client_id, "LINKEDIN_CLIENT_SECRET": secret}
+
+
 def build_tabs(sheet_id: str, key_path: str) -> None:
     heading("4. Build the sheet's tabs")
     check = verify_sheet(sheet_id, key_path)
@@ -300,11 +360,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--recheck", action="store_true",
                         help="verify what is configured and change nothing")
+    parser.add_argument("--linkedin", action="store_true",
+                        help="set only the LinkedIn app credentials")
     args = parser.parse_args()
 
     env = onb.read_env(ENV_PATH)
     if args.recheck:
         return recheck(env)
+    if args.linkedin:
+        values = step_linkedin(env)
+        if values:
+            onb.upsert_env(ENV_PATH, values)
+            heading("Saved to .env")
+            say("  Next:  ./lnp oauth   authorise your own account, once")
+        return 0
 
     say(f"{BOLD}Setup{RESET}")
     say("Each value is checked against the real service before it is saved.")
@@ -321,6 +390,10 @@ def main() -> int:
         onb.upsert_env(ENV_PATH, {"ANTHROPIC_API_KEY": api_key})
 
     build_tabs(sheet_id, key_path)
+
+    linkedin = step_linkedin(onb.read_env(ENV_PATH))
+    if linkedin:
+        onb.upsert_env(ENV_PATH, linkedin)
 
     heading("Done")
     remaining = onb.missing_required(onb.read_env(ENV_PATH))

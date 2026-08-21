@@ -7,6 +7,7 @@
 #   ./lnp curate    put this week's candidates in the sheet
 #   ./lnp draft     draft the rows you selected
 #   ./lnp publish   post approved rows (dry run until you turn it off)
+#   ./lnp linkedin  set the LinkedIn app credentials
 #   ./lnp voice     propose voice rules from your corrections
 #   ./lnp test      run the test suite
 #
@@ -21,6 +22,7 @@ fi
 
 case "${1:-}" in
   setup)   shift; exec "$PY" scripts/wizard.py "$@" ;;
+  linkedin) shift; exec "$PY" scripts/wizard.py --linkedin "$@" ;;
   check)   shift; exec "$PY" scripts/wizard.py --recheck "$@" ;;
   doctor)  shift; exec bash scripts/doctor.sh "$@" ;;
   curate)  shift; exec "$PY" jobs/curate.py "$@" ;;

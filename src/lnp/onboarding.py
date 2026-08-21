@@ -180,6 +180,53 @@ def install_key_file(source: Path, root: Path) -> Path:
 
 
 # --------------------------------------------------------------------------
+# LinkedIn app credentials
+# --------------------------------------------------------------------------
+
+# People paste the label along with the value, because that is how the console
+# presents it. Strip it rather than rejecting a value that is actually correct.
+_LABEL = re.compile(
+    r"^\s*(client\s*(id|secret)|primary\s*client\s*secret|api\s*key)\s*[:=]?\s*",
+    re.IGNORECASE,
+)
+
+
+def clean_pasted(text: str) -> str:
+    """Strip a leading field label, surrounding quotes and stray whitespace."""
+    text = (text or "").strip()
+    text = _LABEL.sub("", text)
+    return text.strip().strip('"').strip("'").strip()
+
+
+def check_linkedin_client_id(text: str) -> Check:
+    value = clean_pasted(text)
+    if not value:
+        return Check(False, "no value given")
+    if " " in value:
+        return Check(False, "that contains a space, so it is not just the id",
+                     "Copy only the Client ID field")
+    if not re.fullmatch(r"[A-Za-z0-9]{10,30}", value):
+        return Check(False, "that does not look like a LinkedIn client id",
+                     "It is a short string of letters and digits, around 14 characters, "
+                     "from your app's Auth tab")
+    return Check(True, f"client id {value}", extra={"value": value})
+
+
+def check_linkedin_secret(text: str) -> Check:
+    value = clean_pasted(text)
+    if not value:
+        return Check(False, "no value given")
+    if " " in value:
+        return Check(False, "that contains a space, so it is not just the secret",
+                     "Copy only the Client Secret field")
+    # Current secrets carry a WPL_AP1. prefix; older apps issued a plain string.
+    if value.startswith("WPL_AP1.") or re.fullmatch(r"[A-Za-z0-9+/=._-]{12,}", value):
+        return Check(True, f"secret {value[:8]}...", extra={"value": value})
+    return Check(False, "that does not look like a LinkedIn client secret",
+                 "Take it from your app's Auth tab, next to Client Secret")
+
+
+# --------------------------------------------------------------------------
 # .env
 # --------------------------------------------------------------------------
 
