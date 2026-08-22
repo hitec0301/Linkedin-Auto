@@ -43,6 +43,7 @@ export const api = {
   signOut: () => request('/auth/signout', { method: 'POST' }),
 
   rows: (status) => request(`/api/rows${status ? `?status_filter=${status}` : ''}`),
+  curateNow: () => request('/api/rows/curate-now', { method: 'POST' }),
   editRow: (id, body) => request(`/api/rows/${id}`, { method: 'PATCH', body }),
   approve: (id) => request(`/api/rows/${id}/approve`, { method: 'POST' }),
   unapprove: (id) => request(`/api/rows/${id}/unapprove`, { method: 'POST' }),

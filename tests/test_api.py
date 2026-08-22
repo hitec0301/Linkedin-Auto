@@ -525,3 +525,99 @@ def test_the_shipped_schema_matches_the_migrations(tmp_path, monkeypatch):
     # or extra table or column does not.
     real = [d for d in diff if d[0] not in ("add_index", "remove_index")]
     assert real == [], f"the models and the migrations disagree: {real}"
+
+
+# --------------------------------------------------------------------------
+# On-demand curate: the Setup screen's "fetch candidates now"
+# --------------------------------------------------------------------------
+
+
+def test_curate_now_writes_rows_when_review_is_empty(api, monkeypatch):
+    """A brand-new account can get its first batch without waiting for Monday."""
+    from lnp import ingest as ingest_mod
+    from lnp.ingest import Candidate, FeedResult
+
+    with session_mod.session_scope() as session:
+        session.add(Source(id="01SRCNOW", tenant_id=TENANT, name="Feed",
+                            url="https://feed.test/rss", tier=2,
+                            audience="AUD_CORPORATE", active=True))
+
+    def fake_fetch(feed, timeout, user_agent):
+        items = [
+            Candidate(url="https://feed.test/a", title="A district buys AI seats",
+                      summary="summary", source_name=feed["name"],
+                      tier=feed["tier"], weight=feed["weight"]),
+        ]
+        return FeedResult(feed["name"], feed["url"], feed["tier"], True, len(items), "", items)
+
+    def fake_scorer(config, *, system, user, model=None, max_tokens=0):
+        import json
+        items = json.loads(user.split("Items to triage:\n", 1)[1])
+        return [
+            {"i": item["i"], "score": 8, "audience": "AUD_CORPORATE",
+             "theme": "THM_AI", "why": "Buyers will feel this before vendors do."}
+            for item in items
+        ]
+
+    monkeypatch.setattr(ingest_mod, "fetch_feed", fake_fetch)
+    monkeypatch.setattr("lnp.scoring.complete_json", fake_scorer)
+
+    response = api.post("/api/rows/curate-now")
+    assert response.status_code == 200
+    assert response.json()["written"] == 1
+
+    rows = api.get("/api/rows").json()
+    assert len(rows) == 1
+    assert rows[0]["status"] == "NEW"
+
+
+def test_curate_now_refuses_when_review_is_not_empty(api):
+    """The button only exists for the empty state; the API enforces the same rule."""
+    seed([Row(ID="01ALREADYNEW", Status=Status.NEW)])
+    response = api.post("/api/rows/curate-now")
+    assert response.status_code == 409
+
+
+def test_curate_now_respects_the_cooldown(api):
+    """A batch that just ran cannot be re-triggered a second later."""
+    store_for().set_config_value("LAST_CURATE", iso())
+    response = api.post("/api/rows/curate-now")
+    assert response.status_code == 429
+
+
+def test_curate_now_does_not_reach_another_tenants_rows(api, monkeypatch):
+    """Triggered from one account's session, it only ever touches that account."""
+    from lnp import ingest as ingest_mod
+    from lnp.ingest import Candidate, FeedResult
+
+    with session_mod.session_scope() as session:
+        session.add(Source(id="01SRCOTHER", tenant_id=TENANT, name="Feed",
+                            url="https://feed.test/rss", tier=2,
+                            audience="AUD_CORPORATE", active=True))
+    seed([Row(ID="01OTHERROW", Status=Status.NEW)], tenant_id=OTHER)
+
+    def fake_fetch(feed, timeout, user_agent):
+        items = [
+            Candidate(url="https://feed.test/a", title="A district buys AI seats",
+                      summary="summary", source_name=feed["name"],
+                      tier=feed["tier"], weight=feed["weight"]),
+        ]
+        return FeedResult(feed["name"], feed["url"], feed["tier"], True, len(items), "", items)
+
+    def fake_scorer(config, *, system, user, model=None, max_tokens=0):
+        import json
+        items = json.loads(user.split("Items to triage:\n", 1)[1])
+        return [
+            {"i": item["i"], "score": 8, "audience": "AUD_CORPORATE",
+             "theme": "THM_AI", "why": "Buyers will feel this before vendors do."}
+            for item in items
+        ]
+
+    monkeypatch.setattr(ingest_mod, "fetch_feed", fake_fetch)
+    monkeypatch.setattr("lnp.scoring.complete_json", fake_scorer)
+
+    response = api.post("/api/rows/curate-now")
+    assert response.status_code == 200
+
+    other_rows = store_for(OTHER).pipeline_rows()
+    assert [r.ID for r in other_rows] == ["01OTHERROW"]

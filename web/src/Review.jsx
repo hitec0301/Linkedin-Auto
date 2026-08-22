@@ -11,12 +11,28 @@ export default function Review() {
   const rows = useAsync(() => api.rows(ORDER.join(',')), [])
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
+  const [fetchMsg, setFetchMsg] = useState('')
 
   async function act(fn) {
     setBusy('working')
     setError('')
     try {
       await fn()
+      rows.reload()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  async function fetchNow() {
+    setBusy('fetching')
+    setError('')
+    setFetchMsg('')
+    try {
+      const result = await api.curateNow()
+      setFetchMsg(result.detail)
       rows.reload()
     } catch (err) {
       setError(err.message)
@@ -40,6 +56,12 @@ export default function Review() {
       {sorted.length === 0 ? (
         <div className="empty">
           <p>Nothing waiting. The next batch of candidates arrives Monday morning.</p>
+          <div className="actions" style={{ justifyContent: 'center' }}>
+            <button className="action primary" disabled={!!busy} onClick={fetchNow}>
+              {busy === 'fetching' ? 'Fetching…' : 'Fetch candidates now'}
+            </button>
+          </div>
+          {fetchMsg && <p className="muted">{fetchMsg}</p>}
         </div>
       ) : (
         <p className="muted" style={{ marginTop: 0 }}>

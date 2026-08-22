@@ -10,10 +10,15 @@ and one place where the POSTING/POSTED sequence is enforced.
 
 from __future__ import annotations
 
+import threading
+from contextlib import closing
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from .. import runner
+from ..config import Config
+from ..curate import curate as run_curate
 from ..db.schema import Tenant
 from ..db.store import PipelineStore
 from ..models import (
@@ -24,10 +29,32 @@ from ..models import (
     TransitionError,
 )
 from ..db.store import StoreError
-from .deps import active_tenant, current_store
+from ..util import parse_dt, utcnow
+from .deps import active_tenant, config, current_store
 from .schemas import ROW_COLUMN_BY_FIELD, ReviseIn, RowEdit, RowOut
 
 router = APIRouter(prefix="/api/rows", tags=["pipeline"])
+
+# Everything the Review screen shows before it says "nothing waiting" - the
+# same set decides whether an on-demand curate run is offered, so the button
+# and the emptiness message can never disagree about what "waiting" means.
+WAITING_STATUSES = {
+    Status.NEW, Status.DRAFTED, Status.REVISE,
+    Status.APPROVED, Status.FAILED, Status.POSTING,
+}
+
+# A brand-new account with an empty Sources list, or one whose last run wrote
+# nothing but duplicates, would otherwise let a stuck "Fetch now" button be
+# clicked repeatedly - each click is a real feed fetch and a real model call.
+CURATE_NOW_COOLDOWN_MINUTES = 10
+
+# lnp.llm's usage meter is a process-global, not a per-thread one, because the
+# scheduled jobs only ever run one tenant at a time in a single thread. This
+# on-demand path is reached from FastAPI's threadpool, so two accounts
+# clicking "Fetch now" at the same instant could otherwise attribute one
+# tenant's model spend to the other's cap. The lock serialises the rare,
+# human-triggered case rather than making the meter thread-safe everywhere.
+_CURATE_NOW_LOCK = threading.Lock()
 
 # What the interface may offer, per status. Derived from the state machine so
 # a button cannot exist for a move the store would refuse.
@@ -65,6 +92,52 @@ def list_rows(
         wanted = {s.strip().upper() for s in status_filter.split(",") if s.strip()}
         rows = [r for r in rows if r.status in wanted]
     return [RowOut.of(r, allowed_actions(r)) for r in rows]
+
+
+@router.post("/curate-now")
+def curate_now(
+    tenant: Tenant = Depends(active_tenant),
+    store: PipelineStore = Depends(current_store),
+    cfg: Config = Depends(config),
+) -> dict:
+    """Fetch and score a batch right now, instead of waiting for Monday.
+
+    Offered only when there is nothing on Review already - a full slate
+    exists precisely so a new account is not still empty five minutes after
+    connecting LinkedIn. Runs the exact function Job A runs on its own
+    schedule, against this one account, so there is no second code path to
+    keep in sync.
+    """
+    waiting = [r for r in store.pipeline_rows() if r.status in WAITING_STATUSES]
+    if waiting:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"there are already {len(waiting)} row(s) waiting on Review; "
+            "clear those before fetching more",
+        )
+
+    last_run = parse_dt(store.config_values().get("LAST_CURATE"))
+    if last_run is not None:
+        minutes_ago = (utcnow() - last_run).total_seconds() / 60
+        if minutes_ago < CURATE_NOW_COOLDOWN_MINUTES:
+            wait = round(CURATE_NOW_COOLDOWN_MINUTES - minutes_ago)
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                f"a batch just ran; try again in about {wait} minute(s)",
+            )
+
+    with _CURATE_NOW_LOCK, closing(runner.runs("curate", cfg, tenant_id=tenant.id)) as runs:
+        run = next(runs, None)
+        if run is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "this account is not active")
+        try:
+            written = run_curate(run)
+        except RuntimeError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+    if written == 0:
+        return {"written": 0, "detail": "checked your feeds; nothing new to show yet"}
+    return {"written": written, "detail": f"{written} candidate(s) ready on Review"}
 
 
 @router.get("/{row_id}", response_model=RowOut)

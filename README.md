@@ -87,6 +87,13 @@ These are enforced in code and each has a test:
 each with an audience tag, a theme tag, and a sentence on why it matters. They
 tick three or four and write a one-line angle for each.
 
+A new account does not wait for the first Monday: once LinkedIn is connected,
+the Review screen offers **Fetch candidates now**, which runs Job A on the
+spot for that one account. It is offered only while Review is empty, and a
+batch that just ran cannot be re-triggered for ten minutes - both limits exist
+because each click is a real feed fetch and a real model call, charged against
+the same monthly allowance the scheduled run uses.
+
 The angle is the whole system. It is their thesis, and the source article is
 evidence for it. "Districts are buying AI tutoring seats faster than they can
 staff the humans who supervise them" is an angle. "AI tutoring adoption is
@@ -223,6 +230,7 @@ config/voice_card.md    the starter voice card, likewise
 
 src/lnp/models.py       status machine, Row, column ownership, health metric
 src/lnp/runner.py       one run per account: store, sources, card, tokens, meter
+src/lnp/curate.py       Job A's work, shared by the cron job and "fetch now"
 src/lnp/ingest.py       feeds, two-stage dedupe, education filtering
 src/lnp/scoring.py      batched scoring, tier weights, quota enforcement
 src/lnp/drafting.py     extraction, prompts, post-processing, revision
