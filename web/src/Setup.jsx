@@ -106,17 +106,24 @@ export default function Setup({ me, onChange }) {
                 here.
               </p>
               {error && <Notice kind="error">{error}</Notice>}
+              {saved && !error && (
+                <Notice kind="ok">
+                  Saved. Add the redirect URL in step 4 below, then authorise posting.
+                </Notice>
+              )}
               <form onSubmit={saveApp}>
                 <label>Client ID</label>
                 <input
                   type="text" required value={creds.client_id}
-                  onChange={(e) => setCreds({ ...creds, client_id: e.target.value.trim() })}
+                  autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck="false"
+                  onChange={(e) => { setCreds({ ...creds, client_id: e.target.value.trim() }); setSaved(false) }}
                 />
                 <label>Client Secret</label>
                 <input
                   type="password" required value={creds.client_secret}
+                  autoComplete="new-password"
                   placeholder={me.linkedin_app_configured ? 'stored — enter again only to replace it' : ''}
-                  onChange={(e) => setCreds({ ...creds, client_secret: e.target.value.trim() })}
+                  onChange={(e) => { setCreds({ ...creds, client_secret: e.target.value.trim() }); setSaved(false) }}
                 />
                 <div className="actions">
                   <button className="action primary" type="submit">Save</button>
