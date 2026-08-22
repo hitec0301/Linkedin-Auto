@@ -40,10 +40,22 @@ def signin_app() -> AppCredentials:
     """The operator's own LinkedIn app, used only to establish identity."""
     client_id = os.environ.get("LNP_AUTH_CLIENT_ID", "").strip()
     client_secret = os.environ.get("LNP_AUTH_CLIENT_SECRET", "").strip()
-    if not client_id or not client_secret:
+    missing = [
+        name
+        for name, value in (
+            ("LNP_AUTH_CLIENT_ID", client_id),
+            ("LNP_AUTH_CLIENT_SECRET", client_secret),
+        )
+        if not value
+    ]
+    if missing:
+        # Naming the variable turns this from "something is wrong" into an
+        # instruction. /healthz reports the same thing for all of them at once.
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            "sign-in is not configured on this deployment",
+            f"sign-in is not configured on this deployment: {' and '.join(missing)} "
+            f"{'is' if len(missing) == 1 else 'are'} not set on the running container. "
+            "See /healthz.",
         )
     return AppCredentials(client_id=client_id, client_secret=client_secret)
 

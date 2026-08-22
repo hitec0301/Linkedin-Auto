@@ -419,8 +419,14 @@ TEST_DATABASE_URL=postgresql://localhost/lnp_test pytest   # against real Postgr
 **Then on Railway,** in this order — each step is the precondition for the next,
 so a failure tells you exactly which one broke:
 
-1. `curl https://<your-domain>/healthz` → `{"ok":true}`. The image built, the
-   process started, and migrations applied.
+1. `curl https://<your-domain>/healthz` → `"ok":true`. The image built, the
+   process started, and migrations applied. It also reports what the running
+   container can see of its own configuration — `missing` names any required
+   variable that is not set, `base_url` is the value the redirect URL is built
+   from, and `booted_at` tells you whether you are looking at a container that
+   started before or after your last variable change. Presence only; no value
+   of a secret is ever returned. The dashboard says what you typed, this says
+   what the process got, and only the second one decides whether sign-in works.
 2. `curl -i https://<your-domain>/api/rows` → **401**. The API is refusing
    anonymous requests, which is the one failure mode worth checking by hand.
 3. Open the domain in a browser and sign in with LinkedIn. A redirect back to

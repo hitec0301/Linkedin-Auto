@@ -8,6 +8,7 @@ configuration to get wrong.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -27,6 +28,40 @@ from .routes_pipeline import router as pipeline_router
 logger = log.get(__name__)
 
 WEB_DIST = Path(os.environ.get("LNP_WEB_DIST") or (REPO_ROOT / "web" / "dist"))
+
+BOOTED_AT = datetime.now(timezone.utc)
+
+# Every variable a deployment needs, and whether the process can do its job
+# without it. Presence only is ever reported - a deployment that is missing a
+# key should be able to find that out without anyone pasting a secret into a
+# chat window to prove it is set.
+REQUIRED_ENV = (
+    "DATABASE_URL",
+    "LNP_SECRET_KEY",
+    "LNP_ENCRYPTION_KEY",
+    "LNP_AUTH_CLIENT_ID",
+    "LNP_AUTH_CLIENT_SECRET",
+)
+OPTIONAL_ENV = ("ANTHROPIC_API_KEY", "SLACK_WEBHOOK_URL")
+
+
+def config_report() -> dict:
+    """What this process can actually see in its environment.
+
+    The dashboard says what you typed; this says what the running container
+    got, which is the only one of the two that decides whether sign-in works.
+    """
+    present = {name: bool(os.environ.get(name, "").strip()) for name in REQUIRED_ENV + OPTIONAL_ENV}
+    return {
+        "booted_at": BOOTED_AT.isoformat(),
+        # Not a secret - it is the domain in the address bar - and seeing it is
+        # how you catch a trailing slash or an http:// that the redirect URL
+        # registered with LinkedIn does not match.
+        "base_url": os.environ.get("LNP_BASE_URL", "").strip() or None,
+        "env": present,
+        "missing": [name for name in REQUIRED_ENV if not present[name]],
+        "signin_configured": present["LNP_AUTH_CLIENT_ID"] and present["LNP_AUTH_CLIENT_SECRET"],
+    }
 
 
 def create_app() -> FastAPI:
@@ -58,7 +93,7 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict:
-        return {"ok": True}
+        return {"ok": True, **config_report()}
 
     @app.post("/auth/signout", include_in_schema=False)
     def signout() -> JSONResponse:
@@ -79,6 +114,16 @@ def create_app() -> FastAPI:
             /setup works on a fresh load instead of 404ing.
             """
             return FileResponse(WEB_DIST / "index.html")
+
+    # Printed once at boot so the deploy log answers "did this container get
+    # the variables?" without anyone having to reproduce the failure first.
+    report = config_report()
+    logger.info(
+        "config: base_url=%s signin_configured=%s missing=%s",
+        report["base_url"],
+        report["signin_configured"],
+        ",".join(report["missing"]) or "none",
+    )
 
     return app
 
