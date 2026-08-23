@@ -188,7 +188,13 @@ def redraft_now(run: "runner.Run", row: Row, take: str) -> RedraftResult:
     if correction:
         updates["RevisionCount"] = str(target.revision_count + 1)
         updates["RevisionNote"] = ""
-        store.write(target, updates, allow_revision_note=True)
+        # A FinalText left over from before this revision - a hand-edit, or a
+        # variant picked earlier - was a decision about the draft this just
+        # replaced. effective_text prefers FinalText over DraftText, so
+        # leaving it in place would make the new draft invisible: the row
+        # would look untouched until the human noticed and cleared it by hand.
+        updates["FinalText"] = ""
+        store.write(target, updates, allow_revision_note=True, allow_final_text_reset=True)
     else:
         if not target.ScheduledFor:
             taken = {r.ScheduledFor for r in store.pipeline_rows() if r.ScheduledFor}
@@ -197,13 +203,22 @@ def redraft_now(run: "runner.Run", row: Row, take: str) -> RedraftResult:
 
     proposals = 0
     if correction and take:
-        proposals = _learn_from_correction(
-            run,
-            FeedbackItem(
-                row_id=target.ID, signal=SIGNAL_NOTE, instruction=take,
-                draft_text=previous_draft, final_text="",
-            ),
-        )
+        # Best-effort, and after the fact: the redraft above already committed,
+        # so a failure here - a rate limit, a flaky call - must not turn a
+        # correction that landed into a request that looks like it failed.
+        try:
+            proposals = _learn_from_correction(
+                run,
+                FeedbackItem(
+                    row_id=target.ID, signal=SIGNAL_NOTE, instruction=take,
+                    draft_text=previous_draft, final_text="",
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - logged, never lets a saved redraft look failed
+            logger.error(
+                "learning from this correction failed; the redraft itself is unaffected",
+                extra={"row_id": target.ID, "error": str(exc)},
+            )
 
     logger.info(
         "redrafted",

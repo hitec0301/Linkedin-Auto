@@ -147,6 +147,28 @@ def test_edits_land_in_final_text(api):
     assert body["draft_text"] == "model text"
 
 
+def test_two_variants_are_split_out_for_the_picker(api):
+    from lnp.drafting import VARIANT_A, VARIANT_B
+
+    seed([Row(ID="01A", Status=Status.DRAFTED,
+               DraftText=f"{VARIANT_A}\nFirst version.\n\n{VARIANT_B}\nSecond version.")])
+    body = api.get("/api/rows/01A").json()
+    assert body["variant_a"] == "First version."
+    assert body["variant_b"] == "Second version."
+    assert body["draft_text"].startswith(VARIANT_A)  # untouched, for the record
+
+
+def test_picking_a_variant_clears_the_picker(api):
+    from lnp.drafting import VARIANT_A, VARIANT_B
+
+    seed([Row(ID="01A", Status=Status.DRAFTED,
+               DraftText=f"{VARIANT_A}\nFirst version.\n\n{VARIANT_B}\nSecond version.")])
+    body = api.patch("/api/rows/01A", json={"final_text": "First version."}).json()
+    assert body["variant_a"] == ""
+    assert body["variant_b"] == ""
+    assert body["final_text"] == "First version."
+
+
 def test_selecting_and_taking_a_row(api):
     seed([Row(ID="01A", Status=Status.NEW)])
     body = api.patch(

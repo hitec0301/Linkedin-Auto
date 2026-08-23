@@ -297,7 +297,8 @@ class PipelineStore:
     # ---- the guarded write path ------------------------------------------
 
     def write(
-        self, row: Row, updates: Dict[str, Any], *, allow_revision_note: bool = False
+        self, row: Row, updates: Dict[str, Any], *,
+        allow_revision_note: bool = False, allow_final_text_reset: bool = False,
     ) -> None:
         """A job writing to a row.
 
@@ -306,7 +307,11 @@ class PipelineStore:
         """
         if not updates:
             return
-        assert_writable(list(updates), allow_revision_note=allow_revision_note)
+        assert_writable(
+            list(updates),
+            allow_revision_note=allow_revision_note,
+            allow_final_text_reset=allow_final_text_reset,
+        )
         self._write_fields(row, updates)
         for name, value in updates.items():
             setattr(row, name, "" if value is None else str(value))

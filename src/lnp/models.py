@@ -159,18 +159,35 @@ MODEL_OWNED_COLUMNS: Set[str] = {
 }
 
 
-def assert_writable(columns: Sequence[str], *, allow_revision_note: bool = False) -> None:
+def assert_writable(
+    columns: Sequence[str], *,
+    allow_revision_note: bool = False,
+    allow_final_text_reset: bool = False,
+) -> None:
     """Raise if any named column belongs to the human.
 
-    `allow_revision_note` is the one narrow exception in the system: after a
-    successful regenerate, the job clears RevisionNote so the human can see the
-    instruction was consumed. Only drafting.py passes it.
+    Two narrow exceptions, both used only by redraft.py:
+
+      `allow_revision_note`    after a successful regenerate, clears
+                                RevisionNote so the human can see the
+                                instruction was consumed.
+      `allow_final_text_reset` after a redraft writes a fresh DraftText,
+                                clears a FinalText left over from before it -
+                                otherwise the old FinalText keeps winning in
+                                `effective_text` and the new draft is
+                                invisible until the human notices and clears
+                                it themselves. Their edit was against the
+                                draft that redraft just replaced; keeping it
+                                around does not preserve a decision, it hides
+                                the new one.
     """
     for name in columns:
         if name not in COLUMN_INDEX:
             raise ColumnPermissionError(f"unknown column {name!r}")
         if name in HUMAN_OWNED_COLUMNS:
             if name == "RevisionNote" and allow_revision_note:
+                continue
+            if name == "FinalText" and allow_final_text_reset:
                 continue
             raise ColumnPermissionError(
                 f"{name} is human-owned; jobs must not write it"

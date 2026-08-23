@@ -1187,6 +1187,53 @@ def test_redraft_now_revises_in_place_and_lands_on_drafted(monkeypatch):
     assert updated.RevisionCount == "2"
     assert updated.RevisionNote == ""
     assert "revised draft" in updated.DraftText
+
+
+def test_redraft_now_clears_a_stale_final_text_on_revision(monkeypatch):
+    """effective_text prefers FinalText, so a leftover from before this
+    revision would hide the new draft - it has to go, not just DraftText."""
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+
+    row = Row(ID="01A", Status=Status.DRAFTED, DraftText="old draft", FinalText="my hand-edited version",
+              Angle="original angle", RevisionCount="0",
+              SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+    monkeypatch.setattr(voice_mod, "propose_rules", lambda config, items, card, **kw: [])
+
+    redraft_mod.redraft_now(run, rows_of(store)[0], "Cut the closing question.")
+
+    updated = rows_of(store)[0]
+    assert updated.FinalText == ""
+    assert "revised draft" in updated.DraftText
+    assert "revised draft" in updated.effective_text  # the fresh draft is what's now visible
+
+
+def test_redraft_now_survives_the_learning_step_failing(monkeypatch):
+    """The redraft already committed by the time learning runs; a failure
+    there - a rate limit, a flaky call - must not look like the redraft failed."""
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+
+    row = Row(ID="01A", Status=Status.DRAFTED, DraftText="old draft", Angle="original angle",
+              RevisionCount="0", SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+
+    def explode(*a, **kw):
+        raise RuntimeError("rate limited")
+    monkeypatch.setattr(voice_mod, "propose_rules", explode)
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "Cut the closing question.")
+
+    assert result.proposals == 0
+    updated = rows_of(store)[0]
+    assert "revised draft" in updated.DraftText  # the redraft landed regardless
     assert updated.Angle == "original angle"   # untouched by a revision
 
 

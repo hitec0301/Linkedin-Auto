@@ -53,6 +53,11 @@ export default function RowCard({ row, busy, act, reload, selectable, selected, 
     await act(() => api.redraftNow(row.id, take))
   }
 
+  function pickVariant(body) {
+    act(() => api.editRow(row.id, { final_text: body }))
+  }
+
+  const hasVariants = !!row.variant_b
   const text = row.final_text || row.draft_text
   const hasDraft = !!row.draft_text
   const isTerminal = ['POSTED', 'SKIPPED', 'EXPIRED'].includes(row.status)
@@ -96,7 +101,24 @@ export default function RowCard({ row, busy, act, reload, selectable, selected, 
 
         {row.status === 'POSTING' && <p className="muted">Publishing now — nothing to do.</p>}
 
-        {text && (
+        {hasVariants ? (
+          <>
+            <p className="field-label" style={{ margin: '14px 0 6px' }}>
+              Two versions — pick the one to publish. The other is dropped.
+            </p>
+            {[['A', row.variant_a], ['B', row.variant_b]].map(([label, body]) => (
+              <div key={label} className="variant-option">
+                <div className="post-text">{body}</div>
+                <div className="note-row">
+                  <p className="charcount field">{body.length} characters</p>
+                  <button className="action primary" disabled={!!busy} onClick={() => pickVariant(body)}>
+                    Use variant {label}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </>
+        ) : text && (
           <>
             <div className="post-text">{text}</div>
             {row.status === 'POSTED' ? (
@@ -106,12 +128,15 @@ export default function RowCard({ row, busy, act, reload, selectable, selected, 
                 {row.revision_count > 0 && ` · ${row.revision_count} revision(s)`}
               </p>
             ) : (
-              <p className="charcount">{text.length} characters{row.final_text && row.final_text !== row.draft_text && ' · edited by you'}</p>
+              <p className="charcount">
+                {(row.char_count || text.length)} characters
+                {row.final_text && row.final_text !== row.draft_text && ' · edited by you'}
+              </p>
             )}
           </>
         )}
 
-        {hasDraft && !isTerminal && (
+        {hasDraft && !hasVariants && !isTerminal && (
           <>
             <label className="field-label">Your version — edit freely. The draft above is kept as written.</label>
             <textarea

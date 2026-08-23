@@ -120,6 +120,15 @@ def test_revision_note_is_writable_only_on_the_revision_path():
     assert store.pipeline_rows()[0].RevisionNote == ""
 
 
+def test_final_text_is_writable_only_on_the_redraft_path():
+    store = make_store([Row(ID="01AAA", Status=Status.DRAFTED, DraftText="d", FinalText="hand-edited")])
+    row = store.pipeline_rows()[0]
+    with pytest.raises(ColumnPermissionError):
+        store.write(row, {"FinalText": ""})
+    store.write(row, {"FinalText": ""}, allow_final_text_reset=True)
+    assert store.pipeline_rows()[0].FinalText == ""
+
+
 def test_missing_paused_key_reads_as_paused():
     store = make_store([])
     store.set_config_value("PAUSED", "")

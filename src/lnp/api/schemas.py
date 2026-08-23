@@ -11,6 +11,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from ..drafting import contains_both_variants, split_variants
 from ..models import ALL_STATUSES, COLUMNS, Row
 
 
@@ -29,6 +30,12 @@ class RowOut(BaseModel):
     take: str = ""
     draft_text: str = ""
     final_text: str = ""
+    # Set only while DraftText still holds two undecided variants (the first
+    # twenty posts draft two, to show the range). variant_b non-empty is the
+    # signal the interface uses to show the picker instead of one post body -
+    # once a variant is chosen into FinalText, these go back to blank.
+    variant_a: str = ""
+    variant_b: str = ""
     revision_count: int = 0
     char_count: int = 0
     status: str = ""
@@ -41,6 +48,10 @@ class RowOut(BaseModel):
 
     @classmethod
     def of(cls, row: Row) -> "RowOut":
+        variant_a, variant_b = "", ""
+        if not (row.FinalText or "").strip() and contains_both_variants(row.DraftText):
+            variant_a, second = split_variants(row.DraftText)
+            variant_b = second or ""
         return cls(
             id=row.ID,
             created_at=row.CreatedAt,
@@ -54,6 +65,8 @@ class RowOut(BaseModel):
             take=row.Angle if not row.DraftText else (row.RevisionNote or row.Angle),
             draft_text=row.DraftText,
             final_text=row.FinalText,
+            variant_a=variant_a,
+            variant_b=variant_b,
             revision_count=row.revision_count,
             char_count=int(float(row.CharCount or 0)),
             status=row.status,
