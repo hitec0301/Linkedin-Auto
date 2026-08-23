@@ -1031,9 +1031,12 @@ def real_config():
     return load_config(REAL_CONFIG_PATH)
 
 
-def test_shipped_config_has_dry_run_on():
-    """The repo must not ship able to post on the first run."""
-    assert real_config().dry_run is True
+def test_shipped_config_has_dry_run_off():
+    """This deployment has deliberately turned dry_run off: Post now and the
+    scheduled checker both publish for real. Flip publish.dry_run back to
+    true in config/config.yaml (and update this test) to go back to logging
+    payloads instead of posting them."""
+    assert real_config().dry_run is False
 
 
 def test_publish_dry_run_logs_a_full_payload_and_posts_nothing(monkeypatch, capsys):

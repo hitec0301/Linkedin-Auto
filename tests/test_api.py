@@ -1172,7 +1172,9 @@ def test_publish_now_route_refuses_a_row_that_is_not_approved(api):
     assert api.post("/api/rows/01A/publish-now").status_code == 409
 
 
-def test_publish_now_route_is_a_dry_run_on_the_shipped_default(api, monkeypatch):
+def test_publish_now_route_publishes_for_real_on_the_shipped_default(api, monkeypatch):
+    """This deployment has deliberately turned publish.dry_run off, so the
+    shipped config's own "Post now" route calls the LinkedIn API for real."""
     from lnp import publish_now as publish_now_mod
     from lnp.linkedin import LinkedIn
 
@@ -1193,14 +1195,14 @@ def test_publish_now_route_is_a_dry_run_on_the_shipped_default(api, monkeypatch)
 
         build_payload = LinkedIn.build_payload
 
-        def create_post(self, payload):  # pragma: no cover - must never run
-            raise AssertionError("dry run must not call the API")
+        def create_post(self, payload):
+            return "urn:li:share:999"
 
     monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
 
     body = api.post("/api/rows/01A/publish-now").json()
-    assert body["status"] == "APPROVED"
-    assert "dry run" in body["error"].lower()
+    assert body["status"] == "POSTED"
+    assert body["post_urn"] == "urn:li:share:999"
 
 
 def test_publish_now_route_respects_the_pause_switch(api, monkeypatch):

@@ -104,8 +104,9 @@ voice:
   max_proposals_per_run: 5
 
 publish:
-  # Leave this on for two weeks. It logs the exact payload and posts nothing.
-  dry_run: true
+  # Off: publishing (manual "Post now" and the scheduled checker alike)
+  # posts for real. Set back to true to log the payload and post nothing.
+  dry_run: false
   # A row more than this many hours past ScheduledFor expires unpublished. A
   # four-day-old take is worse than no post.
   staleness_hours: 48

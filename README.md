@@ -495,13 +495,15 @@ so a failure tells you exactly which one broke:
    within a few seconds — no cron, no waiting for Monday.
 7. Write a take on one and click **Redraft with AI**. A draft appears in
    place, on the same card.
-8. **Leave `publish.dry_run: true` in `config/config.yaml` for the first
-   fortnight.** Set the row's status to Approved and either click **Post
-   now** or leave it a schedule time: the in-process publish checker (see
-   "One service" above) picks it up within `publish_checker.interval_seconds`
-   and logs the exact payload it would send, posting nothing. Read those
-   logs each morning, fix the voice card, and only then set `dry_run: false`
-   and redeploy.
+8. **For a new account, set `publish.dry_run: true` in `config/config.yaml`
+   for the first fortnight.** Set the row's status to Approved and either
+   click **Post now** or leave it a schedule time: the in-process publish
+   checker (see "One service" above) picks it up within
+   `publish_checker.interval_seconds` and logs the exact payload it would
+   send, posting nothing. Read those logs each morning, fix the voice card,
+   and only then set `dry_run: false` and redeploy. This repo currently ships
+   with `dry_run: false` — Post now and the scheduled checker both publish
+   for real.
 
 The kill switch works throughout, for each account, from the switch on their
 Setup screen. Publishing stops within `publish_checker.interval_seconds` and
