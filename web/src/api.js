@@ -45,11 +45,14 @@ export const api = {
   rows: (status) => request(`/api/rows${status ? `?status_filter=${status}` : ''}`),
   curateNow: () => request('/api/rows/curate-now', { method: 'POST' }),
   editRow: (id, body) => request(`/api/rows/${id}`, { method: 'PATCH', body }),
-  approve: (id) => request(`/api/rows/${id}/approve`, { method: 'POST' }),
+  approve: (id, body) => request(`/api/rows/${id}/approve`, { method: 'POST', body }),
   unapprove: (id) => request(`/api/rows/${id}/unapprove`, { method: 'POST' }),
   revise: (id, note) => request(`/api/rows/${id}/revise`, { method: 'POST', body: { note } }),
   skip: (id) => request(`/api/rows/${id}/skip`, { method: 'POST' }),
   redraftNow: (id) => request(`/api/rows/${id}/redraft-now`, { method: 'POST' }),
+  reschedule: (id, scheduledFor) =>
+    request(`/api/rows/${id}/schedule`, { method: 'PUT', body: { scheduled_for: scheduledFor } }),
+  publishNow: (id) => request(`/api/rows/${id}/publish-now`, { method: 'POST' }),
 
   setPaused: (paused) => request('/api/pause', { method: 'PUT', body: { paused } }),
   sources: () => request('/api/sources'),

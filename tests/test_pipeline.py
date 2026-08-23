@@ -1023,6 +1023,67 @@ def test_publish_dry_run_logs_a_full_payload_and_posts_nothing(monkeypatch, caps
     assert rows_of(store)[0].status == Status.APPROVED
 
 
+# ---- lnp.publish_now: the "post now" button on approve --------------------
+
+
+def test_publish_one_posts_immediately_and_marks_the_row_posted(monkeypatch):
+    """Same LinkedIn client, same POSTING/POSTED sequence, one row, on request."""
+    from lnp import publish_now as publish_now_mod
+    from lnp.util import iso
+
+    row = Row(ID="01A", Status=Status.APPROVED, ScheduledFor=iso(utcnow()),
+              DraftText="A real approved draft with real text in it.")
+    store = connect_linkedin(make_store([row], tenants=(TENANT,)))
+    run = make_run(store)
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):
+            return "urn:li:share:999888777"
+
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
+
+    result = publish_now_mod.publish_one(run, rows_of(store)[0], dry_run=False)
+
+    assert result.published is True
+    updated = rows_of(store)[0]
+    assert updated.status == Status.POSTED
+    assert updated.PostURN == "urn:li:share:999888777"
+    assert updated.Error == ""
+
+
+def test_publish_one_refuses_while_paused_without_touching_linkedin():
+    from lnp import publish_now as publish_now_mod
+    from lnp.util import iso
+
+    def explode(*a, **kw):  # pragma: no cover - must never run
+        raise AssertionError("must not touch LinkedIn while paused")
+
+    row = Row(ID="01A", Status=Status.APPROVED, ScheduledFor=iso(utcnow()),
+              DraftText="A real approved draft.")
+    store = connect_linkedin(make_store([row], paused="TRUE", tenants=(TENANT,)))
+    run = make_run(store)
+    run.token_backend = explode
+
+    result = publish_now_mod.publish_one(run, rows_of(store)[0], dry_run=False)
+
+    assert result.published is False
+    assert "paused" in result.detail.lower()
+    updated = rows_of(store)[0]
+    assert updated.status == Status.APPROVED           # nothing moved
+    assert "paused" in updated.Error.lower()
+
+
 def test_publish_stops_at_the_kill_switch(monkeypatch, capsys):
     row = Row(ID="01ROW", Status=Status.APPROVED,
               ScheduledFor=(utcnow() - timedelta(minutes=10)).isoformat(),

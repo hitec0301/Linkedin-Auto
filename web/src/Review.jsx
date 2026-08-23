@@ -77,8 +77,11 @@ export default function Review() {
 function RowCard({ row, busy, act }) {
   const [revising, setRevising] = useState(false)
   const [note, setNote] = useState('')
+  const [scheduling, setScheduling] = useState(false)
+  const [scheduledAt, setScheduledAt] = useState('')
   const can = (name) => row.allowed_actions.includes(name)
   const text = row.final_text || row.draft_text
+  const isApproved = row.status === 'APPROVED'
 
   return (
     <div className="panel row-card">
@@ -153,8 +156,32 @@ function RowCard({ row, busy, act }) {
         </>
       )}
 
+      {scheduling && (
+        <>
+          <label>When should this go out?</label>
+          <div className="actions">
+            <button
+              className="action primary"
+              disabled={!!busy}
+              onClick={() => act(async () => {
+                await (isApproved ? api.publishNow(row.id) : api.approve(row.id, { publish_now: true }))
+                setScheduling(false)
+              })}
+            >
+              Post now
+            </button>
+          </div>
+          <p className="muted" style={{ margin: '10px 0 4px' }}>or pick a time</p>
+          <input
+            type="datetime-local"
+            value={scheduledAt}
+            onChange={(e) => setScheduledAt(e.target.value)}
+          />
+        </>
+      )}
+
       <div className="actions">
-        {can('approve') && !revising && (
+        {can('approve') && !revising && !scheduling && (
           <button
             className="action primary"
             disabled={!!busy || !text.trim()}
@@ -163,7 +190,37 @@ function RowCard({ row, busy, act }) {
             Approve for publishing
           </button>
         )}
-        {can('revise') && !revising && (
+        {(can('approve') || can('publish_now')) && !revising && !scheduling && (
+          <button
+            className="action"
+            disabled={!!busy || !text.trim()}
+            onClick={() => setScheduling(true)}
+          >
+            Choose when…
+          </button>
+        )}
+        {scheduling && (
+          <>
+            <button
+              className="action primary"
+              disabled={!scheduledAt || !!busy}
+              onClick={() => act(async () => {
+                const when = new Date(scheduledAt).toISOString()
+                await (isApproved
+                  ? api.reschedule(row.id, when)
+                  : api.approve(row.id, { scheduled_for: when }))
+                setScheduling(false)
+                setScheduledAt('')
+              })}
+            >
+              {isApproved ? 'Reschedule for that time' : 'Approve, scheduled for that time'}
+            </button>
+            <button className="action" onClick={() => { setScheduling(false); setScheduledAt('') }}>
+              Cancel
+            </button>
+          </>
+        )}
+        {can('revise') && !revising && !scheduling && (
           <button className="action" onClick={() => setRevising(true)}>
             Send back with a note
           </button>
@@ -195,14 +252,14 @@ function RowCard({ row, busy, act }) {
             </button>
           </>
         )}
-        {can('unapprove') && !revising && (
+        {can('unapprove') && !revising && !scheduling && (
           <Confirm
             label="Take approval back"
             question="This retires the row rather than returning it to draft. Sure?"
             onConfirm={() => act(() => api.unapprove(row.id))}
           />
         )}
-        {can('skip') && !revising && (
+        {can('skip') && !revising && !scheduling && (
           <Confirm
             label="Skip"
             question="Skipped rows do not come back. Sure?"

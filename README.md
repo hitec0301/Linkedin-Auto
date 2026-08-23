@@ -118,6 +118,16 @@ metric and the weekly voice job are computed from.
 If they were given two variants, one has to go before approving. A row approved
 with both still in it is refused, not guessed at.
 
+**Approving also decides when.** Left alone, the row keeps the slot Job B
+assigned it. **Choose when…** offers the other two cases: **Post now**
+publishes immediately - through the same client and the same
+POSTING-before/POSTED-after sequence Job C itself uses, so a manual post and a
+scheduled one leave the system identically - or a specific date and time,
+overriding the auto-assigned slot. Post now still defers to the pause switch
+and to `publish.dry_run`: either one leaves the row approved and due
+immediately, for Job C to pick up within the next thirty minutes exactly as if
+the button had not been pressed.
+
 **Job C** posts approved rows when their slot arrives, and writes back the URN,
 the timestamp, and the edit distance.
 

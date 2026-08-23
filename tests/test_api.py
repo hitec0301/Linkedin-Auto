@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from conftest import make_engine
+from conftest import connect_linkedin, make_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -703,3 +703,162 @@ def test_redraft_now_does_not_reach_another_tenants_row(api, monkeypatch):
 
     response = api.post("/api/rows/01THEIRS/redraft-now")
     assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# Publish timing: schedule an approval, or post it immediately
+# --------------------------------------------------------------------------
+
+
+def test_approve_rejects_scheduled_for_and_publish_now_together(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    response = api.post("/api/rows/01A/approve", json={
+        "scheduled_for": (utcnow() + timedelta(days=1)).isoformat(),
+        "publish_now": True,
+    })
+    assert response.status_code == 400
+
+
+def test_approve_can_override_the_schedule(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    when = utcnow() + timedelta(days=3)
+    body = api.post(
+        "/api/rows/01A/approve", json={"scheduled_for": when.isoformat()}
+    ).json()
+    assert body["status"] == "APPROVED"
+    assert body["scheduled_for"].startswith(when.strftime("%Y-%m-%dT%H:%M"))
+
+
+def test_approve_rejects_a_schedule_already_in_the_past(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    when = utcnow() - timedelta(hours=1)
+    response = api.post(
+        "/api/rows/01A/approve", json={"scheduled_for": when.isoformat()}
+    )
+    assert response.status_code == 400
+
+
+def test_approve_rejects_an_unparseable_schedule(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    response = api.post(
+        "/api/rows/01A/approve", json={"scheduled_for": "not a date"}
+    )
+    assert response.status_code == 400
+
+
+def test_approve_publish_now_is_a_dry_run_on_the_shipped_default(api, monkeypatch):
+    """The shipped config's dry_run:true covers publish_now exactly as it does the cron job."""
+    from lnp import publish_now as publish_now_mod
+    from lnp.linkedin import LinkedIn
+
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a real draft with real text")])
+    connect_linkedin(store_for())
+    store_for().set_config_value("PAUSED", "FALSE")
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):  # pragma: no cover - must never run
+            raise AssertionError("dry run must not call the API")
+
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
+
+    body = api.post("/api/rows/01A/approve", json={"publish_now": True}).json()
+    assert body["status"] == "APPROVED"  # dry run never transitions to POSTED
+    assert "dry run" in body["error"].lower()
+    assert body["post_urn"] == ""
+
+
+def test_approve_publish_now_respects_the_pause_switch(api, monkeypatch):
+    from lnp import publish_now as publish_now_mod
+
+    def explode(*a, **kw):  # pragma: no cover - must never run
+        raise AssertionError("must not touch LinkedIn while paused")
+
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a real draft")])
+    connect_linkedin(store_for())
+    store_for().set_config_value("PAUSED", "TRUE")
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", explode)
+
+    body = api.post("/api/rows/01A/approve", json={"publish_now": True}).json()
+    assert body["status"] == "APPROVED"
+    assert "paused" in body["error"].lower()
+
+
+# --------------------------------------------------------------------------
+# Publish timing on an already-approved row
+# --------------------------------------------------------------------------
+
+
+def test_reschedule_moves_an_approved_rows_slot(api):
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())])
+    when = utcnow() + timedelta(days=5)
+    body = api.put(
+        "/api/rows/01A/schedule", json={"scheduled_for": when.isoformat()}
+    ).json()
+    assert body["scheduled_for"].startswith(when.strftime("%Y-%m-%dT%H:%M"))
+
+
+def test_reschedule_refuses_a_row_that_is_not_approved(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    when = utcnow() + timedelta(days=1)
+    response = api.put(
+        "/api/rows/01A/schedule", json={"scheduled_for": when.isoformat()}
+    )
+    assert response.status_code == 409
+
+
+def test_reschedule_refuses_a_past_time(api):
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())])
+    when = utcnow() - timedelta(hours=1)
+    response = api.put(
+        "/api/rows/01A/schedule", json={"scheduled_for": when.isoformat()}
+    )
+    assert response.status_code == 400
+
+
+def test_publish_now_route_refuses_a_row_that_is_not_approved(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    assert api.post("/api/rows/01A/publish-now").status_code == 409
+
+
+def test_publish_now_route_is_a_dry_run_on_the_shipped_default(api, monkeypatch):
+    from lnp import publish_now as publish_now_mod
+    from lnp.linkedin import LinkedIn
+
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a real draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())])
+    connect_linkedin(store_for())
+    store_for().set_config_value("PAUSED", "FALSE")
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):  # pragma: no cover - must never run
+            raise AssertionError("dry run must not call the API")
+
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
+
+    body = api.post("/api/rows/01A/publish-now").json()
+    assert body["status"] == "APPROVED"
+    assert "dry run" in body["error"].lower()

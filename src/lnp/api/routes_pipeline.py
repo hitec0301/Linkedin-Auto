@@ -3,15 +3,19 @@
 Ticking a row, writing an angle, editing the text, approving. Everything else
 in this product exists to make those four things take ten minutes a week.
 
-There is no endpoint here that publishes. Approving marks a row APPROVED and
-the publish job takes it from there, which keeps a single writer to LinkedIn
-and one place where the POSTING/POSTED sequence is enforced.
+Approving marks a row APPROVED; the scheduled publish job takes it from there
+by default. The one exception is approve's own publish_now, for a customer
+who wants a post out immediately rather than waiting for a slot - it goes
+through lnp.publish_now, the same POSTING/POSTED sequence and the same
+LinkedIn client the scheduled job uses, so there remains exactly one place
+that sequence is implemented even though there are now two callers of it.
 """
 
 from __future__ import annotations
 
 import threading
 from contextlib import closing
+from datetime import timedelta
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -20,6 +24,7 @@ from .. import runner
 from ..config import Config
 from ..curate import curate as run_curate
 from ..draft import draft_all as run_draft_all
+from ..publish_now import publish_one as run_publish_one
 from ..db.schema import Tenant
 from ..db.store import PipelineStore
 from ..models import (
@@ -30,9 +35,9 @@ from ..models import (
     TransitionError,
 )
 from ..db.store import StoreError
-from ..util import parse_dt, utcnow
+from ..util import iso, parse_dt, utcnow
 from .deps import active_tenant, config, current_store
-from .schemas import ROW_COLUMN_BY_FIELD, ReviseIn, RowEdit, RowOut
+from .schemas import ApproveIn, ROW_COLUMN_BY_FIELD, ReviseIn, RowEdit, RowOut, ScheduleIn
 
 router = APIRouter(prefix="/api/rows", tags=["pipeline"])
 
@@ -50,13 +55,24 @@ CURATE_NOW_COOLDOWN_MINUTES = 10
 # thread-safe everywhere.
 _ON_DEMAND_LLM_LOCK = threading.Lock()
 
+# store.transition()'s guard checks the in-memory row it is handed, not a
+# fresh read under a database lock, because every existing writer (the cron
+# jobs) is already single-threaded and sequential. approve's publish_now is
+# the first writer that is not, so two "post now" clicks landing on the same
+# row from FastAPI's threadpool at once is a real - if rare - way to attempt
+# the same post twice. This lock serialises this one path; it does not (and
+# cannot, from here) protect against an overlap with the scheduled publish
+# job running as a separate process, which is the same single-writer
+# assumption the rest of the product already runs on.
+_PUBLISH_NOW_LOCK = threading.Lock()
+
 # What the interface may offer, per status. Derived from the state machine so
 # a button cannot exist for a move the store would refuse.
 ACTIONS: Dict[str, List[str]] = {
     Status.NEW: ["edit", "skip"],
     Status.DRAFTED: ["edit", "approve", "revise", "skip"],
     Status.REVISE: ["edit", "skip", "redraft"],
-    Status.APPROVED: ["edit", "unapprove", "skip"],
+    Status.APPROVED: ["edit", "unapprove", "skip", "publish_now", "reschedule"],
     Status.POSTING: [],
     Status.POSTED: ["edit"],  # only Reach, which the human fills in later
     Status.FAILED: ["approve", "skip"],
@@ -204,6 +220,37 @@ def edit_row(
     return RowOut.of(row, allowed_actions(row))
 
 
+def _validate_schedule(raw: str) -> str:
+    """Parse and validate a customer-supplied publish time. Returns the ISO string to store."""
+    when = parse_dt(raw)
+    if when is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "could not understand that date/time"
+        )
+    if when < utcnow() - timedelta(minutes=1):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "that time has already passed")
+    return iso(when)
+
+
+def _publish_now(tenant_id: str, cfg: Config, row_id: str) -> Optional[Row]:
+    """Run lnp.publish_now.publish_one for exactly one row.
+
+    Returns the row as last observed through the session the attempt went
+    through, or None if the account or the row is gone by the time the run
+    starts - both of which `active_tenant` and `find` above already make
+    unreachable in the ordinary case.
+    """
+    with _PUBLISH_NOW_LOCK, closing(runner.runs("publish", cfg, tenant_id=tenant_id)) as runs:
+        run = next(runs, None)
+        if run is None:
+            return None
+        live_row = next((r for r in run.store.pipeline_rows() if r.ID == row_id), None)
+        if live_row is None:
+            return None
+        run_publish_one(run, live_row, dry_run=cfg.dry_run)
+        return next((r for r in run.store.pipeline_rows() if r.ID == row_id), None)
+
+
 def _move(store: PipelineStore, row: Row, target: str, updates=None) -> RowOut:
     try:
         store.transition(row, target, updates, allow_revision_note=True)
@@ -222,22 +269,96 @@ def _move(store: PipelineStore, row: Row, target: str, updates=None) -> RowOut:
 @router.post("/{row_id}/approve", response_model=RowOut)
 def approve(
     row_id: str,
+    body: ApproveIn = ApproveIn(),
     store: PipelineStore = Depends(current_store),
     tenant: Tenant = Depends(active_tenant),
+    cfg: Config = Depends(config),
 ) -> RowOut:
-    """Approve a draft for publishing.
+    """Approve a draft for publishing, and say when.
 
-    The one irreversible-ish decision in the product, so it is its own endpoint
-    with its own name. It does not publish; it says this may be published, and
-    the publish job posts it when its slot arrives.
+    Leaving both fields unset keeps the slot Job B already assigned - today's
+    default, and still what the scheduled publish job honours either way.
+    Setting one overrides that slot as part of the same decision, rather than
+    a second endpoint the customer has to remember to call: approve and when
+    are one moment for the person making it, not two.
     """
+    if body.scheduled_for and body.publish_now:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "choose either a schedule or 'post now', not both",
+        )
+
     row = find(store, row_id)
     if not row.effective_text.strip():
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             "there is nothing to publish in this row yet",
         )
-    return _move(store, row, Status.APPROVED, {"Error": ""})
+
+    updates = {"Error": ""}
+    if body.scheduled_for:
+        updates["ScheduledFor"] = _validate_schedule(body.scheduled_for)
+    elif body.publish_now:
+        # Due immediately, so if the publish attempt below cannot go
+        # through right now, the next scheduled run (within 30 minutes)
+        # picks it up rather than it waiting for whatever slot Job B guessed.
+        updates["ScheduledFor"] = iso(utcnow())
+
+    approved = _move(store, row, Status.APPROVED, updates)
+    if not body.publish_now:
+        return approved
+
+    updated = _publish_now(tenant.id, cfg, row_id)
+    return RowOut.of(updated, allowed_actions(updated)) if updated else approved
+
+
+@router.put("/{row_id}/schedule", response_model=RowOut)
+def reschedule(
+    row_id: str,
+    body: ScheduleIn,
+    store: PipelineStore = Depends(current_store),
+    tenant: Tenant = Depends(active_tenant),
+) -> RowOut:
+    """Move an already-approved row's publish time, without unapproving it.
+
+    APPROVED only: a row still being drafted has no commitment to move, and
+    unapprove-then-reapprove is the deliberately narrow path for anything
+    already posted or skipped.
+    """
+    row = find(store, row_id)
+    if row.status != Status.APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"this row is {row.status}, not approved and waiting to publish",
+        )
+    store.write(row, {"ScheduledFor": _validate_schedule(body.scheduled_for)})
+    return RowOut.of(row, allowed_actions(row))
+
+
+@router.post("/{row_id}/publish-now", response_model=RowOut)
+def publish_now_route(
+    row_id: str,
+    store: PipelineStore = Depends(current_store),
+    tenant: Tenant = Depends(active_tenant),
+    cfg: Config = Depends(config),
+) -> RowOut:
+    """Publish an already-approved row immediately, instead of waiting for its slot.
+
+    The same lnp.publish_now.publish_one approve's own publish_now uses, so a
+    post made from here and one made from that first, one-time choice behave
+    identically - PAUSED and dry_run both still apply, and a refusal leaves
+    the row APPROVED and due now for the next scheduled run.
+    """
+    row = find(store, row_id)
+    if row.status != Status.APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"this row is {row.status}, not approved and waiting to publish",
+        )
+    updated = _publish_now(tenant.id, cfg, row_id)
+    if updated is None:  # pragma: no cover - the row cannot vanish mid-request
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")
+    return RowOut.of(updated, allowed_actions(updated))
 
 
 @router.post("/{row_id}/unapprove", response_model=RowOut)

@@ -80,6 +80,27 @@ class RowEdit(BaseModel):
     reach: Optional[int] = None
 
 
+class ApproveIn(BaseModel):
+    """How this one post should go out. Both are optional and mutually exclusive.
+
+    Neither set: the row keeps the slot Job B already assigned it, and the
+    next scheduled publish run posts it when that arrives - today's default.
+    """
+
+    scheduled_for: Optional[str] = None  # overrides the auto-assigned slot
+    publish_now: bool = False  # bypass scheduling; attempt to post immediately
+
+    @field_validator("scheduled_for")
+    @classmethod
+    def blank_is_none(cls, value: Optional[str]) -> Optional[str]:
+        value = (value or "").strip()
+        return value or None
+
+
+class ScheduleIn(BaseModel):
+    scheduled_for: str = Field(min_length=1)
+
+
 class ReviseIn(BaseModel):
     note: str = Field(min_length=1, max_length=2000)
 
