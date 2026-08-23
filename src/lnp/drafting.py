@@ -352,7 +352,6 @@ def draft(
         user=prompt,
         model=config.get("drafting.model", "claude-sonnet-4-6"),
         max_tokens=int(config.get("drafting.max_tokens", 4000)),
-        temperature=config.get("drafting.temperature"),
     )
     if variants and contains_both_variants(raw):
         first, second = split_variants(raw)
@@ -386,6 +385,5 @@ def revise(
         user=prompt,
         model=config.get("drafting.model", "claude-sonnet-4-6"),
         max_tokens=int(config.get("drafting.max_tokens", 4000)),
-        temperature=config.get("drafting.temperature"),
     )
     return postprocess(raw)

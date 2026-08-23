@@ -76,7 +76,6 @@ scoring:
 drafting:
   model: claude-sonnet-4-6
   max_tokens: 4000
-  temperature: 1.0
   min_chars: 900
   max_chars: 1300
   # LinkedIn truncates near 210 characters. The first two lines have to carry
