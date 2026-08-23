@@ -1,9 +1,26 @@
+import { useState } from 'react'
 import { api } from './api.js'
-import { AutoSave, Notice, useAsync } from './bits.jsx'
+import { Notice, useAsync } from './bits.jsx'
+import RowCard from './RowCard.jsx'
 
 export default function Published() {
   const rows = useAsync(() => api.rows('POSTED,EXPIRED,SKIPPED,FAILED'), [])
   const health = useAsync(() => api.health(), [])
+  const [busy, setBusy] = useState('')
+  const [error, setError] = useState('')
+
+  async function act(fn) {
+    setBusy('working')
+    setError('')
+    try {
+      await fn()
+      rows.reload()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy('')
+    }
+  }
 
   if (rows.loading) return <p className="empty">Loading…</p>
   if (rows.error) return <Notice kind="error">{rows.error}</Notice>
@@ -14,31 +31,13 @@ export default function Published() {
 
   return (
     <>
+      {error && <Notice kind="error">{error}</Notice>}
       {h && <Health stats={h} />}
 
       {posted.length === 0 && <p className="empty">Nothing published yet.</p>}
 
       {posted.map((row) => (
-        <div className="panel" key={row.id}>
-          <h3>{row.source_title || 'Untitled'}</h3>
-          <div className="meta">
-            <span>{(row.posted_at || '').replace('T', ' ').replace('Z', '')}</span>
-            {row.edit_distance > 0 && <span>you changed {Math.round(row.edit_distance * 100)}%</span>}
-            {row.revision_count > 0 && <span>{row.revision_count} revision(s)</span>}
-          </div>
-          <div className="post-text">{row.final_text || row.draft_text}</div>
-          <label>
-            Impressions, when you have them. Nothing reads this automatically —
-            LinkedIn's analytics are not scraped.
-          </label>
-          <AutoSave
-            id={row.id}
-            rows={1}
-            value={row.reach ? String(row.reach) : ''}
-            placeholder="e.g. 4200"
-            onSave={(v) => api.editRow(row.id, { reach: Number(v.replace(/\D/g, '')) || 0 })}
-          />
-        </div>
+        <RowCard key={row.id} row={row} busy={busy} act={act} reload={rows.reload} />
       ))}
 
       {rest.length > 0 && (

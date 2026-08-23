@@ -4,10 +4,6 @@ export function Notice({ kind = 'warn', children }) {
   return <div className={`notice ${kind === 'warn' ? '' : kind}`}>{children}</div>
 }
 
-export function StatusTag({ status }) {
-  return <span className={`tag status-${status}`}>{status.toLowerCase()}</span>
-}
-
 export function useAsync(loader, deps = []) {
   const [state, setState] = useState({ data: null, error: '', loading: true })
   const [nonce, setNonce] = useState(0)
