@@ -56,6 +56,7 @@ logger = log.get(__name__)
 KEY_PAUSED = "PAUSED"
 KEY_POST_COUNT = "POST_COUNT"
 KEY_PERSON_URN = "PERSON_URN"
+KEY_AUDIENCE_DESCRIPTION = "AUDIENCE_DESCRIPTION"
 
 TRUTHY = {"true", "yes", "1", "on", "paused"}
 

@@ -36,7 +36,7 @@ from ..models import (
 )
 from ..db.store import StoreError
 from ..util import iso, parse_dt, utcnow
-from .deps import active_tenant, config, current_store
+from .deps import ON_DEMAND_LLM_LOCK, active_tenant, config, current_store
 from .schemas import ApproveIn, ROW_COLUMN_BY_FIELD, ReviseIn, RowEdit, RowOut, ScheduleIn
 
 router = APIRouter(prefix="/api/rows", tags=["pipeline"])
@@ -45,15 +45,6 @@ router = APIRouter(prefix="/api/rows", tags=["pipeline"])
 # nothing but duplicates, would otherwise let a stuck "Fetch now" button be
 # clicked repeatedly - each click is a real feed fetch and a real model call.
 CURATE_NOW_COOLDOWN_MINUTES = 10
-
-# lnp.llm's usage meter is a process-global, not a per-thread one, because the
-# scheduled jobs only ever run one tenant at a time in a single thread. This
-# on-demand path is reached from FastAPI's threadpool, so two accounts
-# clicking "Fetch now" (or two rows being redrafted) at the same instant could
-# otherwise attribute one tenant's model spend to the other's cap. The lock
-# serialises the rare, human-triggered case rather than making the meter
-# thread-safe everywhere.
-_ON_DEMAND_LLM_LOCK = threading.Lock()
 
 # store.transition()'s guard checks the in-memory row it is handed, not a
 # fresh read under a database lock, because every existing writer (the cron
@@ -128,7 +119,7 @@ def curate_now(
                 f"a batch just ran; try again in about {wait} minute(s)",
             )
 
-    with _ON_DEMAND_LLM_LOCK, closing(runner.runs("curate", cfg, tenant_id=tenant.id)) as runs:
+    with ON_DEMAND_LLM_LOCK, closing(runner.runs("curate", cfg, tenant_id=tenant.id)) as runs:
         run = next(runs, None)
         if run is None:
             raise HTTPException(status.HTTP_409_CONFLICT, "this account is not active")
@@ -163,7 +154,7 @@ def redraft_now(
             f"this row is {row.status}, not sent back for revision",
         )
 
-    with _ON_DEMAND_LLM_LOCK, closing(runner.runs("draft", cfg, tenant_id=tenant.id)) as runs:
+    with ON_DEMAND_LLM_LOCK, closing(runner.runs("draft", cfg, tenant_id=tenant.id)) as runs:
         run = next(runs, None)
         if run is None:
             raise HTTPException(status.HTTP_409_CONFLICT, "this account is not active")

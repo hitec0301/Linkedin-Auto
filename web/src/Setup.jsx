@@ -11,12 +11,33 @@ import { Confirm, Notice, useAsync } from './bits.jsx'
  * removed is guesswork, so every value that has to be copied is shown here
  * ready to paste, in the order LinkedIn's own screens ask for them.
  */
-export default function Setup({ me, onChange }) {
+export default function Setup({ me, onChange, go }) {
   const usage = useAsync(() => api.usage(), [])
   const [creds, setCreds] = useState({ client_id: '', client_secret: '' })
   const [redirect, setRedirect] = useState('')
   const [error, setError] = useState('')
   const [saved, setSaved] = useState(false)
+
+  const [audience, setAudience] = useState(me.audience_description || '')
+  const [audienceBusy, setAudienceBusy] = useState(false)
+  const [audienceError, setAudienceError] = useState('')
+  const [audienceSaved, setAudienceSaved] = useState(false)
+
+  async function saveAudience(e) {
+    e.preventDefault()
+    setAudienceBusy(true)
+    setAudienceError('')
+    setAudienceSaved(false)
+    try {
+      await api.setAudience(audience)
+      setAudienceSaved(true)
+      onChange()
+    } catch (err) {
+      setAudienceError(err.message)
+    } finally {
+      setAudienceBusy(false)
+    }
+  }
 
   const params = new URLSearchParams(window.location.search)
   const justConnected = params.get('connected') === '1'
@@ -62,6 +83,39 @@ export default function Setup({ me, onChange }) {
           everything else running. It is the switch to use when you are on
           holiday, or when the news makes a scheduled post read badly.
         </p>
+      </div>
+
+      <div className="panel">
+        <h3>About your audience</h3>
+        <p className="muted">
+          A few sentences on who you write for and what you know. Saving this
+          rewrites the "Who is writing" and "Stance" sections of your voice
+          card to match — everything else in it, including anything you have
+          already edited by hand, is left alone. You can run this again any
+          time your focus changes.
+        </p>
+        {audienceError && <Notice kind="error">{audienceError}</Notice>}
+        {audienceSaved && !audienceError && (
+          <Notice kind="ok">
+            Voice card updated.{' '}
+            <a href="#" onClick={(e) => { e.preventDefault(); go('voice') }}>
+              Review it on the Voice screen.
+            </a>
+          </Notice>
+        )}
+        <form onSubmit={saveAudience}>
+          <textarea
+            rows={4}
+            value={audience}
+            placeholder="e.g. I'm a staff platform engineer writing for other backend and infra engineers at mid-size SaaS companies — procurement, on-call, the gap between a proof of concept and a production rollout."
+            onChange={(e) => { setAudience(e.target.value); setAudienceSaved(false) }}
+          />
+          <div className="actions">
+            <button className="action primary" type="submit" disabled={audienceBusy || !audience.trim()}>
+              {audienceBusy ? 'Drafting…' : 'Save and update my voice card'}
+            </button>
+          </div>
+        </form>
       </div>
 
       <div className="panel">

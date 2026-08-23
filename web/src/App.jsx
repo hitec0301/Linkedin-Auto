@@ -110,8 +110,8 @@ export default function App() {
       {active === 'review' && <Review me={me} />}
       {active === 'published' && <Published />}
       {active === 'voice' && <Voice />}
-      {active === 'sources' && <Sources />}
-      {active === 'setup' && <Setup me={me} onChange={refresh} />}
+      {active === 'sources' && <Sources me={me} go={go} />}
+      {active === 'setup' && <Setup me={me} onChange={refresh} go={go} />}
     </div>
   )
 }

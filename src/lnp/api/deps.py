@@ -7,6 +7,7 @@ there is no route that can be pointed at somebody else's account.
 
 from __future__ import annotations
 
+import threading
 from typing import Iterator, Optional
 
 from fastapi import Cookie, Depends, HTTPException, status
@@ -19,6 +20,17 @@ from ..db.store import PipelineStore
 from .security import SESSION_COOKIE, read_session
 
 _config: Optional[Config] = None
+
+# lnp.llm's usage meter is a process-global, not a per-thread one, because
+# every existing caller (the scheduled jobs) runs one tenant at a time in a
+# single thread. Every route that opens its own runner.Run to make an
+# on-demand LLM call - curate-now, redraft-now, drafting a starter voice
+# card from a description - shares this one lock, so two such requests
+# landing on FastAPI's threadpool at once cannot attribute one tenant's
+# model spend to another's cap. One lock, not one per route module: two
+# separate locks would each serialise their own callers and still race
+# against each other.
+ON_DEMAND_LLM_LOCK = threading.Lock()
 
 
 def config() -> Config:

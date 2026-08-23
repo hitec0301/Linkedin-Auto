@@ -131,6 +131,18 @@ class MeOut(BaseModel):
     linkedin_connected: bool = False
     linkedin_app_configured: bool = False
     post_count: int = 0
+    audience_description: str = ""
+
+
+class AudienceIn(BaseModel):
+    description: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("description")
+    @classmethod
+    def not_only_whitespace(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("say something about who you write for")
+        return value.strip()
 
 
 class UsageOut(BaseModel):

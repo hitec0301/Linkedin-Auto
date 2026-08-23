@@ -435,8 +435,10 @@ from lnp.voice import (
     amend_card_text,
     build_voice_context,
     collect_feedback,
+    draft_starter_sections,
     existing_amendments,
     find_recurring,
+    replace_starter_sections,
     retrieve_examples,
 )
 
@@ -455,6 +457,61 @@ def test_starter_card_has_markers_and_banned_list():
     assert AMENDMENTS_BEGIN in STARTER_CARD and AMENDMENTS_END in STARTER_CARD
     for banned in ["game-changer", "delve", "Thoughts?", "in today's rapidly evolving landscape"]:
         assert banned in STARTER_CARD
+
+
+# ---- Tailoring the starter card from a free-text description -------------
+
+
+def test_draft_starter_sections_sends_the_description(card_config):
+    seen = {}
+
+    def fake_completer(config, *, system, user, model=None, max_tokens=0):
+        seen["user"] = user
+        return "## Who is writing\nStaff engineers.\n\n## Stance\n- Skeptical of hype.\n"
+
+    result = draft_starter_sections(card_config, "Staff engineers at SaaS companies",
+                                     completer=fake_completer)
+    assert "Staff engineers at SaaS companies" in seen["user"]
+    assert result.startswith("## Who is writing")
+
+
+def test_draft_starter_sections_strips_code_fences(card_config):
+    def fenced(config, *, system, user, model=None, max_tokens=0):
+        return "```markdown\n## Who is writing\nSomeone.\n\n## Stance\n- A point.\n```"
+
+    result = draft_starter_sections(card_config, "anything", completer=fenced)
+    assert "```" not in result
+    assert result.startswith("## Who is writing")
+
+
+def test_replace_starter_sections_keeps_everything_else_on_the_real_card():
+    """Structure, Banned, Formatting and the amendment markers are audience-
+    agnostic writing-craft rules; regenerating them risks losing a detail an
+    LLM call has no way to know matters. Only Who/Stance should move."""
+    new_sections = (
+        "## Who is writing\nStaff platform engineers.\n\n"
+        "## Stance\n- Prefers boring, proven tools.\n"
+    )
+    result = replace_starter_sections(STARTER_CARD, new_sections)
+
+    assert "Staff platform engineers" in result
+    assert "Prefers boring, proven tools" in result
+    assert "An L&D leader working in edtech" not in result  # the old section is gone
+    assert AMENDMENTS_BEGIN in result and AMENDMENTS_END in result
+    assert "## Structure" in result and "## Banned" in result and "## Formatting" in result
+    for banned in ["game-changer", "delve", "Thoughts?"]:
+        assert banned in result
+
+
+def test_replace_starter_sections_inserts_when_who_is_missing():
+    """A customer who deleted the section should not lose the new one - it goes
+    in ahead of whatever they kept, not silently dropped."""
+    card = "# Voice card\n\n## Structure\n- short posts\n"
+    result = replace_starter_sections(
+        card, "## Who is writing\nSomeone.\n\n## Stance\n- a point.\n"
+    )
+    assert result.index("## Who is writing") < result.index("## Structure")
+    assert "short posts" in result
 
 
 def test_amending_a_card_is_idempotent():

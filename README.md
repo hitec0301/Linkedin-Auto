@@ -13,7 +13,16 @@ is wrong, the thing to change is the voice card, not the architecture.
 The shipped voice and source list are written for an L&D leader in edtech
 posting to corporate L&D practitioners and academic educators. Both are
 per-account and fully editable, so that is a starting position rather than a
-constraint.
+constraint. **About your audience**, on the Setup screen, moves that starting
+position: a few sentences on who a customer writes for redrafts the "Who is
+writing" and "Stance" sections of their voice card to match, leaving
+Structure, Banned, and Formatting - the audience-agnostic rules about writing
+for LinkedIn specifically, not about any one field - untouched. It can be
+rerun any time their focus changes. It does not touch the source list:
+finding real feeds for a niche needs a search capability this product does
+not have, and fabricating URLs would break curation rather than help it, so
+the Sources screen shows the audience description as a reminder and leaves
+finding feeds to the person who knows their field.
 
 ---
 
@@ -241,10 +250,12 @@ config/voice_card.md    the starter voice card, likewise
 src/lnp/models.py       status machine, Row, column ownership, health metric
 src/lnp/runner.py       one run per account: store, sources, card, tokens, meter
 src/lnp/curate.py       Job A's work, shared by the cron job and "fetch now"
+src/lnp/draft.py        Job B's work, shared by the cron job and "redraft now"
+src/lnp/publish_now.py  one row, published on request - approve's publish_now
 src/lnp/ingest.py       feeds, two-stage dedupe, education filtering
 src/lnp/scoring.py      batched scoring, tier weights, quota enforcement
 src/lnp/drafting.py     extraction, prompts, post-processing, revision
-src/lnp/voice.py        the card, feedback signals, rule proposals
+src/lnp/voice.py        the card, feedback signals, rule proposals, tailoring
 src/lnp/tokens.py       OAuth rotation, proactive refresh, expiry warnings
 src/lnp/linkedin.py     Posts API, and the stuck-row recovery query
 src/lnp/llm.py          Anthropic access, and the metering hook every call passes

@@ -25,7 +25,7 @@ from rapidfuzz import fuzz
 
 from . import log
 from .config import Config
-from .llm import complete_json
+from .llm import complete, complete_json
 from .models import Row, Status
 from .util import normalized_edit_distance
 
@@ -120,6 +120,95 @@ def amend_card_in_store(store, rules: Sequence[str]) -> List[str]:
 def same_rule(a: str, b: str) -> bool:
     """Rules that differ only in wording are the same rule."""
     return a.strip().lower() == b.strip().lower() or fuzz.token_set_ratio(a, b) >= 92
+
+
+# --------------------------------------------------------------------------
+# Tailoring the starter card to what a new account says about themselves
+# --------------------------------------------------------------------------
+#
+# Only "Who is writing" and "Stance" are regenerated. Structure, Banned, and
+# Formatting are hard-won, audience-agnostic rules about writing for LinkedIn
+# specifically - what makes a post readable there, not what makes a post about
+# this person's field - and the amendment markers are load-bearing for the
+# Sunday job. Regenerating those risks losing a detail an LLM call has no way
+# to know matters; leaving them alone and replacing only the two sections that
+# are actually about the customer does not.
+
+SECTION_HEADING_RE = re.compile(r"^## .+$", re.MULTILINE)
+
+STARTER_SECTIONS_SYSTEM = """\
+You write the opening two sections of a LinkedIn voice card: a writing brief \
+that tells a drafting model who this person is and what point of view they \
+write from. You are given a short description, in the person's own words, of \
+their audience and expertise.
+
+Write exactly two sections, in this shape, and nothing else - no preamble, no \
+other headings, no closing remarks:
+
+## Who is writing
+A short paragraph or a few bullet points naming who this person writes for -
+specific roles or titles, not vague categories like "professionals."
+
+## Stance
+3-6 bullet points on the point of view this person writes from: what they take \
+a position on, what they are skeptical of, what kind of claim they back up and \
+what kind they avoid. Ground every bullet in what the description actually \
+says - infer no expertise, credential, or opinion it does not support.
+
+Plain, direct sentences. No "in today's landscape," no "leverage," no \
+em-dashes, no rhetorical questions. This card exists specifically to keep \
+those out of what gets published under this person's name."""
+
+
+def draft_starter_sections(config: Config, description: str, completer=None) -> str:
+    """Ask the model for a "Who is writing" / "Stance" pair from a free-text
+    description of the account's audience and expertise.
+
+    Raises whatever the completer raises - a usage-cap or LLM error here
+    should surface to the person who just typed the description, not be
+    swallowed into a generic card they never asked for.
+    """
+    completer = completer or complete
+    text = completer(
+        config,
+        system=STARTER_SECTIONS_SYSTEM,
+        user=f"Description, in their own words:\n\n{description.strip()}",
+        model=config.get("voice.model", "claude-sonnet-4-6"),
+        max_tokens=int(config.get("voice.max_tokens", 4000)),
+    )
+    out = (text or "").strip()
+    out = re.sub(r"^```[a-zA-Z]*\s*\n?", "", out)
+    out = re.sub(r"\n?```\s*$", "", out).strip()
+    return out
+
+
+def replace_starter_sections(card: str, new_sections: str) -> str:
+    """Splice a freshly drafted "Who is writing"/"Stance" block into `card`.
+
+    Everything else - Structure, Banned, Formatting, the amendment markers,
+    anything the customer has already written anywhere else in the file - is
+    left exactly as it was. If "Who is writing" is not there to find (the
+    customer deleted or renamed it), the new block goes in ahead of whatever
+    sections remain rather than being dropped silently.
+    """
+    headings = [(m.start(), m.group().strip()) for m in SECTION_HEADING_RE.finditer(card)]
+    who_idx = next(
+        (i for i, (_, title) in enumerate(headings) if title == "## Who is writing"),
+        None,
+    )
+    block = new_sections.strip() + "\n\n"
+
+    if who_idx is None:
+        insert_at = headings[0][0] if headings else len(card)
+        return card[:insert_at] + block + card[insert_at:]
+
+    start = headings[who_idx][0]
+    end = len(card)
+    for pos, title in headings[who_idx + 1:]:
+        if title != "## Stance":
+            end = pos
+            break
+    return card[:start] + block + card[end:]
 
 
 # --------------------------------------------------------------------------

@@ -33,6 +33,10 @@ from lnp.util import iso, utcnow
 TENANT = "01J000000000000000000000AA"
 OTHER = "01J000000000000000000000BB"
 
+STARTER_VOICE_CARD = (
+    Path(__file__).resolve().parents[1] / "config" / "voice_card.md"
+).read_text()
+
 
 @pytest.fixture
 def api(monkeypatch):
@@ -862,3 +866,56 @@ def test_publish_now_route_is_a_dry_run_on_the_shipped_default(api, monkeypatch)
     body = api.post("/api/rows/01A/publish-now").json()
     assert body["status"] == "APPROVED"
     assert "dry run" in body["error"].lower()
+
+
+# --------------------------------------------------------------------------
+# Audience: who this account writes for, and the voice card it seeds
+# --------------------------------------------------------------------------
+
+
+def test_set_audience_saves_description_and_redrafts_who_and_stance(api, monkeypatch):
+    from lnp import voice as voice_mod
+
+    store_for().save_voice_card(STARTER_VOICE_CARD)
+
+    def fake_complete(config, *, system, user, model=None, max_tokens=0, **kw):
+        assert "Staff platform engineers" in user
+        return "## Who is writing\nStaff platform engineers.\n\n## Stance\n- Prefers proven tools.\n"
+
+    monkeypatch.setattr(voice_mod, "complete", fake_complete)
+
+    body = api.put(
+        "/api/audience", json={"description": "Staff platform engineers"}
+    ).json()
+    assert "Staff platform engineers" in body["content"]
+    assert "Prefers proven tools" in body["content"]
+    # The audience-agnostic sections survive untouched.
+    assert "## Structure" in body["content"]
+    assert "## Banned" in body["content"]
+    assert "<!-- AMENDMENTS-BEGIN -->" in body["content"]
+
+    me = api.get("/api/me").json()
+    assert me["audience_description"] == "Staff platform engineers"
+
+
+def test_set_audience_rejects_a_blank_description(api):
+    response = api.put("/api/audience", json={"description": "   "})
+    assert response.status_code == 422
+
+
+def test_set_audience_runs_inside_a_metered_run(api, monkeypatch):
+    """The call has to go through runner.runs(), the same as every other
+    on-demand LLM call, or it is unlimited and free rather than metered."""
+    from lnp import llm, voice as voice_mod
+
+    store_for().save_voice_card(STARTER_VOICE_CARD)
+    seen = {}
+
+    def fake_complete(config, *, system, user, model=None, max_tokens=0, **kw):
+        seen["meter"] = llm.current_meter()
+        return "## Who is writing\nSomeone.\n\n## Stance\n- a point.\n"
+
+    monkeypatch.setattr(voice_mod, "complete", fake_complete)
+    response = api.put("/api/audience", json={"description": "Someone specific"})
+    assert response.status_code == 200
+    assert seen["meter"] is not None

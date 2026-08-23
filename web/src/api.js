@@ -60,6 +60,7 @@ export const api = {
   updateSource: (id, body) => request(`/api/sources/${id}`, { method: 'PUT', body }),
   deleteSource: (id) => request(`/api/sources/${id}`, { method: 'DELETE' }),
 
+  setAudience: (description) => request('/api/audience', { method: 'PUT', body: { description } }),
   voiceCard: () => request('/api/voice-card'),
   saveVoiceCard: (content) => request('/api/voice-card', { method: 'PUT', body: { content } }),
   amendments: () => request('/api/amendments'),
