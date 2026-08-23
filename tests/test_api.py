@@ -566,6 +566,68 @@ def test_the_shipped_schema_matches_the_migrations(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Starting a post yourself: a source to cite, and a take to write from
+# --------------------------------------------------------------------------
+
+
+def test_create_row_makes_a_new_row_from_a_source_and_a_take(api):
+    body = api.post("/api/rows", json={
+        "source_url": "https://example.test/an-article",
+        "source_title": "An article worth citing",
+        "take": "My own thesis about this, spelled out at whatever length I want.",
+    }).json()
+    assert body["status"] == "NEW"
+    assert body["source_url"] == "https://example.test/an-article"
+    assert body["source_title"] == "An article worth citing"
+    assert body["take"] == "My own thesis about this, spelled out at whatever length I want."
+
+    listed = [r["id"] for r in api.get("/api/rows").json()]
+    assert body["id"] in listed
+
+
+def test_create_row_works_with_no_title_or_take(api):
+    body = api.post("/api/rows", json={"source_url": "https://example.test/x"}).json()
+    assert body["status"] == "NEW"
+    assert body["source_title"] == ""
+    assert body["take"] == ""
+
+
+def test_create_row_rejects_a_blank_url(api):
+    response = api.post("/api/rows", json={"source_url": ""})
+    assert response.status_code == 422
+
+
+def test_create_row_rejects_something_that_is_not_a_url(api):
+    response = api.post("/api/rows", json={"source_url": "not a url"})
+    assert response.status_code == 422
+
+
+def test_create_row_is_scoped_to_the_signed_in_tenant(api):
+    body = api.post("/api/rows", json={"source_url": "https://example.test/y"}).json()
+    assert store_for(OTHER).pipeline_rows() == []
+    assert store_for().pipeline_rows()[0].ID == body["id"]
+
+
+def test_a_self_started_row_can_be_redrafted_like_any_other(api, monkeypatch):
+    """The point: it is indistinguishable from a fetched candidate from here on."""
+    from lnp import drafting as drafting_mod, voice as voice_mod
+
+    created = api.post("/api/rows", json={
+        "source_url": "https://example.test/an-article",
+        "take": "My own angle on this.",
+    }).json()
+    store_for().save_voice_card("A starter voice card.")
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A drafted post. " * 20)
+
+    response = api.post(f"/api/rows/{created['id']}/redraft-now", json={"take": created["take"]})
+    assert response.status_code == 200
+    assert response.json()["status"] == "DRAFTED"
+
+
+# --------------------------------------------------------------------------
 # On-demand curate: the Setup screen's "fetch candidates now"
 # --------------------------------------------------------------------------
 

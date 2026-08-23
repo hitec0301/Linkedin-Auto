@@ -16,6 +16,7 @@ export default function Review() {
   const [error, setError] = useState('')
   const [fetchMsg, setFetchMsg] = useState('')
   const [picked, setPicked] = useState(() => new Set())
+  const [composing, setComposing] = useState(false)
 
   async function act(fn) {
     setBusy('working')
@@ -83,11 +84,23 @@ export default function Review() {
               ? `${drafted} draft${drafted === 1 ? '' : 's'} waiting on you.`
               : 'No drafts waiting. Write a take on a candidate and redraft it.'}
         </p>
-        <button className="action" disabled={!!busy} onClick={fetchNow}>
-          {busy === 'fetching' ? 'Fetching…' : 'Fetch candidates now'}
-        </button>
+        <div className="actions" style={{ marginTop: 0 }}>
+          <button className="action" disabled={!!busy} onClick={() => setComposing((v) => !v)}>
+            {composing ? 'Cancel' : 'New post'}
+          </button>
+          <button className="action" disabled={!!busy} onClick={fetchNow}>
+            {busy === 'fetching' ? 'Fetching…' : 'Fetch candidates now'}
+          </button>
+        </div>
       </div>
       {fetchMsg && <p className="muted" style={{ marginTop: -10 }}>{fetchMsg}</p>}
+
+      {composing && (
+        <NewPostForm
+          onCancel={() => setComposing(false)}
+          onCreated={() => { setComposing(false); rows.reload() }}
+        />
+      )}
 
       {pickedCount > 0 && (
         <div className="bulkbar">
@@ -116,5 +129,78 @@ export default function Review() {
         />
       ))}
     </>
+  )
+}
+
+/**
+ * Start a post from your own writeup instead of a fetched candidate.
+ *
+ * Owns its own submit state rather than routing through the page's `act` -
+ * a validation error (a malformed URL, most often) should leave the form
+ * open with what was typed still in it, not close it and lose the draft.
+ */
+function NewPostForm({ onCancel, onCreated }) {
+  const [sourceUrl, setSourceUrl] = useState('')
+  const [sourceTitle, setSourceTitle] = useState('')
+  const [take, setTake] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+
+  async function submit() {
+    setSubmitting(true)
+    setError('')
+    try {
+      await api.createRow({ source_url: sourceUrl, source_title: sourceTitle, take })
+      onCreated()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="panel card">
+      <h3>New post</h3>
+      {error && <Notice kind="error">{error}</Notice>}
+
+      <label className="field-label">Source URL — the article you're citing</label>
+      <input
+        type="url"
+        value={sourceUrl}
+        placeholder="https://…"
+        onChange={(e) => setSourceUrl(e.target.value)}
+      />
+
+      <label className="field-label">Title, if you want one (optional)</label>
+      <input
+        type="text"
+        value={sourceTitle}
+        placeholder="Untitled if left blank"
+        onChange={(e) => setSourceTitle(e.target.value)}
+      />
+
+      <label className="field-label">Your writeup — the thesis a first draft is built from</label>
+      <textarea
+        className="note"
+        rows={5}
+        value={take}
+        placeholder="What's your take on this article? Write as much as you want - this is what the draft argues, the article is just evidence for it."
+        onChange={(e) => setTake(e.target.value)}
+      />
+
+      <div className="actions">
+        <button
+          className="action primary"
+          disabled={submitting || !sourceUrl.trim()}
+          onClick={submit}
+        >
+          {submitting ? 'Creating…' : 'Create'}
+        </button>
+        <button className="action" disabled={submitting} onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </div>
   )
 }

@@ -103,6 +103,27 @@ class BulkSkipIn(BaseModel):
     ids: List[str] = Field(min_length=1, max_length=200)
 
 
+class NewPostIn(BaseModel):
+    """A post someone starts themselves, instead of from a fetched candidate.
+
+    `take` is the same field the card shows once the row exists - the thesis
+    a first draft is built from - so a self-started row and a fetched one are
+    indistinguishable the moment after creation.
+    """
+
+    source_url: str = Field(min_length=1, max_length=2000)
+    source_title: str = Field(default="", max_length=300)
+    take: str = Field(default="", max_length=20000)
+
+    @field_validator("source_url")
+    @classmethod
+    def looks_like_a_url(cls, value: str) -> str:
+        value = value.strip()
+        if not (value.startswith("http://") or value.startswith("https://")):
+            raise ValueError("needs to be a full URL, starting with http:// or https://")
+        return value
+
+
 class ScheduleIn(BaseModel):
     scheduled_for: str = Field(min_length=1)
 

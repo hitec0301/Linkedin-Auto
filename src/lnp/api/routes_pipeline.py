@@ -27,7 +27,7 @@ from ..models import ColumnPermissionError, Row, Status
 from ..util import iso, parse_dt, utcnow
 from .deps import ON_DEMAND_LLM_LOCK, PUBLISH_NOW_LOCK, active_tenant, config, current_store
 from .schemas import (
-    BulkSkipIn, RedraftIn, ROW_COLUMN_BY_FIELD, RowEdit, RowOut, ScheduleIn, StatusIn,
+    BulkSkipIn, NewPostIn, RedraftIn, ROW_COLUMN_BY_FIELD, RowEdit, RowOut, ScheduleIn, StatusIn,
 )
 
 router = APIRouter(prefix="/api/rows", tags=["pipeline"])
@@ -55,6 +55,31 @@ def list_rows(
         wanted = {s.strip().upper() for s in status_filter.split(",") if s.strip()}
         rows = [r for r in rows if r.status in wanted]
     return [RowOut.of(r) for r in rows]
+
+
+@router.post("", response_model=RowOut, status_code=201)
+def create_row(
+    body: NewPostIn,
+    store: PipelineStore = Depends(current_store),
+    tenant: Tenant = Depends(active_tenant),
+) -> RowOut:
+    """A post someone starts themselves: a source to cite, and a take to write from.
+
+    Everything the automatic path adds on top - dedupe, a relevance score, an
+    audience and theme tag - is triage for a slate nobody asked for yet. A
+    row someone deliberately started skips straight past that; it is exactly
+    as real a row as a fetched one from the moment it exists, and "Redraft
+    with AI" treats it identically - it fetches this SourceURL itself the
+    same way it would a candidate's.
+    """
+    row = Row(
+        SourceURL=body.source_url,
+        SourceTitle=body.source_title,
+        Angle=body.take,
+        Status=Status.NEW,
+    )
+    store.append_rows([row])
+    return RowOut.of(row)
 
 
 @router.post("/curate-now")
