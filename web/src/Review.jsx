@@ -17,12 +17,41 @@ export default function Review({ onDiscuss }) {
   const [fetchMsg, setFetchMsg] = useState('')
   const [picked, setPicked] = useState(() => new Set())
   const [composing, setComposing] = useState(false)
+  const [postNotice, setPostNotice] = useState(null)
 
   async function act(fn) {
     setBusy('working')
     setError('')
     try {
       await fn()
+      rows.reload()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  // Publishing takes the row off this screen the moment it lands (Posted
+  // rows live on Published, not Review) - a plain `act()` reload would make
+  // a successful post look like the button did nothing. This captures the
+  // outcome from the response itself, before that reload can erase it.
+  async function postNow(row) {
+    setBusy('working')
+    setError('')
+    setPostNotice(null)
+    try {
+      const updated = await api.publishNow(row.id)
+      if (updated.status === 'POSTED') {
+        const link = updated.post_urn
+          ? `https://www.linkedin.com/feed/update/${encodeURIComponent(updated.post_urn)}/`
+          : ''
+        setPostNotice({ kind: 'ok', text: 'Published to LinkedIn.', link })
+      } else if (/^dry run/.test(updated.error || '')) {
+        setPostNotice({ kind: 'warn', text: `Not published — ${updated.error}` })
+      } else if (updated.error) {
+        setPostNotice({ kind: 'error', text: updated.error })
+      }
       rows.reload()
     } catch (err) {
       setError(err.message)
@@ -75,6 +104,19 @@ export default function Review({ onDiscuss }) {
   return (
     <>
       {error && <Notice kind="error">{error}</Notice>}
+      {postNotice && (
+        <Notice kind={postNotice.kind}>
+          {postNotice.text}
+          {postNotice.link && (
+            <>
+              {' '}
+              <a href={postNotice.link} target="_blank" rel="noreferrer">View it on LinkedIn ↗</a>
+            </>
+          )}
+          {' '}
+          <a href="#" onClick={(e) => { e.preventDefault(); setPostNotice(null) }}>Dismiss</a>
+        </Notice>
+      )}
 
       <div className="toprow">
         <p>
@@ -127,6 +169,7 @@ export default function Review({ onDiscuss }) {
           selected={picked.has(row.id)}
           onToggleSelect={toggle}
           onDiscuss={onDiscuss}
+          onPostNow={postNow}
         />
       ))}
     </>

@@ -18,10 +18,12 @@ function label(status) {
  * the field and the button sit right next to each other and a click should
  * carry exactly what is on screen.
  */
-export default function RowCard({ row, busy, act, reload, selectable, selected, onToggleSelect, onDiscuss }) {
+export default function RowCard({ row, busy, act, reload, selectable, selected, onToggleSelect, onDiscuss, onPostNow }) {
   const [take, setTake] = useState(row.take || '')
   const [saveState, setSaveState] = useState('idle')
   const [scheduledAt, setScheduledAt] = useState(toLocalInput(row.scheduled_for))
+  const [finalText, setFinalText] = useState(row.final_text || '')
+  const [reach, setReach] = useState(row.reach ? String(row.reach) : '')
   const timer = useRef(null)
 
   useEffect(() => {
@@ -32,6 +34,14 @@ export default function RowCard({ row, busy, act, reload, selectable, selected, 
   useEffect(() => {
     setScheduledAt(toLocalInput(row.scheduled_for))
   }, [row.id, row.scheduled_for])
+
+  useEffect(() => {
+    setFinalText(row.final_text || '')
+  }, [row.id, row.final_text])
+
+  useEffect(() => {
+    setReach(row.reach ? String(row.reach) : '')
+  }, [row.id, row.reach])
 
   function changeTake(next) {
     setTake(next)
@@ -142,10 +152,10 @@ export default function RowCard({ row, busy, act, reload, selectable, selected, 
             <textarea
               className="note"
               rows={4}
-              value={row.final_text}
+              value={finalText}
               placeholder="Leave empty to publish the draft as it stands."
-              onChange={(e) => api.editRow(row.id, { final_text: e.target.value })}
-              onBlur={(e) => act(() => api.editRow(row.id, { final_text: e.target.value }))}
+              onChange={(e) => setFinalText(e.target.value)}
+              onBlur={() => act(() => api.editRow(row.id, { final_text: finalText }))}
             />
           </>
         )}
@@ -164,7 +174,7 @@ export default function RowCard({ row, busy, act, reload, selectable, selected, 
               }}
             />
             <span className="muted">or</span>
-            <button className="action" disabled={!!busy} onClick={() => act(() => api.publishNow(row.id))}>
+            <button className="action" disabled={!!busy} onClick={() => onPostNow(row)}>
               {busy === 'working' ? 'Posting…' : 'Post now'}
             </button>
           </div>
@@ -177,10 +187,10 @@ export default function RowCard({ row, busy, act, reload, selectable, selected, 
             </label>
             <input
               type="text"
-              value={row.reach ? String(row.reach) : ''}
+              value={reach}
               placeholder="e.g. 4200"
-              onChange={(e) => api.editRow(row.id, { reach: Number(e.target.value.replace(/\D/g, '')) || 0 })}
-              onBlur={reload}
+              onChange={(e) => setReach(e.target.value.replace(/\D/g, ''))}
+              onBlur={() => act(() => api.editRow(row.id, { reach: Number(reach) || 0 }))}
             />
           </>
         )}
