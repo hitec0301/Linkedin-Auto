@@ -661,8 +661,36 @@ def test_curate_now_does_not_reach_another_tenants_rows(api, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# On-demand redraft: "redraft now" on a row sent back with a note
+# On-demand draft: a ticked-and-angled row, or one sent back with a note
 # --------------------------------------------------------------------------
+
+
+def test_redraft_now_drafts_a_ticked_row_with_an_angle(api, monkeypatch):
+    from lnp import drafting as drafting_mod, voice as voice_mod
+
+    seed([Row(ID="01NEW", Status=Status.NEW, Selected="TRUE",
+               Angle="Procurement cycles, not model quality, decide adoption.",
+               SourceURL="https://x.test/a", SourceTitle="A title")])
+    store_for().save_voice_card("A starter voice card.")
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A fresh draft of about the right length. " * 20)
+
+    response = api.post("/api/rows/01NEW/redraft-now")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "DRAFTED"
+    assert "fresh draft" in body["draft_text"]
+    assert body["scheduled_for"]
+
+
+def test_redraft_now_refuses_a_new_row_without_an_angle(api):
+    """Ticking the box is not enough on its own - the angle is the input."""
+    seed([Row(ID="01NEW", Status=Status.NEW, Selected="TRUE", Angle="")])
+    response = api.post("/api/rows/01NEW/redraft-now")
+    assert response.status_code == 409
+    assert "angle" in response.json()["detail"].lower()
 
 
 def test_redraft_now_regenerates_a_revise_row(api, monkeypatch):
@@ -689,7 +717,7 @@ def test_redraft_now_regenerates_a_revise_row(api, monkeypatch):
     assert row.RevisionNote == ""
 
 
-def test_redraft_now_refuses_a_row_that_is_not_revise(api):
+def test_redraft_now_refuses_an_unticked_row(api):
     seed([Row(ID="01NEW", Status=Status.NEW)])
     response = api.post("/api/rows/01NEW/redraft-now")
     assert response.status_code == 409

@@ -109,7 +109,12 @@ staff the humans who supervise them" is an angle. "AI tutoring adoption is
 growing" is a summary, and a summary is what comes back.
 
 **Within the hour.** Job B drafts each ticked row and assigns a slot. For the
-first twenty posts it produces two variants, so they can see the range.
+first twenty posts it produces two variants, so they can see the range. A
+ticked row does not have to wait for that hourly run: **Draft now**, next to
+the angle field once it is ticked and the angle is written, drafts it on the
+spot. The same button, relabelled **Redraft now**, appears on a row sent back
+with a note - both run the exact function Job B runs on its own schedule,
+restricted to that one row.
 
 **Then, per draft, one of four buttons:**
 

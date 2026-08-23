@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from .. import runner
 from ..config import Config
 from ..curate import curate as run_curate
-from ..draft import draft_all as run_draft_all
+from ..draft import draft_all as run_draft_all, rows_to_draft, rows_to_revise
 from ..publish_now import publish_one as run_publish_one
 from ..db.schema import Tenant
 from ..db.store import PipelineStore
@@ -60,7 +60,7 @@ _PUBLISH_NOW_LOCK = threading.Lock()
 # What the interface may offer, per status. Derived from the state machine so
 # a button cannot exist for a move the store would refuse.
 ACTIONS: Dict[str, List[str]] = {
-    Status.NEW: ["edit", "skip"],
+    Status.NEW: ["edit", "skip", "draft"],
     Status.DRAFTED: ["edit", "approve", "revise", "skip"],
     Status.REVISE: ["edit", "skip", "redraft"],
     Status.APPROVED: ["edit", "unapprove", "skip", "publish_now", "reschedule"],
@@ -140,18 +140,25 @@ def redraft_now(
     store: PipelineStore = Depends(current_store),
     cfg: Config = Depends(config),
 ) -> dict:
-    """Regenerate a sent-back row right now, instead of waiting for the hourly job.
+    """Draft a ticked row, or regenerate one sent back, right now.
 
-    Only valid on a REVISE row - the state the store already refuses to let
-    the interface skip past. Runs the exact function Job B runs on its own
-    schedule, restricted to this one row, so a manual redraft and the
+    Valid on the same two cases Job B itself acts on - a NEW row that is
+    ticked and has an angle, or a REVISE row - reusing its own eligibility
+    check rather than restating it, so this can never accept a row the
+    scheduled job would skip. Runs the exact function Job B runs on its own
+    schedule, restricted to this one row, so a manual draft and the
     scheduled one are provably the same code path.
     """
     row = find(store, row_id)
-    if row.status != Status.REVISE:
+    if not (rows_to_draft([row]) or rows_to_revise([row])):
+        if row.status == Status.NEW:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "tick this row and give it an angle before drafting",
+            )
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"this row is {row.status}, not sent back for revision",
+            f"this row is {row.status}, not ready to draft",
         )
 
     with ON_DEMAND_LLM_LOCK, closing(runner.runs("draft", cfg, tenant_id=tenant.id)) as runs:

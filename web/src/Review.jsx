@@ -68,13 +68,13 @@ export default function Review() {
       {fetchMsg && <p className="muted" style={{ marginTop: -10 }}>{fetchMsg}</p>}
 
       {sorted.map((row) => (
-        <RowCard key={row.id} row={row} busy={busy} act={act} />
+        <RowCard key={row.id} row={row} busy={busy} act={act} reload={rows.reload} />
       ))}
     </>
   )
 }
 
-function RowCard({ row, busy, act }) {
+function RowCard({ row, busy, act, reload }) {
   const [revising, setRevising] = useState(false)
   const [note, setNote] = useState('')
   const [scheduling, setScheduling] = useState(false)
@@ -116,8 +116,19 @@ function RowCard({ row, busy, act }) {
             id={row.id}
             value={row.angle}
             placeholder="e.g. the compliance-training numbers everyone quotes are measuring the wrong thing"
-            onSave={(v) => api.editRow(row.id, { angle: v })}
+            onSave={(v) => api.editRow(row.id, { angle: v }).then(reload)}
           />
+          {row.selected && row.angle?.trim() && (
+            <div className="actions">
+              <button
+                className="action primary"
+                disabled={!!busy}
+                onClick={() => act(() => api.redraftNow(row.id))}
+              >
+                {busy === 'working' ? 'Drafting…' : 'Draft now'}
+              </button>
+            </div>
+          )}
         </>
       )}
 
