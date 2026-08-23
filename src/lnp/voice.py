@@ -27,7 +27,7 @@ from . import log
 from .config import Config
 from .llm import complete, complete_json
 from .models import Row, Status
-from .util import normalized_edit_distance
+from .util import iso, normalized_edit_distance
 
 logger = log.get(__name__)
 
@@ -114,6 +114,32 @@ def amend_card_in_store(store, rules: Sequence[str]) -> List[str]:
     if written:
         store.save_voice_card(card)
         logger.info("voice card amended", extra={"rules": written})
+    return written
+
+
+def apply_accepted(store, dry_run: bool = False) -> List[str]:
+    """Write every ticked-but-not-yet-applied amendment into the card.
+
+    Idempotent by rule text: a rule already present in the card (ticked
+    again, or proposed twice in different words) is marked applied without
+    being inserted a second time, so calling this after every accept - not
+    once a week - never duplicates a rule that was already written in.
+    """
+    pending = store.pending_amendments()
+    if not pending:
+        return []
+    rules = [r.rule for r in pending if r.rule.strip()]
+    if dry_run:
+        return rules
+
+    written = amend_card_in_store(store, rules)
+    stamp = iso()
+    for record in pending:
+        store.mark_amendment_applied(
+            record,
+            stamp if record.rule in written else "duplicate of an existing rule",
+        )
+    logger.info("accepted amendments applied", extra={"count": len(written)})
     return written
 
 

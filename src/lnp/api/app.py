@@ -15,12 +15,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .. import log
+from .. import log, publish_loop
 from ..config import REPO_ROOT
 from ..llm import UsageCapExceeded
 from ..db.store import StoreError
 from ..tokens import TokenError
 from . import security
+from .deps import PUBLISH_NOW_LOCK, config as get_config
 from .routes_account import router as account_router
 from .routes_auth import router as auth_router
 from .routes_pipeline import router as pipeline_router
@@ -43,6 +44,13 @@ REQUIRED_ENV = (
     "LNP_AUTH_CLIENT_SECRET",
 )
 OPTIONAL_ENV = ("ANTHROPIC_API_KEY", "SLACK_WEBHOOK_URL")
+
+# Opt-in, not opt-out: create_app() runs on every test and on every import of
+# this module (see `app = create_app()` below), and a background thread that
+# fired off real publish attempts in that context would be a hazard, not a
+# feature. Only scripts/serve.sh - the actual web server's start command -
+# sets this before the process starts.
+PUBLISH_CHECKER_ENV = "LNP_PUBLISH_CHECKER"
 
 
 def config_report() -> dict:
@@ -100,6 +108,9 @@ def create_app() -> FastAPI:
         response = JSONResponse({"ok": True})
         response.delete_cookie(security.SESSION_COOKIE, path="/")
         return response
+
+    if os.environ.get(PUBLISH_CHECKER_ENV, "").strip().lower() in {"1", "true", "yes"}:
+        publish_loop.start(get_config(), PUBLISH_NOW_LOCK)
 
     if WEB_DIST.is_dir():
         app.mount(

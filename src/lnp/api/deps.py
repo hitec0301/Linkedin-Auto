@@ -32,6 +32,17 @@ _config: Optional[Config] = None
 # against each other.
 ON_DEMAND_LLM_LOCK = threading.Lock()
 
+# store.transition()'s guard checks the in-memory row it is handed, not a
+# fresh read under a database lock, because every existing writer used to be
+# single-threaded and sequential (one cron job at a time). Two things can now
+# reach the same row's publish path at once: a person clicking "Post now" and
+# the background publish checker's own periodic sweep. This lock serialises
+# both against each other, tenant-wide - it does not scope per row, because
+# the checker processes one tenant's due rows in a batch and a finer lock
+# would not stop it from racing a "Post now" click on a different row in the
+# same batch.
+PUBLISH_NOW_LOCK = threading.Lock()
+
 
 def config() -> Config:
     global _config

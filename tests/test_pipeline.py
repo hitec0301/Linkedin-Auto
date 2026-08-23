@@ -1141,6 +1141,175 @@ def test_publish_one_refuses_while_paused_without_touching_linkedin():
     assert "paused" in updated.Error.lower()
 
 
+# ---- lnp.redraft: "Redraft with AI" on any row, at any stage -------------
+
+
+def test_redraft_now_drafts_a_new_row(monkeypatch):
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+
+    row = Row(ID="01A", Status=Status.NEW, SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft", lambda config, row, ctx, **kw: "A fresh draft. " * 20)
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "Procurement cycles decide adoption.")
+
+    assert result.cloned is False
+    assert result.correction is False
+    assert result.proposals == 0
+    updated = rows_of(store)[0]
+    assert updated.status == Status.DRAFTED
+    assert updated.Angle == "Procurement cycles decide adoption."
+    assert "fresh draft" in updated.DraftText
+    assert updated.ScheduledFor
+
+
+def test_redraft_now_revises_in_place_and_lands_on_drafted(monkeypatch):
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+
+    row = Row(ID="01A", Status=Status.DRAFTED, DraftText="old draft", Angle="original angle",
+              RevisionCount="1", SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+    monkeypatch.setattr(voice_mod, "propose_rules", lambda config, items, card, **kw: [])
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "Cut the closing question.")
+
+    assert result.cloned is False
+    assert result.correction is True
+    updated = rows_of(store)[0]
+    assert updated.status == Status.DRAFTED
+    assert updated.RevisionCount == "2"
+    assert updated.RevisionNote == ""
+    assert "revised draft" in updated.DraftText
+    assert updated.Angle == "original angle"   # untouched by a revision
+
+
+def test_redraft_now_files_a_proposal_from_the_correction(monkeypatch):
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+    from lnp.voice import Proposal
+
+    row = Row(ID="01A", Status=Status.DRAFTED, DraftText="old draft", Angle="an angle",
+              SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+    monkeypatch.setattr(
+        voice_mod, "propose_rules",
+        lambda config, items, card, **kw: [
+            Proposal(rule="Cut the closing question.", rationale="asked directly", signal="NOTE"),
+        ],
+    )
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "Cut the closing question.")
+
+    assert result.proposals == 1
+    queued = store.amendment_records()
+    assert len(queued) == 1
+    assert queued[0].rule == "Cut the closing question."
+    assert queued[0].accepted is False
+
+
+def test_redraft_now_does_not_queue_the_same_proposal_twice(monkeypatch):
+    """A correction typed again before the first proposal is decided must not
+    file a near-duplicate - it should still be sitting there, unaccepted."""
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+    from lnp.voice import Proposal
+
+    rows = [
+        Row(ID="01A", Status=Status.DRAFTED, DraftText="old draft a", Angle="an angle",
+            SourceURL="https://x.test/a", SourceTitle="A title"),
+        Row(ID="01B", Status=Status.DRAFTED, DraftText="old draft b", Angle="another angle",
+            SourceURL="https://x.test/b", SourceTitle="B title"),
+    ]
+    store = make_store(rows, tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+    monkeypatch.setattr(
+        voice_mod, "propose_rules",
+        lambda config, items, card, **kw: [
+            Proposal(rule="Cut the closing question.", rationale="asked directly", signal="NOTE"),
+        ],
+    )
+
+    first = redraft_mod.redraft_now(run, rows_of(store)[0], "Cut the closing question.")
+    second = redraft_mod.redraft_now(run, [r for r in rows_of(store) if r.ID == "01B"][0],
+                                      "Cut the closing question, please.")
+
+    assert first.proposals == 1
+    assert second.proposals == 0   # already queued, not yet decided
+    assert len(store.amendment_records()) == 1
+
+
+def test_redraft_now_clones_a_posted_row_and_leaves_it_untouched(monkeypatch):
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+    from lnp.util import iso
+
+    row = Row(ID="01OLD", Status=Status.POSTED, DraftText="what shipped", FinalText="what shipped",
+              PostURN="urn:li:share:1", PostedAt=iso(utcnow()),
+              SourceURL="https://x.test/a", SourceTitle="A title", Audience="AUD_CORPORATE")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft", lambda config, row, ctx, **kw: "A brand new take. " * 20)
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "A completely different angle.")
+
+    assert result.cloned is True
+    assert result.correction is False
+    rows = {r.ID: r for r in rows_of(store)}
+    assert len(rows) == 2
+    original = rows["01OLD"]
+    assert original.status == Status.POSTED
+    assert original.PostURN == "urn:li:share:1"     # untouched
+    assert original.DraftText == "what shipped"      # untouched
+    clone = rows[result.row.ID]
+    assert clone.status == Status.DRAFTED
+    assert clone.Audience == "AUD_CORPORATE"         # carried over from the source
+    assert "brand new take" in clone.DraftText
+
+
+def test_redraft_now_on_an_approved_row_returns_it_to_drafted(monkeypatch):
+    """Redrafting something about to publish requires a fresh decision to approve it again."""
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+
+    row = Row(ID="01A", Status=Status.APPROVED, DraftText="old draft", Angle="an angle",
+              ScheduledFor=(utcnow() + timedelta(days=1)).isoformat(),
+              SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+    monkeypatch.setattr(voice_mod, "propose_rules", lambda config, items, card, **kw: [])
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "Make it sharper.")
+
+    assert result.row.status == Status.DRAFTED
+
+
+def test_redraft_now_refuses_a_row_being_published():
+    from lnp import redraft as redraft_mod
+
+    row = Row(ID="01A", Status=Status.POSTING, DraftText="in flight",
+              SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    with pytest.raises(redraft_mod.RedraftRefused):
+        redraft_mod.redraft_now(run, rows_of(store)[0], "anything")
+
+
 def test_publish_stops_at_the_kill_switch(monkeypatch, capsys):
     row = Row(ID="01ROW", Status=Status.APPROVED,
               ScheduledFor=(utcnow() - timedelta(minutes=10)).isoformat(),

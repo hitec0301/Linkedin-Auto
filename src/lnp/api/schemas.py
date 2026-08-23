@@ -11,7 +11,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from ..models import COLUMNS, Row
+from ..models import ALL_STATUSES, COLUMNS, Row
 
 
 class RowOut(BaseModel):
@@ -24,10 +24,11 @@ class RowOut(BaseModel):
     why_it_matters: str = ""
     relevance_score: float = 0.0
     selected: bool = False
-    angle: str = ""
+    # The angle before a draft exists, the revision instruction once it does -
+    # one field the interface shows in one place for the row's whole life.
+    take: str = ""
     draft_text: str = ""
     final_text: str = ""
-    revision_note: str = ""
     revision_count: int = 0
     char_count: int = 0
     status: str = ""
@@ -37,13 +38,9 @@ class RowOut(BaseModel):
     edit_distance: float = 0.0
     reach: int = 0
     error: str = ""
-    # What the interface is allowed to offer on this row, worked out from the
-    # state machine rather than re-derived in the browser. Two copies of a
-    # rule is one copy too many.
-    allowed_actions: List[str] = Field(default_factory=list)
 
     @classmethod
-    def of(cls, row: Row, allowed: List[str]) -> "RowOut":
+    def of(cls, row: Row) -> "RowOut":
         return cls(
             id=row.ID,
             created_at=row.CreatedAt,
@@ -54,10 +51,9 @@ class RowOut(BaseModel):
             why_it_matters=row.WhyItMatters,
             relevance_score=row.relevance_score,
             selected=row.is_selected,
-            angle=row.Angle,
+            take=row.Angle if not row.DraftText else (row.RevisionNote or row.Angle),
             draft_text=row.DraftText,
             final_text=row.FinalText,
-            revision_note=row.RevisionNote,
             revision_count=row.revision_count,
             char_count=int(float(row.CharCount or 0)),
             status=row.status,
@@ -67,7 +63,6 @@ class RowOut(BaseModel):
             edit_distance=float(row.EditDistance or 0),
             reach=int(float(row.Reach or 0)),
             error=row.Error,
-            allowed_actions=allowed,
         )
 
 
@@ -75,47 +70,41 @@ class RowEdit(BaseModel):
     """The columns a person may change. Deliberately short."""
 
     selected: Optional[bool] = None
-    angle: Optional[str] = None
+    take: Optional[str] = None
     final_text: Optional[str] = None
     reach: Optional[int] = None
 
 
-class ApproveIn(BaseModel):
-    """How this one post should go out. Both are optional and mutually exclusive.
+class StatusIn(BaseModel):
+    status: str
 
-    Neither set: the row keeps the slot Job B already assigned it, and the
-    next scheduled publish run posts it when that arrives - today's default.
+    @field_validator("status")
+    @classmethod
+    def a_real_status(cls, value: str) -> str:
+        value = value.strip().upper()
+        if value not in ALL_STATUSES:
+            raise ValueError(f"{value!r} is not a status this pipeline has")
+        return value
+
+
+class RedraftIn(BaseModel):
+    """The take, sent along with the redraft request itself.
+
+    Rather than relying on a prior autosave of the same field having
+    already landed - the button and the field are right next to each
+    other, and the request should carry exactly what is in the box when it
+    is pressed, not whatever the last debounce happened to save.
     """
 
-    scheduled_for: Optional[str] = None  # overrides the auto-assigned slot
-    publish_now: bool = False  # bypass scheduling; attempt to post immediately
+    take: str = ""
 
-    @field_validator("scheduled_for")
-    @classmethod
-    def blank_is_none(cls, value: Optional[str]) -> Optional[str]:
-        value = (value or "").strip()
-        return value or None
+
+class BulkSkipIn(BaseModel):
+    ids: List[str] = Field(min_length=1, max_length=200)
 
 
 class ScheduleIn(BaseModel):
     scheduled_for: str = Field(min_length=1)
-
-
-class ReviseIn(BaseModel):
-    note: str = Field(min_length=1, max_length=2000)
-
-    @field_validator("note")
-    @classmethod
-    def not_only_whitespace(cls, value: str) -> str:
-        """A blank note is not an instruction.
-
-        Sending a draft back with nothing to act on wastes a model call and
-        gives the human the same text again, which reads like the tool ignored
-        them.
-        """
-        if not value.strip():
-            raise ValueError("write what you want changed")
-        return value.strip()
 
 
 class MeOut(BaseModel):
@@ -222,7 +211,6 @@ class SettingsIn(BaseModel):
 
 ROW_COLUMN_BY_FIELD = {
     "selected": "Selected",
-    "angle": "Angle",
     "final_text": "FinalText",
     "reach": "Reach",
 }

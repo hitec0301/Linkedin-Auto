@@ -116,6 +116,12 @@ publish:
   api_version: "202605"
   request_timeout_seconds: 30
 
+publish_checker:
+  # How often the in-process background thread checks for approved rows
+  # whose ScheduledFor has arrived. This is the one thing still on a clock -
+  # everything else in the pipeline runs on request instead.
+  interval_seconds: 60
+
 schedule:
   timezone: America/New_York
   # Slots assigned to newly drafted rows, in local time.

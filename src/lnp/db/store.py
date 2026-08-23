@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from .. import log
 from ..models import (
     COLUMNS,
+    LEGAL_TRANSITIONS,
     Row,
     Status,
     assert_human_writable,
@@ -328,6 +329,35 @@ class PipelineStore:
         payload["Status"] = target
         self.write(row, payload, allow_revision_note=allow_revision_note)
         logger.info("status changed", extra={"row_id": row.ID, "to": target})
+
+    def set_status_freely(self, row: Row, target: str) -> None:
+        """Move a row directly to any status, bypassing the transition guard.
+
+        For the one interface action deliberately not gated by the state
+        machine: the status dropdown. A target that is not a real status is
+        still refused, and POSTING is refused outright - it is not a status
+        a person sets, it is the marker the publish path writes immediately
+        before calling LinkedIn and clears immediately after, and setting it
+        by hand is the one way to make an unpublished row look mid-flight.
+        Everything else moves on request. An irregular jump - one the state
+        machine itself would not have allowed - is logged rather than
+        blocked, so the safety net removed from the interface is not also
+        removed from the record of what happened.
+        """
+        if target == Status.POSTING:
+            raise StoreError(
+                "POSTING is a marker the publish job sets itself while a "
+                "post is going out, not a status you can choose"
+            )
+        if target not in LEGAL_TRANSITIONS:
+            raise StoreError(f"unknown status {target!r}")
+        if target != row.status and target not in LEGAL_TRANSITIONS.get(row.status, set()):
+            logger.warning(
+                "status set outside the normal state machine",
+                extra={"row_id": row.ID, "from": row.status, "to": target},
+            )
+        self.write(row, {"Status": target})
+        logger.info("status changed (free choice)", extra={"row_id": row.ID, "to": target})
 
     def published_rows(self) -> List[Row]:
         return [r for r in self.pipeline_rows() if r.status == Status.POSTED]

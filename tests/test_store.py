@@ -88,6 +88,29 @@ def test_legal_transition_writes_both_status_and_fields():
     assert store.pipeline_rows()[0].Status == Status.POSTING
 
 
+def test_set_status_freely_allows_a_jump_the_state_machine_would_refuse():
+    """The dropdown's whole point: NEW straight to APPROVED is not a legal edge."""
+    store = make_store([Row(ID="01AAA", Status=Status.NEW)])
+    row = store.pipeline_rows()[0]
+    store.set_status_freely(row, Status.APPROVED)
+    assert store.pipeline_rows()[0].Status == Status.APPROVED
+
+
+def test_set_status_freely_refuses_posting():
+    store = make_store([Row(ID="01AAA", Status=Status.APPROVED, DraftText="d")])
+    row = store.pipeline_rows()[0]
+    with pytest.raises(StoreError):
+        store.set_status_freely(row, Status.POSTING)
+    assert store.pipeline_rows()[0].Status == Status.APPROVED
+
+
+def test_set_status_freely_refuses_an_unknown_status():
+    store = make_store([Row(ID="01AAA", Status=Status.NEW)])
+    row = store.pipeline_rows()[0]
+    with pytest.raises(StoreError):
+        store.set_status_freely(row, "MADE_UP_STATUS")
+
+
 def test_revision_note_is_writable_only_on_the_revision_path():
     store = make_store([Row(ID="01AAA", Status=Status.REVISE, RevisionNote="shorter")])
     row = store.pipeline_rows()[0]
@@ -686,7 +709,6 @@ def test_alerts_name_the_account_by_email_not_by_token(accounts, monkeypatch):
 
 def test_the_voice_job_never_ticks_its_own_proposals(bare_accounts):
     """The model does not get to accept its own instructions."""
-    import jobs.voice_amend as voice_job
     from lnp import runner, voice
     from lnp.db import session as session_mod
     from lnp.db.schema import VoiceCard
@@ -710,13 +732,12 @@ def test_the_voice_job_never_ticks_its_own_proposals(bare_accounts):
     class Args:
         dry_run = False
 
-    assert voice_job.apply_accepted(run.store, Args.dry_run) == []
+    assert voice.apply_accepted(run.store, Args.dry_run) == []
     assert voice.AMENDMENTS_BEGIN in run.store.load_voice_card()
     assert "No em dashes" not in run.store.load_voice_card()
 
 
 def test_an_accepted_rule_reaches_the_card_exactly_once(bare_accounts):
-    import jobs.voice_amend as voice_job
     from lnp import runner, voice
     from lnp.db import session as session_mod
     from lnp.db.schema import VoiceCard
@@ -731,9 +752,9 @@ def test_an_accepted_rule_reaches_the_card_exactly_once(bare_accounts):
     run.store.append_amendments([
         AmendmentRecord(rule="No em dashes", signal="DIFF", accepted=True),
     ])
-    assert voice_job.apply_accepted(run.store, False) == ["No em dashes"]
+    assert voice.apply_accepted(run.store, False) == ["No em dashes"]
     card = run.store.load_voice_card()
     assert card.count("No em dashes") == 1
     # Nothing pending means a second run is a no-op, not a duplicate.
-    assert voice_job.apply_accepted(run.store, False) == []
+    assert voice.apply_accepted(run.store, False) == []
     assert run.store.load_voice_card().count("No em dashes") == 1

@@ -255,10 +255,11 @@ def decide_amendment(
 ) -> AmendmentOut:
     """Tick or untick a proposed rule.
 
-    This endpoint is the only way `accepted` ever becomes true. Nothing the
-    model produces reaches the voice card without a person doing this, and
-    accepting here still does not write the card — the weekly job does, so
-    there is one place where the card changes.
+    This endpoint is the only way `accepted` ever becomes true, and
+    accepting writes it into the voice card immediately - there is no
+    weekly job left to do that later, so this is the only moment it can
+    happen. Nothing the model produces reaches the card without a person
+    doing this first.
     """
     from ..db.schema import VoiceAmendment
 
@@ -272,6 +273,8 @@ def decide_amendment(
         )
     found.accepted = body.accepted
     session.commit()
+    if body.accepted:
+        voice.apply_accepted(store)
     return AmendmentOut(
         id=found.id, created_at=iso(found.created_at), rule=found.rule,
         rationale=found.rationale, signal=found.signal,
