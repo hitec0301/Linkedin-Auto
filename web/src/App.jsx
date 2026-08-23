@@ -24,11 +24,30 @@ function tabFromPath() {
   return TABS.some(([id]) => id === name) ? name : 'review'
 }
 
+function systemPrefersDark() {
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false
+}
+
+// No preference saved yet - the toggle still needs a starting label, so it
+// reads what's currently painted (the pre-paint script in index.html already
+// applied any saved choice; with none saved, that's just the system's).
+function currentTheme() {
+  return document.documentElement.dataset.theme || (systemPrefersDark() ? 'dark' : 'light')
+}
+
 export default function App() {
   const [me, setMe] = useState(null)
   const [loading, setLoading] = useState(true)
   const [tab, setTab] = useState(tabFromPath)
   const [error, setError] = useState('')
+  const [theme, setTheme] = useState(currentTheme)
+
+  function toggleTheme() {
+    const next = theme === 'dark' ? 'light' : 'dark'
+    document.documentElement.dataset.theme = next
+    try { localStorage.setItem('theme', next) } catch { /* private browsing, etc. */ }
+    setTheme(next)
+  }
 
   const refresh = useCallback(async () => {
     try {
@@ -80,6 +99,9 @@ export default function App() {
             </button>
           ))}
         </nav>
+        <button className="theme-toggle" onClick={toggleTheme} title="Switch to the other theme">
+          {theme === 'dark' ? 'Light mode' : 'Dark mode'}
+        </button>
         <button
           className="action"
           onClick={async () => { await api.signOut(); setMe(null) }}
