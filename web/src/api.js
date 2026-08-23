@@ -69,6 +69,14 @@ export const api = {
   usage: () => request('/api/usage'),
   health: () => request('/api/health-metric'),
 
+  discussions: () => request('/api/discussions'),
+  discussion: (id) => request(`/api/discussions/${id}`),
+  startDiscussion: (body) => request('/api/discussions', { method: 'POST', body }),
+  postDiscussionMessage: (id, content) =>
+    request(`/api/discussions/${id}/messages`, { method: 'POST', body: { content } }),
+  turnIntoPost: (id) => request(`/api/discussions/${id}/turn-into-post`, { method: 'POST' }),
+  deleteDiscussion: (id) => request(`/api/discussions/${id}`, { method: 'DELETE' }),
+
   saveLinkedInApp: (body) => request('/auth/linkedin/app', { method: 'PUT', body }),
   disconnectLinkedIn: () => request('/auth/linkedin/connect', { method: 'DELETE' }),
 }

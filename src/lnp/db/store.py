@@ -43,6 +43,7 @@ from ..models import (
 )
 from ..util import iso, parse_bool, parse_dt, parse_float, parse_int, utcnow
 from .schema import (
+    Discussion,
     Feedback,
     PipelineRow,
     Setting,
@@ -103,6 +104,20 @@ class AmendmentRecord:
     def is_pending(self) -> bool:
         """Ticked by the human and not yet written into the card."""
         return self.accepted and not (self.applied or "").strip()
+
+
+@dataclass
+class DiscussionRecord:
+    """A scratchpad conversation, as stored."""
+
+    id: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    source_url: str = ""
+    source_title: str = ""
+    started_from_row_id: str = ""
+    row_id: str = ""
+    messages: List[Dict[str, str]] = field(default_factory=list)
 
 
 # (Row field, ORM attribute, kind). The order is COLUMNS' order, and the test
@@ -551,6 +566,75 @@ class PipelineStore:
         if found is None or found.tenant_id != self.tenant_id:
             raise StoreError(f"amendment {record.id} does not exist")
         found.applied = value
+        self.session.commit()
+
+    # ---- discussions -------------------------------------------------------
+
+    @staticmethod
+    def _discussion_record(d: Discussion) -> DiscussionRecord:
+        return DiscussionRecord(
+            id=d.id,
+            created_at=iso(d.created_at) if d.created_at else "",
+            updated_at=iso(d.updated_at) if d.updated_at else "",
+            source_url=d.source_url,
+            source_title=d.source_title,
+            started_from_row_id=d.started_from_row_id,
+            row_id=d.row_id,
+            messages=list(d.messages or []),
+        )
+
+    def discussions(self) -> List[DiscussionRecord]:
+        stmt = (
+            select(Discussion)
+            .where(Discussion.tenant_id == self.tenant_id)
+            .order_by(Discussion.updated_at.desc())
+        )
+        return [self._discussion_record(d) for d in self.session.scalars(stmt)]
+
+    def discussion(self, discussion_id: str) -> DiscussionRecord:
+        found = self.session.get(Discussion, discussion_id)
+        if found is None or found.tenant_id != self.tenant_id:
+            raise StoreError(f"discussion {discussion_id} does not exist")
+        return self._discussion_record(found)
+
+    def create_discussion(
+        self, *, source_url: str, source_title: str, started_from_row_id: str,
+        messages: Sequence[Dict[str, str]],
+    ) -> DiscussionRecord:
+        found = Discussion(
+            id=ulid.new().str,
+            tenant_id=self.tenant_id,
+            source_url=source_url,
+            source_title=source_title,
+            started_from_row_id=started_from_row_id,
+            messages=list(messages),
+        )
+        self.session.add(found)
+        self.session.commit()
+        return self._discussion_record(found)
+
+    def append_discussion_messages(
+        self, discussion_id: str, messages: Sequence[Dict[str, str]]
+    ) -> DiscussionRecord:
+        found = self.session.get(Discussion, discussion_id)
+        if found is None or found.tenant_id != self.tenant_id:
+            raise StoreError(f"discussion {discussion_id} does not exist")
+        found.messages = list(found.messages or []) + list(messages)
+        self.session.commit()
+        return self._discussion_record(found)
+
+    def mark_discussion_committed(self, discussion_id: str, row_id: str) -> None:
+        found = self.session.get(Discussion, discussion_id)
+        if found is None or found.tenant_id != self.tenant_id:
+            raise StoreError(f"discussion {discussion_id} does not exist")
+        found.row_id = row_id
+        self.session.commit()
+
+    def delete_discussion(self, discussion_id: str) -> None:
+        found = self.session.get(Discussion, discussion_id)
+        if found is None or found.tenant_id != self.tenant_id:
+            raise StoreError(f"discussion {discussion_id} does not exist")
+        self.session.delete(found)
         self.session.commit()
 
     # ---- voice card ------------------------------------------------------

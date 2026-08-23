@@ -10,7 +10,7 @@ import RowCard from './RowCard.jsx'
 // competing with the ones still waiting on a decision.
 const ORDER = ['DRAFTED', 'REVISE', 'APPROVED', 'NEW', 'FAILED', 'POSTING']
 
-export default function Review() {
+export default function Review({ onDiscuss }) {
   const rows = useAsync(() => api.rows(ORDER.join(',')), [])
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
@@ -126,6 +126,7 @@ export default function Review() {
           selectable
           selected={picked.has(row.id)}
           onToggleSelect={toggle}
+          onDiscuss={onDiscuss}
         />
       ))}
     </>

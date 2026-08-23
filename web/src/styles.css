@@ -183,6 +183,25 @@ th { color: var(--muted); font-weight: 500; font-size: 13px; }
 .signin { max-width: 460px; margin: 14vh auto; text-align: center; }
 .signin p { color: var(--muted); }
 
+/* Discuss: a source, a chat, and the button that turns it into a post. */
+button.discussion-row {
+  display: block; width: 100%; text-align: left; font: inherit;
+  cursor: pointer; color: inherit;
+}
+button.discussion-row:hover { border-color: var(--muted); }
+
+.chat-thread { display: flex; flex-direction: column; gap: 10px; margin: 14px 0; }
+.chat-msg {
+  padding: 10px 14px; border-radius: 10px; font-size: 14.5px; line-height: 1.55;
+  max-width: 85%; white-space: pre-wrap;
+}
+.chat-msg.chat-assistant {
+  background: var(--bg); border: 1px solid var(--line); align-self: flex-start;
+}
+.chat-msg.chat-user {
+  background: var(--ink); color: var(--bg); align-self: flex-end;
+}
+
 /* Dark mode: system preference by default, overridden either way by the
  * toggle in the header. The toggle sets data-theme and stores it, so a
  * saved choice always wins over whatever the OS says. */

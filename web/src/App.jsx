@@ -2,18 +2,20 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from './api.js'
 import Review from './Review.jsx'
 import Published from './Published.jsx'
+import Discuss from './Discuss.jsx'
 import Voice from './Voice.jsx'
 import Sources from './Sources.jsx'
 import Setup from './Setup.jsx'
 import SignIn from './SignIn.jsx'
 import { Notice } from './bits.jsx'
 
-// Routing is a string. There are five screens and no nested state, so a
+// Routing is a string. There are six screens and no nested state, so a
 // router would be a dependency bought to solve a problem this app does not
 // have. The path is kept in sync so a reload and the back button both work.
 const TABS = [
   ['review', 'Review'],
   ['published', 'Published'],
+  ['discuss', 'Discuss'],
   ['voice', 'Voice'],
   ['sources', 'Sources'],
   ['setup', 'Setup'],
@@ -41,6 +43,7 @@ export default function App() {
   const [tab, setTab] = useState(tabFromPath)
   const [error, setError] = useState('')
   const [theme, setTheme] = useState(currentTheme)
+  const [discussSeed, setDiscussSeed] = useState(null)
 
   function toggleTheme() {
     const next = theme === 'dark' ? 'light' : 'dark'
@@ -69,8 +72,9 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPop)
   }, [])
 
-  function go(next) {
+  function go(next, seed) {
     setTab(next)
+    if (seed !== undefined) setDiscussSeed(seed)
     window.history.pushState({}, '', `/${next}`)
   }
 
@@ -129,8 +133,13 @@ export default function App() {
         </Notice>
       )}
 
-      {active === 'review' && <Review me={me} />}
+      {active === 'review' && (
+        <Review me={me} onDiscuss={(seed) => go('discuss', seed)} />
+      )}
       {active === 'published' && <Published />}
+      {active === 'discuss' && (
+        <Discuss seed={discussSeed} onSeedConsumed={() => setDiscussSeed(null)} go={go} />
+      )}
       {active === 'voice' && <Voice />}
       {active === 'sources' && <Sources me={me} go={go} />}
       {active === 'setup' && <Setup me={me} onChange={refresh} go={go} />}

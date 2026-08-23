@@ -628,6 +628,216 @@ def test_a_self_started_row_can_be_redrafted_like_any_other(api, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Discuss: explore a source, argue with it, before it becomes a post
+# --------------------------------------------------------------------------
+
+
+def test_create_discussion_summarizes_the_source(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize",
+        lambda config, **kw: ("A neutral summary of the article.", Extract("body", True)),
+    )
+
+    body = api.post("/api/discussions", json={
+        "source_url": "https://example.test/an-article",
+        "source_title": "An article",
+    }).json()
+    assert body["source_url"] == "https://example.test/an-article"
+    assert body["messages"] == [
+        {"role": "assistant", "content": "A neutral summary of the article."}
+    ]
+    assert body["row_id"] == ""
+    assert body["started_from_row_id"] == ""
+
+    listed = [d["id"] for d in api.get("/api/discussions").json()]
+    assert body["id"] in listed
+    assert api.get(f"/api/discussions/{body['id']}").json()["id"] == body["id"]
+
+
+def test_create_discussion_rejects_a_bad_url(api):
+    response = api.post("/api/discussions", json={"source_url": "not a url"})
+    assert response.status_code == 422
+
+
+def test_create_discussion_can_start_from_an_existing_row(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    seed([Row(ID="01SRC", Status=Status.NEW, SourceURL="https://x.test/a")])
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+
+    body = api.post("/api/discussions", json={
+        "source_url": "https://x.test/a", "row_id": "01SRC",
+    }).json()
+    assert body["started_from_row_id"] == "01SRC"
+
+
+def test_create_discussion_refuses_an_unknown_row_id(api):
+    response = api.post("/api/discussions", json={
+        "source_url": "https://x.test/a", "row_id": "01NOPE",
+    })
+    assert response.status_code == 404
+
+
+def test_post_message_appends_the_exchange(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "A pushback question.")
+    body = api.post(
+        f"/api/discussions/{created['id']}/messages", json={"content": "I think this is right."}
+    ).json()
+    assert body["messages"] == [
+        {"role": "assistant", "content": "Summary."},
+        {"role": "user", "content": "I think this is right."},
+        {"role": "assistant", "content": "A pushback question."},
+    ]
+
+
+def test_post_message_rejects_a_blank_message(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    response = api.post(f"/api/discussions/{created['id']}/messages", json={"content": "  "})
+    assert response.status_code == 422
+
+
+def test_turn_into_post_creates_a_new_row_when_standalone(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={
+        "source_url": "https://x.test/a", "source_title": "A title",
+    }).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+
+    monkeypatch.setattr(
+        discuss_mod, "synthesize_take", lambda config, **kw: "The synthesized thesis."
+    )
+    row = api.post(f"/api/discussions/{created['id']}/turn-into-post").json()
+    assert row["status"] == "NEW"
+    assert row["source_url"] == "https://x.test/a"
+    assert row["take"] == "The synthesized thesis."
+
+    listed = [r["id"] for r in api.get("/api/rows").json()]
+    assert row["id"] in listed
+
+    discussion = api.get(f"/api/discussions/{created['id']}").json()
+    assert discussion["row_id"] == row["id"]
+
+
+def test_turn_into_post_updates_the_row_it_started_from(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    seed([Row(ID="01SRC", Status=Status.NEW, SourceURL="https://x.test/a")])
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={
+        "source_url": "https://x.test/a", "row_id": "01SRC",
+    }).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+
+    monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+    row = api.post(f"/api/discussions/{created['id']}/turn-into-post").json()
+    assert row["id"] == "01SRC"
+    assert row["take"] == "The thesis."
+    assert len(api.get("/api/rows").json()) == 1  # updated in place, not duplicated
+
+
+def test_turn_into_post_refuses_before_any_argument(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    response = api.post(f"/api/discussions/{created['id']}/turn-into-post")
+    assert response.status_code == 400
+
+
+def test_turn_into_post_refuses_a_second_time(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+    monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+
+    assert api.post(f"/api/discussions/{created['id']}/turn-into-post").status_code == 200
+    assert api.post(f"/api/discussions/{created['id']}/turn-into-post").status_code == 409
+
+
+def test_messages_refused_once_a_discussion_became_a_post(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+    monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+    api.post(f"/api/discussions/{created['id']}/turn-into-post")
+
+    response = api.post(
+        f"/api/discussions/{created['id']}/messages", json={"content": "one more thing"}
+    )
+    assert response.status_code == 409
+
+
+def test_delete_discussion(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    assert api.delete(f"/api/discussions/{created['id']}").status_code == 204
+    assert api.get(f"/api/discussions/{created['id']}").status_code == 404
+
+
+def test_discussions_are_only_this_accounts(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+
+    assert store_for(OTHER).discussions() == []
+    assert api.get("/api/discussions").json()[0]["id"] == created["id"]
+
+
+# --------------------------------------------------------------------------
 # On-demand curate: the Setup screen's "fetch candidates now"
 # --------------------------------------------------------------------------
 

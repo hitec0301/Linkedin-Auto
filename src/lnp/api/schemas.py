@@ -128,6 +128,52 @@ class ScheduleIn(BaseModel):
     scheduled_for: str = Field(min_length=1)
 
 
+# --------------------------------------------------------------------------
+# Discuss: explore a source, argue with it, before it becomes a post
+# --------------------------------------------------------------------------
+
+
+class NewDiscussionIn(BaseModel):
+    source_url: str = Field(min_length=1, max_length=2000)
+    source_title: str = Field(default="", max_length=300)
+    row_id: str = Field(default="", max_length=26)
+
+    @field_validator("source_url")
+    @classmethod
+    def looks_like_a_url(cls, value: str) -> str:
+        value = value.strip()
+        if not (value.startswith("http://") or value.startswith("https://")):
+            raise ValueError("needs to be a full URL, starting with http:// or https://")
+        return value
+
+
+class DiscussionMessageIn(BaseModel):
+    content: str = Field(min_length=1, max_length=8000)
+
+    @field_validator("content")
+    @classmethod
+    def not_only_whitespace(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("say something to respond to")
+        return value.strip()
+
+
+class DiscussionMessageOut(BaseModel):
+    role: str
+    content: str
+
+
+class DiscussionOut(BaseModel):
+    id: str
+    created_at: str = ""
+    updated_at: str = ""
+    source_url: str = ""
+    source_title: str = ""
+    started_from_row_id: str = ""
+    row_id: str = ""
+    messages: List[DiscussionMessageOut] = Field(default_factory=list)
+
+
 class MeOut(BaseModel):
     id: str
     email: str = ""

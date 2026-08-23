@@ -18,7 +18,7 @@ function label(status) {
  * the field and the button sit right next to each other and a click should
  * carry exactly what is on screen.
  */
-export default function RowCard({ row, busy, act, reload, selectable, selected, onToggleSelect }) {
+export default function RowCard({ row, busy, act, reload, selectable, selected, onToggleSelect, onDiscuss }) {
   const [take, setTake] = useState(row.take || '')
   const [saveState, setSaveState] = useState('idle')
   const [scheduledAt, setScheduledAt] = useState(toLocalInput(row.scheduled_for))
@@ -190,7 +190,27 @@ export default function RowCard({ row, busy, act, reload, selectable, selected, 
           </p>
         )}
         {!hasDraft && !take.trim() && !isTerminal && (
-          <p className="redraft-hint">No take yet — redrafting still writes a first version, generic until you edit it.</p>
+          <p className="redraft-hint">
+            No take yet — redrafting still writes a first version, generic until you edit it.
+            {onDiscuss && (
+              <>
+                {' '}Or{' '}
+                <a
+                  href="#"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    onDiscuss({
+                      source_url: row.source_url,
+                      source_title: row.source_title,
+                      row_id: row.id,
+                    })
+                  }}
+                >
+                  discuss it first
+                </a>.
+              </>
+            )}
+          </p>
         )}
       </div>
     </div>

@@ -24,6 +24,7 @@ from . import security
 from .deps import PUBLISH_NOW_LOCK, config as get_config
 from .routes_account import router as account_router
 from .routes_auth import router as auth_router
+from .routes_discuss import router as discuss_router
 from .routes_pipeline import router as pipeline_router
 
 logger = log.get(__name__)
@@ -82,6 +83,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(pipeline_router)
     app.include_router(account_router)
+    app.include_router(discuss_router)
 
     @app.exception_handler(UsageCapExceeded)
     def _cap(request: Request, exc: UsageCapExceeded) -> JSONResponse:
