@@ -49,6 +49,7 @@ export const api = {
   unapprove: (id) => request(`/api/rows/${id}/unapprove`, { method: 'POST' }),
   revise: (id, note) => request(`/api/rows/${id}/revise`, { method: 'POST', body: { note } }),
   skip: (id) => request(`/api/rows/${id}/skip`, { method: 'POST' }),
+  redraftNow: (id) => request(`/api/rows/${id}/redraft-now`, { method: 'POST' }),
 
   setPaused: (paused) => request('/api/pause', { method: 'PUT', body: { paused } }),
   sources: () => request('/api/sources'),

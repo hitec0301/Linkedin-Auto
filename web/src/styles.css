@@ -59,7 +59,7 @@ nav button.on { background: var(--ink); color: var(--bg); }
 }
 .tag.status-DRAFTED { border-color: var(--accent); color: var(--accent); }
 .tag.status-APPROVED { border-color: var(--ok); color: var(--ok); }
-.tag.status-POSTED { background: var(--ok); border-color: var(--ok); color: #fff; }
+.tag.status-POSTED { background: var(--ok); border-color: var(--ok); color: var(--bg); }
 .tag.status-FAILED, .tag.status-EXPIRED { border-color: var(--danger); color: var(--danger); }
 
 .post-text {
@@ -78,7 +78,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin: 14px 0 6px
 
 button.action {
   font: inherit; font-size: 14px; padding: 8px 14px; border-radius: 8px;
-  border: 1px solid var(--line); background: #fff; color: var(--ink); cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer;
 }
 button.action:hover { border-color: var(--muted); }
 button.action[disabled] { opacity: 0.45; cursor: not-allowed; }

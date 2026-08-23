@@ -53,23 +53,19 @@ export default function Review() {
     <>
       {error && <Notice kind="error">{error}</Notice>}
 
-      {sorted.length === 0 ? (
-        <div className="empty">
-          <p>Nothing waiting. The next batch of candidates arrives Monday morning.</p>
-          <div className="actions" style={{ justifyContent: 'center' }}>
-            <button className="action primary" disabled={!!busy} onClick={fetchNow}>
-              {busy === 'fetching' ? 'Fetching…' : 'Fetch candidates now'}
-            </button>
-          </div>
-          {fetchMsg && <p className="muted">{fetchMsg}</p>}
-        </div>
-      ) : (
-        <p className="muted" style={{ marginTop: 0 }}>
-          {drafted > 0
-            ? `${drafted} draft${drafted === 1 ? '' : 's'} waiting on you.`
-            : 'No drafts waiting. Tick the candidates you want and give each an angle.'}
+      <div className="switch" style={{ justifyContent: 'space-between', marginBottom: 16 }}>
+        <p className="muted" style={{ margin: 0 }}>
+          {sorted.length === 0
+            ? 'Nothing waiting. The next batch of candidates arrives Monday morning.'
+            : drafted > 0
+              ? `${drafted} draft${drafted === 1 ? '' : 's'} waiting on you.`
+              : 'No drafts waiting. Tick the candidates you want and give each an angle.'}
         </p>
-      )}
+        <button className="action" disabled={!!busy} onClick={fetchNow}>
+          {busy === 'fetching' ? 'Fetching…' : 'Fetch more candidates'}
+        </button>
+      </div>
+      {fetchMsg && <p className="muted" style={{ marginTop: -10 }}>{fetchMsg}</p>}
 
       {sorted.map((row) => (
         <RowCard key={row.id} row={row} busy={busy} act={act} />
@@ -170,6 +166,15 @@ function RowCard({ row, busy, act }) {
         {can('revise') && !revising && (
           <button className="action" onClick={() => setRevising(true)}>
             Send back with a note
+          </button>
+        )}
+        {can('redraft') && (
+          <button
+            className="action"
+            disabled={!!busy}
+            onClick={() => act(() => api.redraftNow(row.id))}
+          >
+            {busy === 'working' ? 'Redrafting…' : 'Redraft now'}
           </button>
         )}
         {revising && (

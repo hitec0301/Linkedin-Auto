@@ -571,11 +571,44 @@ def test_curate_now_writes_rows_when_review_is_empty(api, monkeypatch):
     assert rows[0]["status"] == "NEW"
 
 
-def test_curate_now_refuses_when_review_is_not_empty(api):
-    """The button only exists for the empty state; the API enforces the same rule."""
-    seed([Row(ID="01ALREADYNEW", Status=Status.NEW)])
+def test_curate_now_adds_to_an_already_populated_review(api, monkeypatch):
+    """Fetching more is not gated on Review being empty - dedupe does the work."""
+    from lnp import ingest as ingest_mod
+    from lnp.ingest import Candidate, FeedResult
+
+    seed([Row(ID="01ALREADYNEW", Status=Status.NEW, SourceURL="https://feed.test/existing")])
+
+    with session_mod.session_scope() as session:
+        session.add(Source(id="01SRCMORE", tenant_id=TENANT, name="Feed",
+                            url="https://feed.test/rss", tier=2,
+                            audience="AUD_CORPORATE", active=True))
+
+    def fake_fetch(feed, timeout, user_agent):
+        items = [
+            Candidate(url="https://feed.test/a", title="A district buys AI seats",
+                      summary="summary", source_name=feed["name"],
+                      tier=feed["tier"], weight=feed["weight"]),
+        ]
+        return FeedResult(feed["name"], feed["url"], feed["tier"], True, len(items), "", items)
+
+    def fake_scorer(config, *, system, user, model=None, max_tokens=0):
+        import json
+        items = json.loads(user.split("Items to triage:\n", 1)[1])
+        return [
+            {"i": item["i"], "score": 8, "audience": "AUD_CORPORATE",
+             "theme": "THM_AI", "why": "Buyers will feel this before vendors do."}
+            for item in items
+        ]
+
+    monkeypatch.setattr(ingest_mod, "fetch_feed", fake_fetch)
+    monkeypatch.setattr("lnp.scoring.complete_json", fake_scorer)
+
     response = api.post("/api/rows/curate-now")
-    assert response.status_code == 409
+    assert response.status_code == 200
+    assert response.json()["written"] == 1
+
+    rows = api.get("/api/rows").json()
+    assert len(rows) == 2
 
 
 def test_curate_now_respects_the_cooldown(api):
@@ -621,3 +654,52 @@ def test_curate_now_does_not_reach_another_tenants_rows(api, monkeypatch):
 
     other_rows = store_for(OTHER).pipeline_rows()
     assert [r.ID for r in other_rows] == ["01OTHERROW"]
+
+
+# --------------------------------------------------------------------------
+# On-demand redraft: "redraft now" on a row sent back with a note
+# --------------------------------------------------------------------------
+
+
+def test_redraft_now_regenerates_a_revise_row(api, monkeypatch):
+    from lnp import drafting as drafting_mod, voice as voice_mod
+
+    seed([Row(ID="01REV", Status=Status.REVISE, Selected="TRUE", Angle="An angle",
+               DraftText="old draft", RevisionNote="cut the closing question",
+               RevisionCount="1", SourceURL="https://x.test/b", SourceTitle="B title",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())])
+    store_for().save_voice_card("A starter voice card.")
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise",
+                         lambda config, row, ctx, **kw: "A revised draft. " * 18)
+
+    response = api.post("/api/rows/01REV/redraft-now")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "DRAFTED"
+    assert "revised draft" in body["draft_text"]
+
+    row = store_for().pipeline_rows()[0]
+    assert row.RevisionCount == "2"
+    assert row.RevisionNote == ""
+
+
+def test_redraft_now_refuses_a_row_that_is_not_revise(api):
+    seed([Row(ID="01NEW", Status=Status.NEW)])
+    response = api.post("/api/rows/01NEW/redraft-now")
+    assert response.status_code == 409
+
+
+def test_redraft_now_does_not_reach_another_tenants_row(api, monkeypatch):
+    from lnp import drafting as drafting_mod, voice as voice_mod
+
+    seed([Row(ID="01THEIRS", Status=Status.REVISE, Angle="a", DraftText="old",
+               RevisionNote="note", RevisionCount="0",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())], tenant_id=OTHER)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "revised. " * 20)
+
+    response = api.post("/api/rows/01THEIRS/redraft-now")
+    assert response.status_code == 404

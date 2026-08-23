@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from .. import runner
 from ..config import Config
 from ..curate import curate as run_curate
+from ..draft import draft_all as run_draft_all
 from ..db.schema import Tenant
 from ..db.store import PipelineStore
 from ..models import (
@@ -35,14 +36,6 @@ from .schemas import ROW_COLUMN_BY_FIELD, ReviseIn, RowEdit, RowOut
 
 router = APIRouter(prefix="/api/rows", tags=["pipeline"])
 
-# Everything the Review screen shows before it says "nothing waiting" - the
-# same set decides whether an on-demand curate run is offered, so the button
-# and the emptiness message can never disagree about what "waiting" means.
-WAITING_STATUSES = {
-    Status.NEW, Status.DRAFTED, Status.REVISE,
-    Status.APPROVED, Status.FAILED, Status.POSTING,
-}
-
 # A brand-new account with an empty Sources list, or one whose last run wrote
 # nothing but duplicates, would otherwise let a stuck "Fetch now" button be
 # clicked repeatedly - each click is a real feed fetch and a real model call.
@@ -51,17 +44,18 @@ CURATE_NOW_COOLDOWN_MINUTES = 10
 # lnp.llm's usage meter is a process-global, not a per-thread one, because the
 # scheduled jobs only ever run one tenant at a time in a single thread. This
 # on-demand path is reached from FastAPI's threadpool, so two accounts
-# clicking "Fetch now" at the same instant could otherwise attribute one
-# tenant's model spend to the other's cap. The lock serialises the rare,
-# human-triggered case rather than making the meter thread-safe everywhere.
-_CURATE_NOW_LOCK = threading.Lock()
+# clicking "Fetch now" (or two rows being redrafted) at the same instant could
+# otherwise attribute one tenant's model spend to the other's cap. The lock
+# serialises the rare, human-triggered case rather than making the meter
+# thread-safe everywhere.
+_ON_DEMAND_LLM_LOCK = threading.Lock()
 
 # What the interface may offer, per status. Derived from the state machine so
 # a button cannot exist for a move the store would refuse.
 ACTIONS: Dict[str, List[str]] = {
     Status.NEW: ["edit", "skip"],
     Status.DRAFTED: ["edit", "approve", "revise", "skip"],
-    Status.REVISE: ["edit", "skip"],
+    Status.REVISE: ["edit", "skip", "redraft"],
     Status.APPROVED: ["edit", "unapprove", "skip"],
     Status.POSTING: [],
     Status.POSTED: ["edit"],  # only Reach, which the human fills in later
@@ -102,20 +96,12 @@ def curate_now(
 ) -> dict:
     """Fetch and score a batch right now, instead of waiting for Monday.
 
-    Offered only when there is nothing on Review already - a full slate
-    exists precisely so a new account is not still empty five minutes after
-    connecting LinkedIn. Runs the exact function Job A runs on its own
-    schedule, against this one account, so there is no second code path to
-    keep in sync.
+    Available any time, not only when Review is empty - dedupe reads the same
+    URL/title history whether it is the cron job or this button asking, so a
+    second fetch on top of an existing slate adds only what is genuinely new.
+    Runs the exact function Job A runs on its own schedule, against this one
+    account, so there is no second code path to keep in sync.
     """
-    waiting = [r for r in store.pipeline_rows() if r.status in WAITING_STATUSES]
-    if waiting:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"there are already {len(waiting)} row(s) waiting on Review; "
-            "clear those before fetching more",
-        )
-
     last_run = parse_dt(store.config_values().get("LAST_CURATE"))
     if last_run is not None:
         minutes_ago = (utcnow() - last_run).total_seconds() / 60
@@ -126,7 +112,7 @@ def curate_now(
                 f"a batch just ran; try again in about {wait} minute(s)",
             )
 
-    with _CURATE_NOW_LOCK, closing(runner.runs("curate", cfg, tenant_id=tenant.id)) as runs:
+    with _ON_DEMAND_LLM_LOCK, closing(runner.runs("curate", cfg, tenant_id=tenant.id)) as runs:
         run = next(runs, None)
         if run is None:
             raise HTTPException(status.HTTP_409_CONFLICT, "this account is not active")
@@ -138,6 +124,45 @@ def curate_now(
     if written == 0:
         return {"written": 0, "detail": "checked your feeds; nothing new to show yet"}
     return {"written": written, "detail": f"{written} candidate(s) ready on Review"}
+
+
+@router.post("/{row_id}/redraft-now", response_model=RowOut)
+def redraft_now(
+    row_id: str,
+    tenant: Tenant = Depends(active_tenant),
+    store: PipelineStore = Depends(current_store),
+    cfg: Config = Depends(config),
+) -> dict:
+    """Regenerate a sent-back row right now, instead of waiting for the hourly job.
+
+    Only valid on a REVISE row - the state the store already refuses to let
+    the interface skip past. Runs the exact function Job B runs on its own
+    schedule, restricted to this one row, so a manual redraft and the
+    scheduled one are provably the same code path.
+    """
+    row = find(store, row_id)
+    if row.status != Status.REVISE:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"this row is {row.status}, not sent back for revision",
+        )
+
+    with _ON_DEMAND_LLM_LOCK, closing(runner.runs("draft", cfg, tenant_id=tenant.id)) as runs:
+        run = next(runs, None)
+        if run is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "this account is not active")
+        try:
+            run_draft_all(run, row=row_id)
+        except RuntimeError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+        # Read back through run.store, the session the write just went
+        # through - `store` above is a separate session/identity map and is
+        # not guaranteed to see a commit made on this one.
+        updated = next((r for r in run.store.pipeline_rows() if r.ID == row_id), None)
+        if updated is None:  # pragma: no cover - the row cannot vanish mid-request
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")
+        return RowOut.of(updated, allowed_actions(updated))
 
 
 @router.get("/{row_id}", response_model=RowOut)
