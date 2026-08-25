@@ -10,6 +10,7 @@ leave this system behave identically once a row is in flight.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 
 from . import log, runner, tokens as token_mod
@@ -71,14 +72,38 @@ def publish_one(run: "runner.Run", row: Row, *, dry_run: bool) -> PublishResult:
 
     token_mod.cache_person_urn(run.config, token_set, author, backend=backend)
     store.set_config_value("PERSON_URN", author)
-    payload = api.build_payload(author, text)
+
+    # The image, if there is one, is uploaded here rather than at generation
+    # time: LinkedIn's upload URL is short-lived, so it has to be requested
+    # right before the post that references it. A failed upload never blocks
+    # the text from going out - it is reported and the post proceeds without
+    # the image, exactly as if none had been generated.
+    image_urn = ""
+    if row.has_image and not dry_run:
+        try:
+            image_urn = api.upload_image(author, base64.b64decode(row.ImageData))
+        except Exception as exc:  # noqa: BLE001 - never lets an image problem block the text
+            logger.error(
+                "image upload failed; publishing without it",
+                extra={"row_id": row.ID, "error": str(exc)},
+            )
+            run.alert(
+                f"Row {row.ID}: the generated image failed to upload",
+                f"{exc}\n\nThe post went out with text only. The image is "
+                "still on the row if you want to try again next time.",
+                severity="warn", job="publish",
+            )
+    payload = api.build_payload(author, text, image_urn=image_urn)
 
     if dry_run:
         logger.info(
             "dry run: not posting",
-            extra={"row_id": row.ID, "chars": len(text), "payload": payload},
+            extra={"row_id": row.ID, "chars": len(text), "payload": payload,
+                   "has_image": row.has_image},
         )
         message = "dry run is on for this deployment: logged the payload, posted nothing"
+        if row.has_image:
+            message += " (an image would have been attached)"
         store.write(row, {"Error": message})
         return PublishResult(True, message)
 

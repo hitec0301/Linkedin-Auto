@@ -152,6 +152,14 @@ pressed. Left alone, the row waits for its scheduled time, and the background
 publish checker (see "One service") posts it, writing back the URN, the
 timestamp, and the edit distance.
 
+**Generate image**, on any card with a draft, asks Claude for a short visual
+brief describing the post and hands that to Gemini to render (needs
+`GEMINI_API_KEY`; see "Set the variables" below). The result is a draft like
+any other - review it, regenerate, or remove it before publishing. It is
+never required: Post now and the scheduled checker both publish text-only if
+a row has no image, and if the image fails to upload at publish time the
+text still goes out, with a warning rather than a failed post.
+
 **Bulk-remove** on the Review screen's toolbar select-and-skip several
 not-relevant candidates at once, instead of one at a time.
 
@@ -414,6 +422,7 @@ them. Project → **Variables**:
 | `LNP_AUTH_CLIENT_ID` | the sign-in app from step 1 |
 | `LNP_AUTH_CLIENT_SECRET` | the secret for that app |
 | `ANTHROPIC_API_KEY` | yours: the operator pays for drafting |
+| `GEMINI_API_KEY` | optional: only needed for "Generate image" on a post |
 | `SLACK_WEBHOOK_URL` | optional, and the only way you hear about a failed run |
 
 Referencing `${{Postgres.DATABASE_URL}}` rather than copying the string means a

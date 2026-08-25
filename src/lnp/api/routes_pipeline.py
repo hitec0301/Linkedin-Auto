@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from .. import runner
 from ..config import Config
 from ..curate import curate as run_curate
+from ..image_gen import ImageGenError, generate_image_now as run_generate_image
 from ..publish_now import publish_one as run_publish_one
 from ..redraft import RedraftRefused, redraft_now as run_redraft_now
 from ..db.schema import Tenant
@@ -152,6 +153,50 @@ def redraft_now_route(
         if updated is None:  # pragma: no cover - the row cannot vanish mid-request
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")
         return RowOut.of(updated)
+
+
+@router.post("/{row_id}/generate-image", response_model=RowOut)
+def generate_image_route(
+    row_id: str,
+    tenant: Tenant = Depends(active_tenant),
+    cfg: Config = Depends(config),
+) -> RowOut:
+    """Generate an image for this row's post and attach it as a draft.
+
+    Model-owned, like DraftText: this always overwrites whatever image the
+    row already had. Never blocks Post now on its own - a row can publish
+    with or without one - so a failure here is reported plainly rather than
+    retried silently.
+    """
+    with ON_DEMAND_LLM_LOCK, closing(runner.runs("image", cfg, tenant_id=tenant.id)) as runs:
+        run = next(runs, None)
+        if run is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "this account is not active")
+        row = next((r for r in run.store.pipeline_rows() if r.ID == row_id), None)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")
+        try:
+            updated_row = run_generate_image(run, row)
+        except ImageGenError as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+        updated = next(
+            (r for r in run.store.pipeline_rows() if r.ID == updated_row.ID), None
+        )
+        if updated is None:  # pragma: no cover - the row cannot vanish mid-request
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")
+        return RowOut.of(updated)
+
+
+@router.delete("/{row_id}/image", response_model=RowOut)
+def remove_image_route(
+    row_id: str,
+    store: PipelineStore = Depends(current_store),
+    tenant: Tenant = Depends(active_tenant),
+) -> RowOut:
+    """Drop a generated image, going back to a text-only post."""
+    row = find(store, row_id)
+    store.write(row, {"ImagePrompt": "", "ImageData": ""})
+    return RowOut.of(row)
 
 
 @router.get("/{row_id}", response_model=RowOut)

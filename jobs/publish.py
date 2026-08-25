@@ -19,6 +19,7 @@ code in the repo that writes to LinkedIn, and it is built to be boring:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import sys
 from pathlib import Path
@@ -202,16 +203,37 @@ def publish(run: runner.Run, args, dry_run: bool) -> int:
             )
             continue
 
-        payload = api.build_payload(author, text)
+        # Uploaded here, right before the post that will reference it: the
+        # image, if there is one - never at generation time, since
+        # LinkedIn's upload URL is short-lived. A failed upload never blocks
+        # the text from going out.
+        image_urn = ""
+        if row.has_image and not dry_run:
+            try:
+                image_urn = api.upload_image(author, base64.b64decode(row.ImageData))
+            except Exception as exc:  # noqa: BLE001 - never lets an image problem block the text
+                logger.error(
+                    "image upload failed; publishing without it",
+                    extra={"row_id": row.ID, "error": str(exc)},
+                )
+                run.alert(
+                    f"Row {row.ID}: the generated image failed to upload",
+                    f"{exc}\n\nThe post went out with text only. The image "
+                    "is still on the row if you want to try again next time.",
+                    severity="warn", job=JOB,
+                )
+        payload = api.build_payload(author, text, image_urn=image_urn)
 
         if dry_run:
             logger.info(
                 "dry run: not posting",
-                extra={"row_id": row.ID, "chars": len(text), "payload": payload},
+                extra={"row_id": row.ID, "chars": len(text), "payload": payload,
+                       "has_image": row.has_image},
             )
             print(
                 f"\n--- DRY RUN — row {row.ID} ({len(text)} chars), "
-                f"scheduled {row.ScheduledFor or 'now'}\n"
+                f"scheduled {row.ScheduledFor or 'now'}"
+                f"{' (an image would have been attached)' if row.has_image else ''}\n"
                 f"POST {api.base}/rest/posts\n"
                 f"LinkedIn-Version: {api.version}\n"
                 f"X-Restli-Protocol-Version: 2.0.0\n"

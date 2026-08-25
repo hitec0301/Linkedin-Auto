@@ -1105,6 +1105,92 @@ def test_redraft_now_does_not_reach_another_tenants_row(api, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Generate image
+# --------------------------------------------------------------------------
+
+
+def test_generate_image_writes_prompt_and_image_to_the_row(api, monkeypatch):
+    from lnp import image_gen
+
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post about training budgets.")])
+    monkeypatch.setattr(image_gen, "build_prompt", lambda config, row: "a quiet office, morning light")
+    monkeypatch.setattr(image_gen, "generate", lambda config, prompt, **kw: b"pretend-png-bytes")
+
+    response = api.post("/api/rows/01D/generate-image")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["image_prompt"] == "a quiet office, morning light"
+    assert body["image_data_url"].startswith("data:image/png;base64,")
+
+    # Persisted, not just returned on the response.
+    again = api.get("/api/rows/01D").json()
+    assert again["image_data_url"] == body["image_data_url"]
+
+
+def test_generate_image_refuses_a_row_with_no_text_yet(api):
+    seed([Row(ID="01NEW", Status=Status.NEW, SourceTitle="A title")])
+    response = api.post("/api/rows/01NEW/generate-image")
+    assert response.status_code == 502
+
+
+def test_generate_image_surfaces_a_clean_error_from_the_model(monkeypatch, api):
+    from lnp import image_gen
+
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post about training budgets.")])
+    monkeypatch.setattr(image_gen, "build_prompt", lambda config, row: "a prompt")
+
+    def explode(config, prompt, **kw):
+        raise image_gen.ImageGenError("the model refused: safety")
+
+    monkeypatch.setattr(image_gen, "generate", explode)
+    response = api.post("/api/rows/01D/generate-image")
+    assert response.status_code == 502
+    assert "safety" in response.json()["detail"]
+
+
+def test_generate_image_regenerating_overwrites_the_old_one(api, monkeypatch):
+    from lnp import image_gen
+
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post.",
+               ImagePrompt="old prompt", ImageData="b2xk")])
+    monkeypatch.setattr(image_gen, "build_prompt", lambda config, row: "new prompt")
+    monkeypatch.setattr(image_gen, "generate", lambda config, prompt, **kw: b"new-bytes")
+
+    response = api.post("/api/rows/01D/generate-image")
+    body = response.json()
+    assert body["image_prompt"] == "new prompt"
+    assert "bmV3LWJ5dGVz" in body["image_data_url"]  # base64("new-bytes")
+
+
+def test_generate_image_does_not_reach_another_tenants_row(api, monkeypatch):
+    from lnp import image_gen
+
+    seed([Row(ID="01THEIRS", Status=Status.DRAFTED, DraftText="a draft")], tenant_id=OTHER)
+    monkeypatch.setattr(image_gen, "build_prompt", lambda config, row: "prompt")
+    monkeypatch.setattr(image_gen, "generate", lambda config, prompt, **kw: b"bytes")
+
+    response = api.post("/api/rows/01THEIRS/generate-image")
+    assert response.status_code == 404
+
+
+def test_remove_image_clears_both_columns(api):
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post.",
+               ImagePrompt="a prompt", ImageData="b2xk")])
+    response = api.delete("/api/rows/01D/image")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["image_prompt"] == ""
+    assert body["image_data_url"] == ""
+
+
+def test_remove_image_does_not_reach_another_tenants_row(api):
+    seed([Row(ID="01THEIRS", Status=Status.DRAFTED, DraftText="a draft",
+               ImagePrompt="a prompt", ImageData="b2xk")], tenant_id=OTHER)
+    response = api.delete("/api/rows/01THEIRS/image")
+    assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------
 # Publish timing: approve via the status dropdown, then schedule or post now
 # --------------------------------------------------------------------------
 
@@ -1203,6 +1289,83 @@ def test_publish_now_route_publishes_for_real_on_the_shipped_default(api, monkey
     body = api.post("/api/rows/01A/publish-now").json()
     assert body["status"] == "POSTED"
     assert body["post_urn"] == "urn:li:share:999"
+
+
+def test_publish_now_route_uploads_and_attaches_a_generated_image(api, monkeypatch):
+    from lnp import publish_now as publish_now_mod
+    from lnp.linkedin import LinkedIn
+
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a real draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat(),
+               ImagePrompt="a prompt", ImageData="aGVsbG8=")])  # "hello"
+    connect_linkedin(store_for())
+    store_for().set_config_value("PAUSED", "FALSE")
+
+    calls = {}
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        def upload_image(self, author, image_bytes):
+            calls["author"] = author
+            calls["image_bytes"] = image_bytes
+            return "urn:li:image:xyz"
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):
+            calls["payload"] = payload
+            return "urn:li:share:999"
+
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
+
+    body = api.post("/api/rows/01A/publish-now").json()
+    assert body["status"] == "POSTED"
+    assert calls["image_bytes"] == b"hello"
+    assert calls["payload"]["content"] == {"media": {"id": "urn:li:image:xyz"}}
+
+
+def test_publish_now_route_publishes_text_only_when_the_image_upload_fails(api, monkeypatch):
+    """An image failing to upload must never block the text from going out."""
+    from lnp import publish_now as publish_now_mod
+    from lnp.linkedin import LinkedIn, LinkedInError
+
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a real draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat(),
+               ImagePrompt="a prompt", ImageData="aGVsbG8=")])
+    connect_linkedin(store_for())
+    store_for().set_config_value("PAUSED", "FALSE")
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        def upload_image(self, author, image_bytes):
+            raise LinkedInError("upload quota exceeded")
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):
+            assert "content" not in payload
+            return "urn:li:share:999"
+
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
+
+    body = api.post("/api/rows/01A/publish-now").json()
+    assert body["status"] == "POSTED"
 
 
 def test_publish_now_route_respects_the_pause_switch(api, monkeypatch):

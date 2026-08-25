@@ -132,6 +132,8 @@ COLUMNS: List[str] = [
     "EditDistance",
     "Reach",
     "Error",
+    "ImagePrompt",
+    "ImageData",
 ]
 
 COLUMN_INDEX: Dict[str, int] = {name: i for i, name in enumerate(COLUMNS)}
@@ -156,6 +158,8 @@ MODEL_OWNED_COLUMNS: Set[str] = {
     "Theme",
     "WhyItMatters",
     "RelevanceScore",
+    "ImagePrompt",
+    "ImageData",
 }
 
 
@@ -273,6 +277,12 @@ class Row:
     EditDistance: str = ""
     Reach: str = ""
     Error: str = ""
+    # The visual brief a model wrote for this post, and the image itself
+    # (base64), from "Generate image". Both model-owned: regenerating
+    # overwrites whichever attempt was there before, the same as a fresh
+    # draft.
+    ImagePrompt: str = ""
+    ImageData: str = ""
 
     # ---- derived views -------------------------------------------------
 
@@ -315,6 +325,10 @@ class Row:
         if (self.FinalText or "").strip():
             return self.FinalText.strip()
         return (self.DraftText or "").strip()
+
+    @property
+    def has_image(self) -> bool:
+        return bool((self.ImageData or "").strip())
 
     @property
     def was_edited(self) -> bool:

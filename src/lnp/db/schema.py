@@ -196,6 +196,8 @@ class PipelineRow(Base):
     edit_distance: Mapped[Optional[float]] = mapped_column(Float)
     reach: Mapped[Optional[int]] = mapped_column(Integer)
     error: Mapped[str] = mapped_column(Text, default="")
+    image_prompt: Mapped[str] = mapped_column(Text, default="")
+    image_data: Mapped[str] = mapped_column(Text, default="")
 
     archived_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
     updated_at: Mapped[datetime] = mapped_column(

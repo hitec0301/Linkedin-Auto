@@ -146,6 +146,8 @@ FIELDS: List[Tuple[str, str, str]] = [
     ("EditDistance", "edit_distance", "float"),
     ("Reach", "reach", "int"),
     ("Error", "error", "text"),
+    ("ImagePrompt", "image_prompt", "text"),
+    ("ImageData", "image_data", "text"),
 ]
 
 BY_COLUMN: Dict[str, Tuple[str, str]] = {c: (a, k) for c, a, k in FIELDS}

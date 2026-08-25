@@ -116,6 +116,13 @@ publish:
   api_version: "202605"
   request_timeout_seconds: 30
 
+imaging:
+  # "Generate image" writes a short visual brief with this model first, then
+  # hands it to Gemini. Needs GEMINI_API_KEY; unset means the button errors.
+  prompt_model: claude-sonnet-4-6
+  model: gemini-2.5-flash-image
+  request_timeout_seconds: 60
+
 publish_checker:
   # How often the in-process background thread checks for approved rows
   # whose ScheduledFor has arrived. This is the one thing still on a clock -

@@ -160,6 +160,30 @@ export default function RowCard({ row, busy, act, reload, selectable, selected, 
           </>
         )}
 
+        {hasDraft && !hasVariants && (row.image_data_url || !isTerminal) && (
+          <div className="image-block">
+            {row.image_data_url ? (
+              <>
+                <img className="generated-image" src={row.image_data_url} alt="Generated for this post" />
+                {!isTerminal && (
+                  <div className="note-row">
+                    <button className="action" disabled={!!busy} onClick={() => act(() => api.generateImage(row.id))}>
+                      {busy === 'working' ? 'Working…' : 'Regenerate image'}
+                    </button>
+                    <button className="action danger" disabled={!!busy} onClick={() => act(() => api.removeImage(row.id))}>
+                      Remove image
+                    </button>
+                  </div>
+                )}
+              </>
+            ) : (
+              <button className="action" disabled={!!busy} onClick={() => act(() => api.generateImage(row.id))}>
+                {busy === 'working' ? 'Generating…' : 'Generate image'}
+              </button>
+            )}
+          </div>
+        )}
+
         {row.status === 'APPROVED' && (
           <div className="schedule-row">
             <label>Publish</label>

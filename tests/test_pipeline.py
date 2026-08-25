@@ -150,6 +150,7 @@ def test_column_order_is_exact():
         "WhyItMatters", "RelevanceScore", "Selected", "Angle", "DraftText",
         "FinalText", "RevisionNote", "RevisionCount", "CharCount", "Status",
         "ScheduledFor", "PostURN", "PostedAt", "EditDistance", "Reach", "Error",
+        "ImagePrompt", "ImageData",
     ]
 
 
@@ -902,6 +903,49 @@ def iso_now():
     return iso()
 
 
+def test_scheduled_publish_uploads_and_attaches_a_generated_image(monkeypatch):
+    """The batch checker (jobs/publish.py) attaches an image the same way
+    the manual "Post now" path does."""
+    import types
+
+    row = Row(ID="01A", Status=Status.APPROVED,
+              ScheduledFor=(utcnow() - timedelta(minutes=1)).isoformat(),
+              DraftText="A real approved draft with real text in it.",
+              ImagePrompt="a prompt", ImageData="aGVsbG8=")
+    store = connect_linkedin(make_store([row], tenants=(TENANT,)))
+    run = make_run(store)
+    calls = {}
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        def upload_image(self, author, image_bytes):
+            calls["image_bytes"] = image_bytes
+            return "urn:li:image:xyz"
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):
+            calls["payload"] = payload
+            return "urn:li:share:999888777"
+
+    monkeypatch.setattr(publish_job, "LinkedIn", FakeAPI)
+
+    published = publish_job.publish(run, types.SimpleNamespace(limit=None), dry_run=False)
+
+    assert published == 1
+    assert calls["image_bytes"] == b"hello"
+    assert calls["payload"]["content"] == {"media": {"id": "urn:li:image:xyz"}}
+    assert rows_of(store)[0].status == Status.POSTED
+
+
 def test_ambiguous_row_with_both_variants_is_refused():
     """Both variants still present means nobody said which post this is."""
     text = f"{VARIANT_A}\nfirst post\n\n{VARIANT_B}\nsecond post"
@@ -939,6 +983,71 @@ def test_linkedin_payload_shape():
     assert headers["LinkedIn-Version"] == "202605"
     assert headers["X-Restli-Protocol-Version"] == "2.0.0"
     assert headers["Authorization"] == "Bearer t"
+
+
+def test_linkedin_payload_carries_an_image_when_given_one():
+    from lnp.tokens import TokenSet
+    api = LinkedIn(Config({"publish": {"api_version": "202605"}}), TokenSet(access_token="t"))
+    payload = api.build_payload("urn:li:person:abc", "the post body", image_urn="urn:li:image:xyz")
+    assert payload["content"] == {"media": {"id": "urn:li:image:xyz"}}
+    without_image = api.build_payload("urn:li:person:abc", "the post body")
+    assert "content" not in without_image
+
+
+def test_upload_image_registers_and_puts_the_bytes():
+    from lnp.tokens import TokenSet
+
+    class FakeResponse:
+        def __init__(self, status_code, json_body=None, text=""):
+            self.status_code = status_code
+            self._json = json_body or {}
+            self.text = text
+
+        def json(self):
+            return self._json
+
+    class FakeSession:
+        def __init__(self):
+            self.put_calls = []
+
+        def post(self, url, **kw):
+            assert "initializeUpload" in url
+            return FakeResponse(200, {"value": {
+                "uploadUrl": "https://upload.example/xyz",
+                "image": "urn:li:image:xyz",
+            }})
+
+        def put(self, url, **kw):
+            self.put_calls.append((url, kw))
+            return FakeResponse(201)
+
+    session = FakeSession()
+    api = LinkedIn(Config({}), TokenSet(access_token="t"), session=session)
+    urn = api.upload_image("urn:li:person:abc", b"pretend-image-bytes")
+    assert urn == "urn:li:image:xyz"
+    put_url, put_kwargs = session.put_calls[0]
+    assert put_url == "https://upload.example/xyz"
+    assert put_kwargs["data"] == b"pretend-image-bytes"
+    assert put_kwargs["headers"]["Authorization"] == "Bearer t"
+
+
+def test_upload_image_raises_when_init_fails():
+    from lnp.tokens import TokenSet
+
+    class FakeResponse:
+        status_code = 500
+        text = "boom"
+
+        def json(self):
+            return {}
+
+    class FakeSession:
+        def post(self, *a, **kw):
+            return FakeResponse()
+
+    api = LinkedIn(Config({}), TokenSet(access_token="t"), session=FakeSession())
+    with pytest.raises(LinkedInError, match="500"):
+        api.upload_image("urn:li:person:abc", b"bytes")
 
 
 def test_missing_restli_id_header_is_not_confirmed():
@@ -1120,6 +1229,45 @@ def test_publish_one_posts_immediately_and_marks_the_row_posted(monkeypatch):
     assert updated.status == Status.POSTED
     assert updated.PostURN == "urn:li:share:999888777"
     assert updated.Error == ""
+
+
+def test_publish_one_uploads_and_attaches_a_generated_image(monkeypatch):
+    from lnp import publish_now as publish_now_mod
+    from lnp.util import iso
+
+    row = Row(ID="01A", Status=Status.APPROVED, ScheduledFor=iso(utcnow()),
+              DraftText="A real approved draft with real text in it.",
+              ImagePrompt="a prompt", ImageData="aGVsbG8=")  # "hello"
+    store = connect_linkedin(make_store([row], tenants=(TENANT,)))
+    run = make_run(store)
+    calls = {}
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        def upload_image(self, author, image_bytes):
+            calls["image_bytes"] = image_bytes
+            return "urn:li:image:xyz"
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):
+            calls["payload"] = payload
+            return "urn:li:share:999888777"
+
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
+    result = publish_now_mod.publish_one(run, rows_of(store)[0], dry_run=False)
+
+    assert result.published is True
+    assert calls["image_bytes"] == b"hello"
+    assert calls["payload"]["content"] == {"media": {"id": "urn:li:image:xyz"}}
 
 
 def test_publish_one_refuses_while_paused_without_touching_linkedin():

@@ -45,6 +45,10 @@ class RowOut(BaseModel):
     edit_distance: float = 0.0
     reach: int = 0
     error: str = ""
+    image_prompt: str = ""
+    # A data: URI, ready for an <img src>, rather than raw base64 - the
+    # frontend never needs to know the encoding is base64 or the mime type.
+    image_data_url: str = ""
 
     @classmethod
     def of(cls, row: Row) -> "RowOut":
@@ -76,6 +80,8 @@ class RowOut(BaseModel):
             edit_distance=float(row.EditDistance or 0),
             reach=int(float(row.Reach or 0)),
             error=row.Error,
+            image_prompt=row.ImagePrompt,
+            image_data_url=f"data:image/png;base64,{row.ImageData}" if row.ImageData else "",
         )
 
 

@@ -248,6 +248,7 @@ def test_row_survives_a_round_trip_through_every_column():
         RevisionNote="note", RevisionCount="2", CharCount="123",
         Status=Status.DRAFTED, ScheduledFor=iso(), PostURN="urn:li:share:1",
         PostedAt=iso(), EditDistance="0.25", Reach="900", Error="none",
+        ImagePrompt="a prompt", ImageData="c29tZSBieXRlcw==",
     )
     store = make_store([original])
     live = store.pipeline_rows()[0]

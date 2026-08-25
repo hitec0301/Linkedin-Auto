@@ -145,6 +145,12 @@ textarea.note {
 .note-row .field { flex: 1; }
 .redraft-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
 
+.image-block { margin: 14px 0; }
+.generated-image {
+  display: block; max-width: 100%; max-height: 420px; width: auto;
+  border-radius: 8px; border: 1px solid var(--line); margin-bottom: 8px;
+}
+
 select.status {
   font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 999px;
   border: 1px solid var(--line); background: var(--panel); color: var(--ink);
