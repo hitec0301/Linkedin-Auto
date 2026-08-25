@@ -16,7 +16,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from .. import runner
+from .. import log, runner
 from ..config import Config, ConfigError
 from ..curate import curate as run_curate
 from ..image_gen import ImageGenError, generate_image_now as run_generate_image
@@ -32,6 +32,7 @@ from .schemas import (
 )
 
 router = APIRouter(prefix="/api/rows", tags=["pipeline"])
+logger = log.get("routes_pipeline")
 
 # A brand-new account with an empty Sources list, or one whose last run wrote
 # nothing but duplicates, would otherwise let a stuck "Fetch now" button be
@@ -178,8 +179,10 @@ def generate_image_route(
         try:
             updated_row = run_generate_image(run, row)
         except ImageGenError as exc:
+            logger.error("image generation failed", extra={"row_id": row_id, "error": str(exc)})
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
         except ConfigError as exc:
+            logger.error("image generation misconfigured", extra={"row_id": row_id, "error": str(exc)})
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
         updated = next(
             (r for r in run.store.pipeline_rows() if r.ID == updated_row.ID), None
