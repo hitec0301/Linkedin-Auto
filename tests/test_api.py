@@ -1148,6 +1148,50 @@ def test_generate_image_surfaces_a_clean_error_from_the_model(monkeypatch, api):
     assert "safety" in response.json()["detail"]
 
 
+def test_generate_image_reports_a_missing_api_key_as_clean_json(api, monkeypatch):
+    """GEMINI_API_KEY missing must come back as a real error, not a raw crash
+    the frontend cannot even parse as JSON."""
+    from lnp import image_gen
+
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post about training budgets.")])
+    monkeypatch.setattr(image_gen, "build_prompt", lambda config, row: "a prompt")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    response = api.post("/api/rows/01D/generate-image")
+    assert response.status_code == 500
+    assert "GEMINI_API_KEY" in response.json()["detail"]
+
+
+def test_an_unexpected_exception_still_comes_back_as_json(api, monkeypatch):
+    """Any route's surprise failure must be catchable by the frontend, not
+    Starlette's own plain-text error page.
+
+    Starlette's ServerErrorMiddleware re-raises the original exception after
+    sending its response - by design, for WSGI/ASGI servers and loggers - so
+    TestClient's default raise_server_exceptions=True surfaces it as a raised
+    exception in the test process rather than a response object. A second
+    client with that off, sharing the same already-configured database and
+    session cookie, is what actually observes what a browser would receive.
+    """
+    from fastapi.testclient import TestClient
+    from lnp import image_gen
+    from lnp.api.app import create_app
+
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post about training budgets.")])
+
+    def explode(config, row):
+        raise RuntimeError("something nobody anticipated")
+
+    monkeypatch.setattr(image_gen, "build_prompt", explode)
+
+    lenient = TestClient(create_app(), raise_server_exceptions=False)
+    lenient.cookies = api.cookies
+    response = lenient.post("/api/rows/01D/generate-image")
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["detail"]
+
+
 def test_generate_image_regenerating_overwrites_the_old_one(api, monkeypatch):
     from lnp import image_gen
 

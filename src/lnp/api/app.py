@@ -101,6 +101,22 @@ def create_app() -> FastAPI:
     def _auth(request: Request, exc: security.AuthError) -> JSONResponse:
         return JSONResponse({"detail": str(exc)}, status_code=401)
 
+    @app.exception_handler(Exception)
+    def _unhandled(request: Request, exc: Exception) -> JSONResponse:
+        """Anything a route did not anticipate, still comes back as JSON.
+
+        Without this, an unhandled exception is Starlette's own plain-text
+        error page - which the frontend's `request()` cannot even parse as
+        JSON, so the failure it is trying to report never reaches the person
+        looking at the screen. Logged in full here; shown to them as one
+        plain sentence, since a stack trace is not theirs to read.
+        """
+        logger.error("unhandled exception", extra={"path": request.url.path}, exc_info=exc)
+        return JSONResponse(
+            {"detail": "something went wrong on our end; try again in a moment"},
+            status_code=500,
+        )
+
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict:
         return {"ok": True, **config_report()}

@@ -20,11 +20,22 @@ async function request(path, options = {}) {
   if (response.status === 204) return null
 
   const text = await response.text()
-  const data = text ? JSON.parse(text) : null
+  // A route that raises without a JSON error handler (an unexpected
+  // exception, or an upstream proxy's own error page) sends back plain text
+  // or HTML, not `{"detail": ...}`. JSON.parse on that would throw before
+  // the real problem - the request itself failing - ever gets shown.
+  let data = null
+  if (text) {
+    try {
+      data = JSON.parse(text)
+    } catch {
+      data = null
+    }
+  }
   if (!response.ok) {
     // FastAPI puts the message in `detail`. Those messages are written for the
     // person reading them, so show them rather than a generic failure.
-    const error = new Error(detailOf(data) || `request failed (${response.status})`)
+    const error = new Error(detailOf(data) || text.slice(0, 300) || `request failed (${response.status})`)
     error.status = response.status
     throw error
   }

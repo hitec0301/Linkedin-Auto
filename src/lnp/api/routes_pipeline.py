@@ -17,7 +17,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from .. import runner
-from ..config import Config
+from ..config import Config, ConfigError
 from ..curate import curate as run_curate
 from ..image_gen import ImageGenError, generate_image_now as run_generate_image
 from ..publish_now import publish_one as run_publish_one
@@ -179,6 +179,8 @@ def generate_image_route(
             updated_row = run_generate_image(run, row)
         except ImageGenError as exc:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+        except ConfigError as exc:
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
         updated = next(
             (r for r in run.store.pipeline_rows() if r.ID == updated_row.ID), None
         )
