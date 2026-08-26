@@ -18,6 +18,7 @@ from .. import discuss as discuss_mod, runner
 from ..config import Config
 from ..db.schema import Tenant
 from ..db.store import PipelineStore, StoreError
+from ..redraft import RedraftRefused
 from .deps import ON_DEMAND_LLM_LOCK, active_tenant, config, current_store
 from .schemas import DiscussionMessageIn, DiscussionOut, NewDiscussionIn, RowOut
 
@@ -111,7 +112,10 @@ def turn_into_post(
                 status.HTTP_400_BAD_REQUEST,
                 "say something first - there is no argument yet to turn into a post",
             )
-        row = discuss_mod.turn_into_post(run, discussion)
+        try:
+            row = discuss_mod.turn_into_post(run, discussion)
+        except RedraftRefused as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         updated = next((r for r in run.store.pipeline_rows() if r.ID == row.ID), None)
         if updated is None:  # pragma: no cover - the row cannot vanish mid-request
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")

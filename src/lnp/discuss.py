@@ -16,7 +16,9 @@ Nothing here writes a pipeline row. A discussion is a scratchpad - explore a
 source, argue it out, and abandon it with nothing left behind - until
 turn_into_post() commits it to exactly one row, the same way "New post"
 does, except the take is synthesized from the conversation instead of typed
-directly.
+directly - and, unlike "New post", it is drafted immediately through the
+same redraft_now() path "Redraft with AI" uses, so the argument lands ready
+for the variant picker instead of a bare take waiting on a second click.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from . import drafting, log
 from .config import Config
 from .llm import complete
 from .models import Row, Status, TERMINAL_STATUSES
+from .redraft import redraft_now
 
 if TYPE_CHECKING:
     from . import runner
@@ -137,9 +140,17 @@ def continue_discussion(
 
 
 def turn_into_post(run: "runner.Run", discussion: "DiscussionRecord") -> Row:
-    """Commit a discussion to exactly one row - the row it started from if it
-    has one and that row is still live, otherwise a fresh one, exactly like
-    "New post" creates. Never both."""
+    """Commit a discussion to exactly one row, drafted immediately - the row
+    it started from if it has one and that row is still live, otherwise a
+    fresh one, exactly like "New post" creates. Never both.
+
+    Delegates the actual drafting to redraft_now(): the same function
+    "Redraft with AI" calls, so a discussion goes straight to a draft (two
+    variants, while the account is still in that window) instead of landing
+    on a bare take that needs a second click to become one. Can raise
+    RedraftRefused, on the one row state that can't be redrafted - the
+    target is mid-publish right now.
+    """
     take = synthesize_take(run.config, messages=discussion.messages)
     store = run.store
 
@@ -151,23 +162,19 @@ def turn_into_post(run: "runner.Run", discussion: "DiscussionRecord") -> Row:
         if found is not None and found.status not in TERMINAL_STATUSES:
             target = found
 
-    if target is not None:
-        if not target.DraftText:
-            store.write_as_human(target, {"Angle": take})
-        else:
-            store.write_as_human(target, {"RevisionNote": take})
-    else:
+    if target is None:
         target = Row(
             SourceURL=discussion.source_url,
             SourceTitle=discussion.source_title,
-            Angle=take,
             Status=Status.NEW,
         )
         store.append_rows([target])
 
-    store.mark_discussion_committed(discussion.id, target.ID)
+    result = redraft_now(run, target, take)
+
+    store.mark_discussion_committed(discussion.id, result.row.ID)
     logger.info(
         "discussion turned into a post",
-        extra={"discussion_id": discussion.id, "row_id": target.ID},
+        extra={"discussion_id": discussion.id, "row_id": result.row.ID},
     )
-    return target
+    return result.row

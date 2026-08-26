@@ -81,7 +81,7 @@ drafting:
   # LinkedIn truncates near 210 characters. The first two lines have to carry
   # the hook and the claim on their own.
   hook_chars: 210
-  max_hashtags: 3
+  max_hashtags: 5
   # Two variants while the human is still calibrating the voice card.
   variants_until_post: 20
   max_revisions: 3

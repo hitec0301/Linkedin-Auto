@@ -739,7 +739,9 @@ def test_post_message_rejects_a_blank_message(api, monkeypatch):
 
 
 def test_turn_into_post_creates_a_new_row_when_standalone(api, monkeypatch):
-    from lnp import discuss as discuss_mod
+    """Lands DRAFTED, not NEW: turn-into-post drafts immediately, the same
+    way "Redraft with AI" would, instead of leaving a bare take."""
+    from lnp import discuss as discuss_mod, drafting as drafting_mod, voice as voice_mod
     from lnp.drafting import Extract
 
     monkeypatch.setattr(
@@ -754,10 +756,16 @@ def test_turn_into_post_creates_a_new_row_when_standalone(api, monkeypatch):
     monkeypatch.setattr(
         discuss_mod, "synthesize_take", lambda config, **kw: "The synthesized thesis."
     )
+    store_for().save_voice_card("A starter voice card.")
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A fresh draft of about the right length. " * 20)
+
     row = api.post(f"/api/discussions/{created['id']}/turn-into-post").json()
-    assert row["status"] == "NEW"
+    assert row["status"] == "DRAFTED"
     assert row["source_url"] == "https://x.test/a"
     assert row["take"] == "The synthesized thesis."
+    assert "fresh draft" in row["draft_text"]
 
     listed = [r["id"] for r in api.get("/api/rows").json()]
     assert row["id"] in listed
@@ -767,7 +775,7 @@ def test_turn_into_post_creates_a_new_row_when_standalone(api, monkeypatch):
 
 
 def test_turn_into_post_updates_the_row_it_started_from(api, monkeypatch):
-    from lnp import discuss as discuss_mod
+    from lnp import discuss as discuss_mod, drafting as drafting_mod, voice as voice_mod
     from lnp.drafting import Extract
 
     seed([Row(ID="01SRC", Status=Status.NEW, SourceURL="https://x.test/a")])
@@ -781,10 +789,47 @@ def test_turn_into_post_updates_the_row_it_started_from(api, monkeypatch):
     api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
 
     monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+    store_for().save_voice_card("A starter voice card.")
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A fresh draft of about the right length. " * 20)
+
     row = api.post(f"/api/discussions/{created['id']}/turn-into-post").json()
     assert row["id"] == "01SRC"
     assert row["take"] == "The thesis."
+    assert row["status"] == "DRAFTED"
     assert len(api.get("/api/rows").json()) == 1  # updated in place, not duplicated
+
+
+def test_turn_into_post_produces_a_variant_pair_when_still_calibrating(api, monkeypatch):
+    """The point the user asked for: a discussion goes straight to the
+    side-by-side picker, not a lone draft needing a further redraft click."""
+    from lnp import discuss as discuss_mod, drafting as drafting_mod, voice as voice_mod
+    from lnp.drafting import VARIANT_A, VARIANT_B, Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+    monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+
+    store_for().save_voice_card("A starter voice card.")
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(
+        drafting_mod, "draft",
+        lambda config, row, ctx, **kw: (
+            f"{VARIANT_A}\nFirst version of the post, said one way. " * 8
+            + f"\n\n{VARIANT_B}\nSecond version of the post, said another way. " * 8
+        ),
+    )
+
+    row = api.post(f"/api/discussions/{created['id']}/turn-into-post").json()
+    assert row["status"] == "DRAFTED"
+    assert row["variant_a"] and row["variant_b"]
+    assert "First version" in row["variant_a"]
+    assert "Second version" in row["variant_b"]
 
 
 def test_turn_into_post_refuses_before_any_argument(api, monkeypatch):
@@ -800,7 +845,7 @@ def test_turn_into_post_refuses_before_any_argument(api, monkeypatch):
 
 
 def test_turn_into_post_refuses_a_second_time(api, monkeypatch):
-    from lnp import discuss as discuss_mod
+    from lnp import discuss as discuss_mod, drafting as drafting_mod, voice as voice_mod
     from lnp.drafting import Extract
 
     monkeypatch.setattr(
@@ -810,13 +855,17 @@ def test_turn_into_post_refuses_a_second_time(api, monkeypatch):
     monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
     api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
     monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+    store_for().save_voice_card("A starter voice card.")
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A fresh draft of about the right length. " * 20)
 
     assert api.post(f"/api/discussions/{created['id']}/turn-into-post").status_code == 200
     assert api.post(f"/api/discussions/{created['id']}/turn-into-post").status_code == 409
 
 
 def test_messages_refused_once_a_discussion_became_a_post(api, monkeypatch):
-    from lnp import discuss as discuss_mod
+    from lnp import discuss as discuss_mod, drafting as drafting_mod, voice as voice_mod
     from lnp.drafting import Extract
 
     monkeypatch.setattr(
@@ -826,12 +875,37 @@ def test_messages_refused_once_a_discussion_became_a_post(api, monkeypatch):
     monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
     api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
     monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+    store_for().save_voice_card("A starter voice card.")
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A fresh draft of about the right length. " * 20)
     api.post(f"/api/discussions/{created['id']}/turn-into-post")
 
     response = api.post(
         f"/api/discussions/{created['id']}/messages", json={"content": "one more thing"}
     )
     assert response.status_code == 409
+
+
+def test_turn_into_post_refuses_a_row_mid_publish(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    seed([Row(ID="01SRC", Status=Status.POSTING, SourceURL="https://x.test/a")])
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={
+        "source_url": "https://x.test/a", "row_id": "01SRC",
+    }).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+    monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+
+    response = api.post(f"/api/discussions/{created['id']}/turn-into-post")
+    assert response.status_code == 409
+    # Refused, not silently corrupted: the row being posted right now is untouched.
+    assert store_for().pipeline_rows()[0].status == "POSTING"
 
 
 def test_delete_discussion(api, monkeypatch):
