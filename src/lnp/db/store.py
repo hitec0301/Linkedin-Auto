@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from .. import log
 from ..models import (
     COLUMNS,
+    LEGAL_TRANSITIONS,
     Row,
     Status,
     assert_human_writable,
@@ -42,6 +43,7 @@ from ..models import (
 )
 from ..util import iso, parse_bool, parse_dt, parse_float, parse_int, utcnow
 from .schema import (
+    Discussion,
     Feedback,
     PipelineRow,
     Setting,
@@ -56,6 +58,7 @@ logger = log.get(__name__)
 KEY_PAUSED = "PAUSED"
 KEY_POST_COUNT = "POST_COUNT"
 KEY_PERSON_URN = "PERSON_URN"
+KEY_AUDIENCE_DESCRIPTION = "AUDIENCE_DESCRIPTION"
 
 TRUTHY = {"true", "yes", "1", "on", "paused"}
 
@@ -103,6 +106,20 @@ class AmendmentRecord:
         return self.accepted and not (self.applied or "").strip()
 
 
+@dataclass
+class DiscussionRecord:
+    """A scratchpad conversation, as stored."""
+
+    id: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    source_url: str = ""
+    source_title: str = ""
+    started_from_row_id: str = ""
+    row_id: str = ""
+    messages: List[Dict[str, str]] = field(default_factory=list)
+
+
 # (Row field, ORM attribute, kind). The order is COLUMNS' order, and the test
 # suite asserts every column appears exactly once — a column added to the model
 # without a mapping here would otherwise be silently dropped on write.
@@ -129,6 +146,8 @@ FIELDS: List[Tuple[str, str, str]] = [
     ("EditDistance", "edit_distance", "float"),
     ("Reach", "reach", "int"),
     ("Error", "error", "text"),
+    ("ImagePrompt", "image_prompt", "text"),
+    ("ImageData", "image_data", "text"),
 ]
 
 BY_COLUMN: Dict[str, Tuple[str, str]] = {c: (a, k) for c, a, k in FIELDS}
@@ -280,7 +299,8 @@ class PipelineStore:
     # ---- the guarded write path ------------------------------------------
 
     def write(
-        self, row: Row, updates: Dict[str, Any], *, allow_revision_note: bool = False
+        self, row: Row, updates: Dict[str, Any], *,
+        allow_revision_note: bool = False, allow_final_text_reset: bool = False,
     ) -> None:
         """A job writing to a row.
 
@@ -289,7 +309,11 @@ class PipelineStore:
         """
         if not updates:
             return
-        assert_writable(list(updates), allow_revision_note=allow_revision_note)
+        assert_writable(
+            list(updates),
+            allow_revision_note=allow_revision_note,
+            allow_final_text_reset=allow_final_text_reset,
+        )
         self._write_fields(row, updates)
         for name, value in updates.items():
             setattr(row, name, "" if value is None else str(value))
@@ -327,6 +351,35 @@ class PipelineStore:
         payload["Status"] = target
         self.write(row, payload, allow_revision_note=allow_revision_note)
         logger.info("status changed", extra={"row_id": row.ID, "to": target})
+
+    def set_status_freely(self, row: Row, target: str) -> None:
+        """Move a row directly to any status, bypassing the transition guard.
+
+        For the one interface action deliberately not gated by the state
+        machine: the status dropdown. A target that is not a real status is
+        still refused, and POSTING is refused outright - it is not a status
+        a person sets, it is the marker the publish path writes immediately
+        before calling LinkedIn and clears immediately after, and setting it
+        by hand is the one way to make an unpublished row look mid-flight.
+        Everything else moves on request. An irregular jump - one the state
+        machine itself would not have allowed - is logged rather than
+        blocked, so the safety net removed from the interface is not also
+        removed from the record of what happened.
+        """
+        if target == Status.POSTING:
+            raise StoreError(
+                "POSTING is a marker the publish job sets itself while a "
+                "post is going out, not a status you can choose"
+            )
+        if target not in LEGAL_TRANSITIONS:
+            raise StoreError(f"unknown status {target!r}")
+        if target != row.status and target not in LEGAL_TRANSITIONS.get(row.status, set()):
+            logger.warning(
+                "status set outside the normal state machine",
+                extra={"row_id": row.ID, "from": row.status, "to": target},
+            )
+        self.write(row, {"Status": target})
+        logger.info("status changed (free choice)", extra={"row_id": row.ID, "to": target})
 
     def published_rows(self) -> List[Row]:
         return [r for r in self.pipeline_rows() if r.status == Status.POSTED]
@@ -520,6 +573,75 @@ class PipelineStore:
         if found is None or found.tenant_id != self.tenant_id:
             raise StoreError(f"amendment {record.id} does not exist")
         found.applied = value
+        self.session.commit()
+
+    # ---- discussions -------------------------------------------------------
+
+    @staticmethod
+    def _discussion_record(d: Discussion) -> DiscussionRecord:
+        return DiscussionRecord(
+            id=d.id,
+            created_at=iso(d.created_at) if d.created_at else "",
+            updated_at=iso(d.updated_at) if d.updated_at else "",
+            source_url=d.source_url,
+            source_title=d.source_title,
+            started_from_row_id=d.started_from_row_id,
+            row_id=d.row_id,
+            messages=list(d.messages or []),
+        )
+
+    def discussions(self) -> List[DiscussionRecord]:
+        stmt = (
+            select(Discussion)
+            .where(Discussion.tenant_id == self.tenant_id)
+            .order_by(Discussion.updated_at.desc())
+        )
+        return [self._discussion_record(d) for d in self.session.scalars(stmt)]
+
+    def discussion(self, discussion_id: str) -> DiscussionRecord:
+        found = self.session.get(Discussion, discussion_id)
+        if found is None or found.tenant_id != self.tenant_id:
+            raise StoreError(f"discussion {discussion_id} does not exist")
+        return self._discussion_record(found)
+
+    def create_discussion(
+        self, *, source_url: str, source_title: str, started_from_row_id: str,
+        messages: Sequence[Dict[str, str]],
+    ) -> DiscussionRecord:
+        found = Discussion(
+            id=ulid.new().str,
+            tenant_id=self.tenant_id,
+            source_url=source_url,
+            source_title=source_title,
+            started_from_row_id=started_from_row_id,
+            messages=list(messages),
+        )
+        self.session.add(found)
+        self.session.commit()
+        return self._discussion_record(found)
+
+    def append_discussion_messages(
+        self, discussion_id: str, messages: Sequence[Dict[str, str]]
+    ) -> DiscussionRecord:
+        found = self.session.get(Discussion, discussion_id)
+        if found is None or found.tenant_id != self.tenant_id:
+            raise StoreError(f"discussion {discussion_id} does not exist")
+        found.messages = list(found.messages or []) + list(messages)
+        self.session.commit()
+        return self._discussion_record(found)
+
+    def mark_discussion_committed(self, discussion_id: str, row_id: str) -> None:
+        found = self.session.get(Discussion, discussion_id)
+        if found is None or found.tenant_id != self.tenant_id:
+            raise StoreError(f"discussion {discussion_id} does not exist")
+        found.row_id = row_id
+        self.session.commit()
+
+    def delete_discussion(self, discussion_id: str) -> None:
+        found = self.session.get(Discussion, discussion_id)
+        if found is None or found.tenant_id != self.tenant_id:
+            raise StoreError(f"discussion {discussion_id} does not exist")
+        self.session.delete(found)
         self.session.commit()
 
     # ---- voice card ------------------------------------------------------

@@ -15,14 +15,16 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .. import log
+from .. import log, publish_loop
 from ..config import REPO_ROOT
 from ..llm import UsageCapExceeded
 from ..db.store import StoreError
 from ..tokens import TokenError
 from . import security
+from .deps import PUBLISH_NOW_LOCK, config as get_config
 from .routes_account import router as account_router
 from .routes_auth import router as auth_router
+from .routes_discuss import router as discuss_router
 from .routes_pipeline import router as pipeline_router
 
 logger = log.get(__name__)
@@ -43,6 +45,13 @@ REQUIRED_ENV = (
     "LNP_AUTH_CLIENT_SECRET",
 )
 OPTIONAL_ENV = ("ANTHROPIC_API_KEY", "SLACK_WEBHOOK_URL")
+
+# Opt-in, not opt-out: create_app() runs on every test and on every import of
+# this module (see `app = create_app()` below), and a background thread that
+# fired off real publish attempts in that context would be a hazard, not a
+# feature. Only scripts/serve.sh - the actual web server's start command -
+# sets this before the process starts.
+PUBLISH_CHECKER_ENV = "LNP_PUBLISH_CHECKER"
 
 
 def config_report() -> dict:
@@ -74,6 +83,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(pipeline_router)
     app.include_router(account_router)
+    app.include_router(discuss_router)
 
     @app.exception_handler(UsageCapExceeded)
     def _cap(request: Request, exc: UsageCapExceeded) -> JSONResponse:
@@ -91,6 +101,22 @@ def create_app() -> FastAPI:
     def _auth(request: Request, exc: security.AuthError) -> JSONResponse:
         return JSONResponse({"detail": str(exc)}, status_code=401)
 
+    @app.exception_handler(Exception)
+    def _unhandled(request: Request, exc: Exception) -> JSONResponse:
+        """Anything a route did not anticipate, still comes back as JSON.
+
+        Without this, an unhandled exception is Starlette's own plain-text
+        error page - which the frontend's `request()` cannot even parse as
+        JSON, so the failure it is trying to report never reaches the person
+        looking at the screen. Logged in full here; shown to them as one
+        plain sentence, since a stack trace is not theirs to read.
+        """
+        logger.error("unhandled exception", extra={"path": request.url.path}, exc_info=exc)
+        return JSONResponse(
+            {"detail": "something went wrong on our end; try again in a moment"},
+            status_code=500,
+        )
+
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict:
         return {"ok": True, **config_report()}
@@ -100,6 +126,9 @@ def create_app() -> FastAPI:
         response = JSONResponse({"ok": True})
         response.delete_cookie(security.SESSION_COOKIE, path="/")
         return response
+
+    if os.environ.get(PUBLISH_CHECKER_ENV, "").strip().lower() in {"1", "true", "yes"}:
+        publish_loop.start(get_config(), PUBLISH_NOW_LOCK)
 
     if WEB_DIST.is_dir():
         app.mount(

@@ -121,7 +121,12 @@ anything after that is read only by people the first two lines convinced.
 - Short paragraphs, one idea each, with a blank line between them.
 - Close on a statement. Never close on a question.
 - No em-dashes anywhere.
-- At most {max_hashtags} hashtags, at the end, or none.
+- Up to {max_hashtags} hashtags, at the end, or none. Each one names \
+something specific to this post's actual subject - the practice, \
+technology, role, or field it is really about - never a generic label like \
+#Business, #Leadership, or #Innovation that could sit on any post \
+unchanged. If the post is not specific enough to support that many good \
+tags, use fewer rather than padding to the limit.
 - Include the source URL on its own line near the end, as plain text.
 - Only numbers that appear in the source extract."""
 
@@ -352,7 +357,6 @@ def draft(
         user=prompt,
         model=config.get("drafting.model", "claude-sonnet-4-6"),
         max_tokens=int(config.get("drafting.max_tokens", 4000)),
-        temperature=config.get("drafting.temperature"),
     )
     if variants and contains_both_variants(raw):
         first, second = split_variants(raw)
@@ -386,6 +390,5 @@ def revise(
         user=prompt,
         model=config.get("drafting.model", "claude-sonnet-4-6"),
         max_tokens=int(config.get("drafting.max_tokens", 4000)),
-        temperature=config.get("drafting.temperature"),
     )
     return postprocess(raw)

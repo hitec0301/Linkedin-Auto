@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from conftest import make_engine
+from conftest import connect_linkedin, make_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -28,10 +28,14 @@ from lnp.db import session as session_mod
 from lnp.db.schema import Base, Source, Tenant, VoiceAmendment, VoiceCard
 from lnp.db.store import PipelineStore
 from lnp.models import Row, Status
-from lnp.util import iso, utcnow
+from lnp.util import iso, parse_dt, utcnow
 
 TENANT = "01J000000000000000000000AA"
 OTHER = "01J000000000000000000000BB"
+
+STARTER_VOICE_CARD = (
+    Path(__file__).resolve().parents[1] / "config" / "voice_card.md"
+).read_text()
 
 
 @pytest.fixture
@@ -106,8 +110,10 @@ def test_another_accounts_row_is_not_found_rather_than_forbidden(api):
     """Not 403: whether that id exists is itself somebody else's business."""
     seed([Row(ID="01THEIRS", Status=Status.DRAFTED, DraftText="theirs")], OTHER)
     assert api.get("/api/rows/01THEIRS").status_code == 404
-    assert api.patch("/api/rows/01THEIRS", json={"angle": "mine now"}).status_code == 404
-    assert api.post("/api/rows/01THEIRS/approve").status_code == 404
+    assert api.patch("/api/rows/01THEIRS", json={"take": "mine now"}).status_code == 404
+    assert api.put(
+        "/api/rows/01THEIRS/status", json={"status": "APPROVED"}
+    ).status_code == 404
 
 
 def test_another_accounts_source_cannot_be_edited(api):
@@ -141,13 +147,51 @@ def test_edits_land_in_final_text(api):
     assert body["draft_text"] == "model text"
 
 
-def test_selecting_and_angling_a_row(api):
+def test_two_variants_are_split_out_for_the_picker(api):
+    from lnp.drafting import VARIANT_A, VARIANT_B
+
+    seed([Row(ID="01A", Status=Status.DRAFTED,
+               DraftText=f"{VARIANT_A}\nFirst version.\n\n{VARIANT_B}\nSecond version.")])
+    body = api.get("/api/rows/01A").json()
+    assert body["variant_a"] == "First version."
+    assert body["variant_b"] == "Second version."
+    assert body["draft_text"].startswith(VARIANT_A)  # untouched, for the record
+
+
+def test_picking_a_variant_clears_the_picker(api):
+    from lnp.drafting import VARIANT_A, VARIANT_B
+
+    seed([Row(ID="01A", Status=Status.DRAFTED,
+               DraftText=f"{VARIANT_A}\nFirst version.\n\n{VARIANT_B}\nSecond version.")])
+    body = api.patch("/api/rows/01A", json={"final_text": "First version."}).json()
+    assert body["variant_a"] == ""
+    assert body["variant_b"] == ""
+    assert body["final_text"] == "First version."
+
+
+def test_selecting_and_taking_a_row(api):
     seed([Row(ID="01A", Status=Status.NEW)])
     body = api.patch(
-        "/api/rows/01A", json={"selected": True, "angle": "what buyers miss"}
+        "/api/rows/01A", json={"selected": True, "take": "what buyers miss"}
     ).json()
     assert body["selected"] is True
-    assert body["angle"] == "what buyers miss"
+    assert body["take"] == "what buyers miss"
+
+
+def test_take_lands_in_the_angle_before_a_draft_exists(api):
+    seed([Row(ID="01A", Status=Status.NEW)])
+    api.patch("/api/rows/01A", json={"take": "an angle"})
+    row = store_for().pipeline_rows()[0]
+    assert row.Angle == "an angle"
+    assert row.RevisionNote == ""
+
+
+def test_take_lands_in_the_revision_note_once_a_draft_exists(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="already drafted", Angle="original")])
+    api.patch("/api/rows/01A", json={"take": "cut the closing question"})
+    row = store_for().pipeline_rows()[0]
+    assert row.RevisionNote == "cut the closing question"
+    assert row.Angle == "original"  # the original angle is not overwritten
 
 
 # --------------------------------------------------------------------------
@@ -155,60 +199,63 @@ def test_selecting_and_angling_a_row(api):
 # --------------------------------------------------------------------------
 
 
-def test_approving_marks_the_row_and_publishes_nothing(api):
+def test_setting_status_moves_the_row(api):
     seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a real draft")])
-    body = api.post("/api/rows/01A/approve").json()
+    body = api.put("/api/rows/01A/status", json={"status": "approved"}).json()
     assert body["status"] == Status.APPROVED
     assert body["post_urn"] == ""     # nothing was published by this call
 
 
-def test_an_empty_row_cannot_be_approved(api):
-    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="   ")])
-    response = api.post("/api/rows/01A/approve")
-    assert response.status_code == 400
-    assert "nothing to publish" in response.json()["detail"]
-
-
-def test_a_new_row_cannot_be_approved(api):
-    """Approval has to pass through a draft somebody actually read."""
-    seed([Row(ID="01A", Status=Status.NEW, DraftText="")])
-    assert api.post("/api/rows/01A/approve").status_code in (400, 409)
-
-
-def test_a_posted_row_cannot_be_approved_again(api):
-    seed([Row(ID="01A", Status=Status.POSTED, DraftText="already out", PostedAt=iso())])
-    response = api.post("/api/rows/01A/approve")
-    assert response.status_code == 409
-    assert "POSTED" in response.json()["detail"]
-
-
-def test_revising_stores_the_note_and_moves_the_row(api):
-    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
-    body = api.post("/api/rows/01A/revise", json={"note": "stop opening with a question"}).json()
-    assert body["status"] == Status.REVISE
-    assert body["revision_note"] == "stop opening with a question"
-
-
-def test_an_empty_revision_note_is_refused(api):
-    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
-    assert api.post("/api/rows/01A/revise", json={"note": "  "}).status_code in (400, 422)
-
-
-def test_allowed_actions_come_from_the_state_machine(api):
+def test_status_can_be_set_freely_even_outside_the_state_machine(api):
+    """The user's call, not the state machine's - a NEW row can jump straight
+    to Approved, and a POSTED row can be walked back to Drafted."""
     seed([
-        Row(ID="01A", Status=Status.DRAFTED, DraftText="d"),
-        Row(ID="01B", Status=Status.POSTING, DraftText="d"),
-        Row(ID="01C", Status=Status.APPROVED, DraftText="d"),
+        Row(ID="01A", Status=Status.NEW),
+        Row(ID="01B", Status=Status.POSTED, DraftText="already out", PostedAt=iso()),
     ])
-    actions = {r["id"]: r["allowed_actions"] for r in api.get("/api/rows").json()}
-    assert "approve" in actions["01A"]
-    assert actions["01B"] == []            # mid-flight: the human waits
-    assert "approve" not in actions["01C"]  # already approved
+    assert api.put("/api/rows/01A/status", json={"status": "APPROVED"}).json()["status"] == "APPROVED"
+    assert api.put("/api/rows/01B/status", json={"status": "DRAFTED"}).json()["status"] == "DRAFTED"
 
 
-def test_a_row_being_published_cannot_be_touched(api):
+def test_status_refuses_posting(api):
+    """POSTING is a marker the publish path sets itself, not a choice a person makes."""
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    response = api.put("/api/rows/01A/status", json={"status": "POSTING"})
+    assert response.status_code == 400
+
+
+def test_status_refuses_an_unknown_value(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    response = api.put("/api/rows/01A/status", json={"status": "NOT_A_REAL_STATUS"})
+    assert response.status_code == 422
+
+
+def test_bulk_skip_removes_several_rows_at_once(api):
+    seed([
+        Row(ID="01A", Status=Status.NEW),
+        Row(ID="01B", Status=Status.DRAFTED, DraftText="d"),
+        Row(ID="01C", Status=Status.NEW),
+    ])
+    body = api.post("/api/rows/bulk-skip", json={"ids": ["01A", "01B"]}).json()
+    assert set(body["removed"]) == {"01A", "01B"}
+    statuses = {r["id"]: r["status"] for r in api.get("/api/rows").json()}
+    assert statuses["01A"] == Status.SKIPPED
+    assert statuses["01B"] == Status.SKIPPED
+    assert statuses["01C"] == Status.NEW
+
+
+def test_bulk_skip_does_not_touch_a_row_mid_publish(api):
     seed([Row(ID="01A", Status=Status.POSTING, DraftText="d")])
-    assert api.post("/api/rows/01A/skip").status_code == 409
+    body = api.post("/api/rows/bulk-skip", json={"ids": ["01A"]}).json()
+    assert body["removed"] == []
+    assert api.get("/api/rows/01A").json()["status"] == Status.POSTING
+
+
+def test_bulk_skip_does_not_reach_another_tenants_rows(api):
+    seed([Row(ID="01THEIRS", Status=Status.NEW)], tenant_id=OTHER)
+    body = api.post("/api/rows/bulk-skip", json={"ids": ["01THEIRS"]}).json()
+    assert body["removed"] == []
+    assert store_for(OTHER).pipeline_rows()[0].status == Status.NEW
 
 
 def test_rows_can_be_filtered_by_status(api):
@@ -244,8 +291,8 @@ def test_a_lapsed_account_can_still_pause_and_still_read(api):
 
     assert api.get("/api/rows").status_code == 200
     assert api.put("/api/pause", json={"paused": True}).status_code == 200
-    # But not approve new posts.
-    assert api.post("/api/rows/01A/approve").status_code == 402
+    # But not change anything about a post.
+    assert api.put("/api/rows/01A/status", json={"status": "APPROVED"}).status_code == 402
 
 
 # --------------------------------------------------------------------------
@@ -259,8 +306,8 @@ def test_the_voice_card_is_editable_in_full(api):
     assert "Write plainly" in api.get("/api/voice-card").json()["content"]
 
 
-def test_accepting_an_amendment_does_not_itself_change_the_card(api):
-    """Two gates: a person ticks it, and the weekly job writes it."""
+def test_accepting_an_amendment_writes_it_into_the_card_immediately(api):
+    """No weekly job left to do it later - accepting is the only gate now."""
     api.put("/api/voice-card", json={"content": "# Voice\n\n<!-- AMENDMENTS-BEGIN -->\n<!-- AMENDMENTS-END -->"})
     with session_mod.session_scope() as session:
         session.add(VoiceAmendment(id="01AM", tenant_id=TENANT, rule="No em dashes",
@@ -268,6 +315,19 @@ def test_accepting_an_amendment_does_not_itself_change_the_card(api):
 
     body = api.put("/api/amendments/01AM", json={"accepted": True}).json()
     assert body["accepted"] is True
+    assert body["applied"] != ""
+    assert "No em dashes" in api.get("/api/voice-card").json()["content"]
+
+
+def test_unticking_an_amendment_does_not_touch_the_card(api):
+    api.put("/api/voice-card", json={"content": "# Voice\n\n<!-- AMENDMENTS-BEGIN -->\n<!-- AMENDMENTS-END -->"})
+    with session_mod.session_scope() as session:
+        session.add(VoiceAmendment(id="01AM", tenant_id=TENANT, rule="No em dashes",
+                                   signal="DIFF", source_row_ids=[]))
+
+    body = api.put("/api/amendments/01AM", json={"accepted": False}).json()
+    assert body["accepted"] is False
+    assert body["applied"] == ""
     assert "No em dashes" not in api.get("/api/voice-card").json()["content"]
 
 
@@ -528,6 +588,352 @@ def test_the_shipped_schema_matches_the_migrations(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Starting a post yourself: a source to cite, and a take to write from
+# --------------------------------------------------------------------------
+
+
+def test_create_row_makes_a_new_row_from_a_source_and_a_take(api):
+    body = api.post("/api/rows", json={
+        "source_url": "https://example.test/an-article",
+        "source_title": "An article worth citing",
+        "take": "My own thesis about this, spelled out at whatever length I want.",
+    }).json()
+    assert body["status"] == "NEW"
+    assert body["source_url"] == "https://example.test/an-article"
+    assert body["source_title"] == "An article worth citing"
+    assert body["take"] == "My own thesis about this, spelled out at whatever length I want."
+
+    listed = [r["id"] for r in api.get("/api/rows").json()]
+    assert body["id"] in listed
+
+
+def test_create_row_works_with_no_title_or_take(api):
+    body = api.post("/api/rows", json={"source_url": "https://example.test/x"}).json()
+    assert body["status"] == "NEW"
+    assert body["source_title"] == ""
+    assert body["take"] == ""
+
+
+def test_create_row_rejects_a_blank_url(api):
+    response = api.post("/api/rows", json={"source_url": ""})
+    assert response.status_code == 422
+
+
+def test_create_row_rejects_something_that_is_not_a_url(api):
+    response = api.post("/api/rows", json={"source_url": "not a url"})
+    assert response.status_code == 422
+
+
+def test_create_row_is_scoped_to_the_signed_in_tenant(api):
+    body = api.post("/api/rows", json={"source_url": "https://example.test/y"}).json()
+    assert store_for(OTHER).pipeline_rows() == []
+    assert store_for().pipeline_rows()[0].ID == body["id"]
+
+
+def test_a_self_started_row_can_be_redrafted_like_any_other(api, monkeypatch):
+    """The point: it is indistinguishable from a fetched candidate from here on."""
+    from lnp import drafting as drafting_mod, voice as voice_mod
+
+    created = api.post("/api/rows", json={
+        "source_url": "https://example.test/an-article",
+        "take": "My own angle on this.",
+    }).json()
+    store_for().save_voice_card("A starter voice card.")
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A drafted post. " * 20)
+
+    response = api.post(f"/api/rows/{created['id']}/redraft-now", json={"take": created["take"]})
+    assert response.status_code == 200
+    assert response.json()["status"] == "DRAFTED"
+
+
+# --------------------------------------------------------------------------
+# Discuss: explore a source, argue with it, before it becomes a post
+# --------------------------------------------------------------------------
+
+
+def test_create_discussion_summarizes_the_source(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize",
+        lambda config, **kw: ("A neutral summary of the article.", Extract("body", True)),
+    )
+
+    body = api.post("/api/discussions", json={
+        "source_url": "https://example.test/an-article",
+        "source_title": "An article",
+    }).json()
+    assert body["source_url"] == "https://example.test/an-article"
+    assert body["messages"] == [
+        {"role": "assistant", "content": "A neutral summary of the article."}
+    ]
+    assert body["row_id"] == ""
+    assert body["started_from_row_id"] == ""
+
+    listed = [d["id"] for d in api.get("/api/discussions").json()]
+    assert body["id"] in listed
+    assert api.get(f"/api/discussions/{body['id']}").json()["id"] == body["id"]
+
+
+def test_create_discussion_rejects_a_bad_url(api):
+    response = api.post("/api/discussions", json={"source_url": "not a url"})
+    assert response.status_code == 422
+
+
+def test_create_discussion_can_start_from_an_existing_row(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    seed([Row(ID="01SRC", Status=Status.NEW, SourceURL="https://x.test/a")])
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+
+    body = api.post("/api/discussions", json={
+        "source_url": "https://x.test/a", "row_id": "01SRC",
+    }).json()
+    assert body["started_from_row_id"] == "01SRC"
+
+
+def test_create_discussion_refuses_an_unknown_row_id(api):
+    response = api.post("/api/discussions", json={
+        "source_url": "https://x.test/a", "row_id": "01NOPE",
+    })
+    assert response.status_code == 404
+
+
+def test_post_message_appends_the_exchange(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "A pushback question.")
+    body = api.post(
+        f"/api/discussions/{created['id']}/messages", json={"content": "I think this is right."}
+    ).json()
+    assert body["messages"] == [
+        {"role": "assistant", "content": "Summary."},
+        {"role": "user", "content": "I think this is right."},
+        {"role": "assistant", "content": "A pushback question."},
+    ]
+
+
+def test_post_message_rejects_a_blank_message(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    response = api.post(f"/api/discussions/{created['id']}/messages", json={"content": "  "})
+    assert response.status_code == 422
+
+
+def test_turn_into_post_creates_a_new_row_when_standalone(api, monkeypatch):
+    """Lands DRAFTED, not NEW: turn-into-post drafts immediately, the same
+    way "Redraft with AI" would, instead of leaving a bare take."""
+    from lnp import discuss as discuss_mod, drafting as drafting_mod, voice as voice_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={
+        "source_url": "https://x.test/a", "source_title": "A title",
+    }).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+
+    monkeypatch.setattr(
+        discuss_mod, "synthesize_take", lambda config, **kw: "The synthesized thesis."
+    )
+    store_for().save_voice_card("A starter voice card.")
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A fresh draft of about the right length. " * 20)
+
+    row = api.post(f"/api/discussions/{created['id']}/turn-into-post").json()
+    assert row["status"] == "DRAFTED"
+    assert row["source_url"] == "https://x.test/a"
+    assert row["take"] == "The synthesized thesis."
+    assert "fresh draft" in row["draft_text"]
+
+    listed = [r["id"] for r in api.get("/api/rows").json()]
+    assert row["id"] in listed
+
+    discussion = api.get(f"/api/discussions/{created['id']}").json()
+    assert discussion["row_id"] == row["id"]
+
+
+def test_turn_into_post_updates_the_row_it_started_from(api, monkeypatch):
+    from lnp import discuss as discuss_mod, drafting as drafting_mod, voice as voice_mod
+    from lnp.drafting import Extract
+
+    seed([Row(ID="01SRC", Status=Status.NEW, SourceURL="https://x.test/a")])
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={
+        "source_url": "https://x.test/a", "row_id": "01SRC",
+    }).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+
+    monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+    store_for().save_voice_card("A starter voice card.")
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A fresh draft of about the right length. " * 20)
+
+    row = api.post(f"/api/discussions/{created['id']}/turn-into-post").json()
+    assert row["id"] == "01SRC"
+    assert row["take"] == "The thesis."
+    assert row["status"] == "DRAFTED"
+    assert len(api.get("/api/rows").json()) == 1  # updated in place, not duplicated
+
+
+def test_turn_into_post_produces_a_variant_pair_when_still_calibrating(api, monkeypatch):
+    """The point the user asked for: a discussion goes straight to the
+    side-by-side picker, not a lone draft needing a further redraft click."""
+    from lnp import discuss as discuss_mod, drafting as drafting_mod, voice as voice_mod
+    from lnp.drafting import VARIANT_A, VARIANT_B, Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+    monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+
+    store_for().save_voice_card("A starter voice card.")
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(
+        drafting_mod, "draft",
+        lambda config, row, ctx, **kw: (
+            f"{VARIANT_A}\nFirst version of the post, said one way. " * 8
+            + f"\n\n{VARIANT_B}\nSecond version of the post, said another way. " * 8
+        ),
+    )
+
+    row = api.post(f"/api/discussions/{created['id']}/turn-into-post").json()
+    assert row["status"] == "DRAFTED"
+    assert row["variant_a"] and row["variant_b"]
+    assert "First version" in row["variant_a"]
+    assert "Second version" in row["variant_b"]
+
+
+def test_turn_into_post_refuses_before_any_argument(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    response = api.post(f"/api/discussions/{created['id']}/turn-into-post")
+    assert response.status_code == 400
+
+
+def test_turn_into_post_refuses_a_second_time(api, monkeypatch):
+    from lnp import discuss as discuss_mod, drafting as drafting_mod, voice as voice_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+    monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+    store_for().save_voice_card("A starter voice card.")
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A fresh draft of about the right length. " * 20)
+
+    assert api.post(f"/api/discussions/{created['id']}/turn-into-post").status_code == 200
+    assert api.post(f"/api/discussions/{created['id']}/turn-into-post").status_code == 409
+
+
+def test_messages_refused_once_a_discussion_became_a_post(api, monkeypatch):
+    from lnp import discuss as discuss_mod, drafting as drafting_mod, voice as voice_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+    monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+    store_for().save_voice_card("A starter voice card.")
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A fresh draft of about the right length. " * 20)
+    api.post(f"/api/discussions/{created['id']}/turn-into-post")
+
+    response = api.post(
+        f"/api/discussions/{created['id']}/messages", json={"content": "one more thing"}
+    )
+    assert response.status_code == 409
+
+
+def test_turn_into_post_refuses_a_row_mid_publish(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    seed([Row(ID="01SRC", Status=Status.POSTING, SourceURL="https://x.test/a")])
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={
+        "source_url": "https://x.test/a", "row_id": "01SRC",
+    }).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+    monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The thesis.")
+
+    response = api.post(f"/api/discussions/{created['id']}/turn-into-post")
+    assert response.status_code == 409
+    # Refused, not silently corrupted: the row being posted right now is untouched.
+    assert store_for().pipeline_rows()[0].status == "POSTING"
+
+
+def test_delete_discussion(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+    assert api.delete(f"/api/discussions/{created['id']}").status_code == 204
+    assert api.get(f"/api/discussions/{created['id']}").status_code == 404
+
+
+def test_discussions_are_only_this_accounts(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        discuss_mod, "summarize", lambda config, **kw: ("Summary.", Extract("body", True))
+    )
+    created = api.post("/api/discussions", json={"source_url": "https://x.test/a"}).json()
+
+    assert store_for(OTHER).discussions() == []
+    assert api.get("/api/discussions").json()[0]["id"] == created["id"]
+
+
+# --------------------------------------------------------------------------
 # On-demand curate: the Setup screen's "fetch candidates now"
 # --------------------------------------------------------------------------
 
@@ -571,11 +977,44 @@ def test_curate_now_writes_rows_when_review_is_empty(api, monkeypatch):
     assert rows[0]["status"] == "NEW"
 
 
-def test_curate_now_refuses_when_review_is_not_empty(api):
-    """The button only exists for the empty state; the API enforces the same rule."""
-    seed([Row(ID="01ALREADYNEW", Status=Status.NEW)])
+def test_curate_now_adds_to_an_already_populated_review(api, monkeypatch):
+    """Fetching more is not gated on Review being empty - dedupe does the work."""
+    from lnp import ingest as ingest_mod
+    from lnp.ingest import Candidate, FeedResult
+
+    seed([Row(ID="01ALREADYNEW", Status=Status.NEW, SourceURL="https://feed.test/existing")])
+
+    with session_mod.session_scope() as session:
+        session.add(Source(id="01SRCMORE", tenant_id=TENANT, name="Feed",
+                            url="https://feed.test/rss", tier=2,
+                            audience="AUD_CORPORATE", active=True))
+
+    def fake_fetch(feed, timeout, user_agent):
+        items = [
+            Candidate(url="https://feed.test/a", title="A district buys AI seats",
+                      summary="summary", source_name=feed["name"],
+                      tier=feed["tier"], weight=feed["weight"]),
+        ]
+        return FeedResult(feed["name"], feed["url"], feed["tier"], True, len(items), "", items)
+
+    def fake_scorer(config, *, system, user, model=None, max_tokens=0):
+        import json
+        items = json.loads(user.split("Items to triage:\n", 1)[1])
+        return [
+            {"i": item["i"], "score": 8, "audience": "AUD_CORPORATE",
+             "theme": "THM_AI", "why": "Buyers will feel this before vendors do."}
+            for item in items
+        ]
+
+    monkeypatch.setattr(ingest_mod, "fetch_feed", fake_fetch)
+    monkeypatch.setattr("lnp.scoring.complete_json", fake_scorer)
+
     response = api.post("/api/rows/curate-now")
-    assert response.status_code == 409
+    assert response.status_code == 200
+    assert response.json()["written"] == 1
+
+    rows = api.get("/api/rows").json()
+    assert len(rows) == 2
 
 
 def test_curate_now_respects_the_cooldown(api):
@@ -621,3 +1060,552 @@ def test_curate_now_does_not_reach_another_tenants_rows(api, monkeypatch):
 
     other_rows = store_for(OTHER).pipeline_rows()
     assert [r.ID for r in other_rows] == ["01OTHERROW"]
+
+
+# --------------------------------------------------------------------------
+# Redraft with AI: one button, reachable from any row, at any stage
+# --------------------------------------------------------------------------
+
+
+def test_redraft_now_drafts_a_new_row_using_the_take_as_the_angle(api, monkeypatch):
+    from lnp import drafting as drafting_mod, voice as voice_mod
+
+    seed([Row(ID="01NEW", Status=Status.NEW,
+               SourceURL="https://x.test/a", SourceTitle="A title")])
+    store_for().save_voice_card("A starter voice card.")
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A fresh draft of about the right length. " * 20)
+
+    response = api.post(
+        "/api/rows/01NEW/redraft-now",
+        json={"take": "Procurement cycles, not model quality, decide adoption."},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "DRAFTED"
+    assert "fresh draft" in body["draft_text"]
+    assert body["scheduled_for"]
+    assert body["take"] == "Procurement cycles, not model quality, decide adoption."
+
+
+def test_redraft_now_works_with_no_take_at_all(api, monkeypatch):
+    """No angle, no history - still a generic blurb the person can edit or publish."""
+    from lnp import drafting as drafting_mod, voice as voice_mod
+
+    seed([Row(ID="01NEW", Status=Status.NEW,
+               SourceURL="https://x.test/a", SourceTitle="A title")])
+    store_for().save_voice_card("A starter voice card.")
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A generic blurb about the article. " * 20)
+
+    response = api.post("/api/rows/01NEW/redraft-now", json={})
+    assert response.status_code == 200
+    assert response.json()["status"] == "DRAFTED"
+
+
+def test_redraft_now_revises_a_drafted_row_using_the_take_as_the_instruction(api, monkeypatch):
+    from lnp import drafting as drafting_mod, voice as voice_mod
+
+    seed([Row(ID="01REV", Status=Status.DRAFTED, Angle="An angle",
+               DraftText="old draft", RevisionCount="1",
+               SourceURL="https://x.test/b", SourceTitle="B title",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())])
+    store_for().save_voice_card("A starter voice card.")
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise",
+                         lambda config, row, ctx, **kw: "A revised draft. " * 18)
+    monkeypatch.setattr(voice_mod, "propose_rules", lambda config, items, card: [])
+
+    response = api.post(
+        "/api/rows/01REV/redraft-now", json={"take": "cut the closing question"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "DRAFTED"
+    assert "revised draft" in body["draft_text"]
+
+    row = store_for().pipeline_rows()[0]
+    assert row.RevisionCount == "2"
+    assert row.RevisionNote == ""
+
+
+def test_redraft_now_clones_a_posted_row_instead_of_overwriting_it(api, monkeypatch):
+    from lnp import drafting as drafting_mod, voice as voice_mod
+
+    seed([Row(ID="01POSTED", Status=Status.POSTED, DraftText="what actually went out",
+               PostURN="urn:li:share:1", PostedAt=iso(),
+               SourceURL="https://x.test/c", SourceTitle="C title")])
+    store_for().save_voice_card("A starter voice card.")
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A brand new draft. " * 20)
+
+    response = api.post("/api/rows/01POSTED/redraft-now", json={"take": "a new angle"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] != "01POSTED"
+    assert body["status"] == "DRAFTED"
+
+    original = next(r for r in api.get("/api/rows").json() if r["id"] == "01POSTED")
+    assert original["status"] == "POSTED"
+    assert original["draft_text"] == "what actually went out"
+    assert original["post_urn"] == "urn:li:share:1"
+
+
+def test_redraft_now_refuses_a_row_being_published(api):
+    seed([Row(ID="01A", Status=Status.POSTING, DraftText="d")])
+    response = api.post("/api/rows/01A/redraft-now", json={"take": "x"})
+    assert response.status_code == 409
+
+
+def test_redraft_now_does_not_reach_another_tenants_row(api, monkeypatch):
+    from lnp import drafting as drafting_mod, voice as voice_mod
+
+    seed([Row(ID="01THEIRS", Status=Status.DRAFTED, Angle="a", DraftText="old",
+               RevisionCount="0",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())], tenant_id=OTHER)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "revised. " * 20)
+
+    response = api.post("/api/rows/01THEIRS/redraft-now", json={"take": "note"})
+    assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# Generate image
+# --------------------------------------------------------------------------
+
+
+def test_generate_image_writes_prompt_and_image_to_the_row(api, monkeypatch):
+    from lnp import image_gen
+
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post about training budgets.")])
+    monkeypatch.setattr(image_gen, "build_prompt", lambda config, row: "a quiet office, morning light")
+    monkeypatch.setattr(image_gen, "generate", lambda config, prompt, **kw: b"pretend-png-bytes")
+
+    response = api.post("/api/rows/01D/generate-image")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["image_prompt"] == "a quiet office, morning light"
+    assert body["image_data_url"].startswith("data:image/png;base64,")
+
+    # Persisted, not just returned on the response.
+    again = api.get("/api/rows/01D").json()
+    assert again["image_data_url"] == body["image_data_url"]
+
+
+def test_generate_image_refuses_a_row_with_no_text_yet(api):
+    seed([Row(ID="01NEW", Status=Status.NEW, SourceTitle="A title")])
+    response = api.post("/api/rows/01NEW/generate-image")
+    assert response.status_code == 502
+
+
+def test_generate_image_surfaces_a_clean_error_from_the_model(monkeypatch, api):
+    from lnp import image_gen
+
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post about training budgets.")])
+    monkeypatch.setattr(image_gen, "build_prompt", lambda config, row: "a prompt")
+
+    def explode(config, prompt, **kw):
+        raise image_gen.ImageGenError("the model refused: safety")
+
+    monkeypatch.setattr(image_gen, "generate", explode)
+    response = api.post("/api/rows/01D/generate-image")
+    assert response.status_code == 502
+    assert "safety" in response.json()["detail"]
+
+
+def test_generate_image_reports_a_missing_api_key_as_clean_json(api, monkeypatch):
+    """GEMINI_API_KEY missing must come back as a real error, not a raw crash
+    the frontend cannot even parse as JSON."""
+    from lnp import image_gen
+
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post about training budgets.")])
+    monkeypatch.setattr(image_gen, "build_prompt", lambda config, row: "a prompt")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    response = api.post("/api/rows/01D/generate-image")
+    assert response.status_code == 500
+    assert "GEMINI_API_KEY" in response.json()["detail"]
+
+
+def test_an_unexpected_exception_still_comes_back_as_json(api, monkeypatch):
+    """Any route's surprise failure must be catchable by the frontend, not
+    Starlette's own plain-text error page.
+
+    Starlette's ServerErrorMiddleware re-raises the original exception after
+    sending its response - by design, for WSGI/ASGI servers and loggers - so
+    TestClient's default raise_server_exceptions=True surfaces it as a raised
+    exception in the test process rather than a response object. A second
+    client with that off, sharing the same already-configured database and
+    session cookie, is what actually observes what a browser would receive.
+    """
+    from fastapi.testclient import TestClient
+    from lnp import image_gen
+    from lnp.api.app import create_app
+
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post about training budgets.")])
+
+    def explode(config, row):
+        raise RuntimeError("something nobody anticipated")
+
+    monkeypatch.setattr(image_gen, "build_prompt", explode)
+
+    lenient = TestClient(create_app(), raise_server_exceptions=False)
+    lenient.cookies = api.cookies
+    response = lenient.post("/api/rows/01D/generate-image")
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["detail"]
+
+
+def test_generate_image_regenerating_overwrites_the_old_one(api, monkeypatch):
+    from lnp import image_gen
+
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post.",
+               ImagePrompt="old prompt", ImageData="b2xk")])
+    monkeypatch.setattr(image_gen, "build_prompt", lambda config, row: "new prompt")
+    monkeypatch.setattr(image_gen, "generate", lambda config, prompt, **kw: b"new-bytes")
+
+    response = api.post("/api/rows/01D/generate-image")
+    body = response.json()
+    assert body["image_prompt"] == "new prompt"
+    assert "bmV3LWJ5dGVz" in body["image_data_url"]  # base64("new-bytes")
+
+
+def test_generate_image_does_not_reach_another_tenants_row(api, monkeypatch):
+    from lnp import image_gen
+
+    seed([Row(ID="01THEIRS", Status=Status.DRAFTED, DraftText="a draft")], tenant_id=OTHER)
+    monkeypatch.setattr(image_gen, "build_prompt", lambda config, row: "prompt")
+    monkeypatch.setattr(image_gen, "generate", lambda config, prompt, **kw: b"bytes")
+
+    response = api.post("/api/rows/01THEIRS/generate-image")
+    assert response.status_code == 404
+
+
+def test_remove_image_clears_both_columns(api):
+    seed([Row(ID="01D", Status=Status.DRAFTED, DraftText="A post.",
+               ImagePrompt="a prompt", ImageData="b2xk")])
+    response = api.delete("/api/rows/01D/image")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["image_prompt"] == ""
+    assert body["image_data_url"] == ""
+
+
+def test_remove_image_does_not_reach_another_tenants_row(api):
+    seed([Row(ID="01THEIRS", Status=Status.DRAFTED, DraftText="a draft",
+               ImagePrompt="a prompt", ImageData="b2xk")], tenant_id=OTHER)
+    response = api.delete("/api/rows/01THEIRS/image")
+    assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# Publish timing: approve via the status dropdown, then schedule or post now
+# --------------------------------------------------------------------------
+
+
+def test_approving_via_status_does_not_itself_set_a_schedule(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    body = api.put("/api/rows/01A/status", json={"status": "APPROVED"}).json()
+    assert body["status"] == "APPROVED"
+    assert body["scheduled_for"] == ""
+
+
+def test_a_freshly_approved_row_can_then_be_scheduled(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    api.put("/api/rows/01A/status", json={"status": "APPROVED"})
+    when = utcnow() + timedelta(days=3)
+    body = api.put(
+        "/api/rows/01A/schedule", json={"scheduled_for": when.isoformat()}
+    ).json()
+    assert body["scheduled_for"].startswith(when.strftime("%Y-%m-%dT%H:%M"))
+
+
+# --------------------------------------------------------------------------
+# Publish timing on an already-approved row
+# --------------------------------------------------------------------------
+
+
+def test_reschedule_moves_an_approved_rows_slot(api):
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())])
+    when = utcnow() + timedelta(days=5)
+    body = api.put(
+        "/api/rows/01A/schedule", json={"scheduled_for": when.isoformat()}
+    ).json()
+    assert body["scheduled_for"].startswith(when.strftime("%Y-%m-%dT%H:%M"))
+
+
+def test_reschedule_refuses_a_row_that_is_not_approved(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    when = utcnow() + timedelta(days=1)
+    response = api.put(
+        "/api/rows/01A/schedule", json={"scheduled_for": when.isoformat()}
+    )
+    assert response.status_code == 409
+
+
+def test_reschedule_refuses_a_past_time(api):
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())])
+    when = utcnow() - timedelta(hours=1)
+    response = api.put(
+        "/api/rows/01A/schedule", json={"scheduled_for": when.isoformat()}
+    )
+    assert response.status_code == 400
+
+
+def test_reschedule_refuses_an_unparseable_time(api):
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())])
+    response = api.put("/api/rows/01A/schedule", json={"scheduled_for": "not a date"})
+    assert response.status_code == 400
+
+
+# --------------------------------------------------------------------------
+# Restore: bring a Failed or Expired row back to Approved
+# --------------------------------------------------------------------------
+
+
+def test_restore_a_failed_row_reapproves_it_with_a_fresh_slot(api):
+    stale = utcnow() - timedelta(days=10)
+    seed([Row(ID="01A", Status=Status.FAILED, DraftText="a draft",
+               ScheduledFor=stale.isoformat(), Error="LinkedIn refused the post: 429")])
+    body = api.post("/api/rows/01A/restore").json()
+    assert body["status"] == "APPROVED"
+    assert body["error"] == ""
+    # Not the stale slot that got it retired - it must actually be in the future,
+    # or the very next publish pass would just expire it again.
+    assert parse_dt(body["scheduled_for"]) > utcnow()
+
+
+def test_restore_an_expired_row_reapproves_it_with_a_fresh_slot(api):
+    stale = utcnow() - timedelta(days=10)
+    seed([Row(ID="01A", Status=Status.EXPIRED, DraftText="a draft",
+               ScheduledFor=stale.isoformat())])
+    body = api.post("/api/rows/01A/restore").json()
+    assert body["status"] == "APPROVED"
+    assert parse_dt(body["scheduled_for"]) > utcnow()
+
+
+def test_restore_does_not_collide_with_an_already_taken_slot(api):
+    taken = utcnow() + timedelta(days=1)
+    seed([
+        Row(ID="01APPR", Status=Status.APPROVED, DraftText="a draft", ScheduledFor=taken.isoformat()),
+        Row(ID="01FAILED", Status=Status.FAILED, DraftText="a draft",
+            ScheduledFor=(utcnow() - timedelta(days=5)).isoformat()),
+    ])
+    body = api.post("/api/rows/01FAILED/restore").json()
+    assert body["scheduled_for"] != taken.isoformat()
+
+
+def test_restore_refuses_a_row_that_is_not_failed_or_expired(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    response = api.post("/api/rows/01A/restore")
+    assert response.status_code == 409
+
+
+def test_restore_refuses_a_posted_row(api):
+    seed([Row(ID="01A", Status=Status.POSTED, DraftText="a draft", PostURN="urn:li:share:1")])
+    response = api.post("/api/rows/01A/restore")
+    assert response.status_code == 409
+
+
+def test_restore_does_not_reach_another_tenants_row(api):
+    seed([Row(ID="01THEIRS", Status=Status.FAILED, DraftText="a draft")], tenant_id=OTHER)
+    response = api.post("/api/rows/01THEIRS/restore")
+    assert response.status_code == 404
+
+
+def test_publish_now_route_refuses_a_row_that_is_not_approved(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    assert api.post("/api/rows/01A/publish-now").status_code == 409
+
+
+def test_publish_now_route_publishes_for_real_on_the_shipped_default(api, monkeypatch):
+    """This deployment has deliberately turned publish.dry_run off, so the
+    shipped config's own "Post now" route calls the LinkedIn API for real."""
+    from lnp import publish_now as publish_now_mod
+    from lnp.linkedin import LinkedIn
+
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a real draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())])
+    connect_linkedin(store_for())
+    store_for().set_config_value("PAUSED", "FALSE")
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):
+            return "urn:li:share:999"
+
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
+
+    body = api.post("/api/rows/01A/publish-now").json()
+    assert body["status"] == "POSTED"
+    assert body["post_urn"] == "urn:li:share:999"
+
+
+def test_publish_now_route_uploads_and_attaches_a_generated_image(api, monkeypatch):
+    from lnp import publish_now as publish_now_mod
+    from lnp.linkedin import LinkedIn
+
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a real draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat(),
+               ImagePrompt="a prompt", ImageData="aGVsbG8=")])  # "hello"
+    connect_linkedin(store_for())
+    store_for().set_config_value("PAUSED", "FALSE")
+
+    calls = {}
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        def upload_image(self, author, image_bytes):
+            calls["author"] = author
+            calls["image_bytes"] = image_bytes
+            return "urn:li:image:xyz"
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):
+            calls["payload"] = payload
+            return "urn:li:share:999"
+
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
+
+    body = api.post("/api/rows/01A/publish-now").json()
+    assert body["status"] == "POSTED"
+    assert calls["image_bytes"] == b"hello"
+    assert calls["payload"]["content"] == {"media": {"id": "urn:li:image:xyz"}}
+
+
+def test_publish_now_route_publishes_text_only_when_the_image_upload_fails(api, monkeypatch):
+    """An image failing to upload must never block the text from going out."""
+    from lnp import publish_now as publish_now_mod
+    from lnp.linkedin import LinkedIn, LinkedInError
+
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a real draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat(),
+               ImagePrompt="a prompt", ImageData="aGVsbG8=")])
+    connect_linkedin(store_for())
+    store_for().set_config_value("PAUSED", "FALSE")
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        def upload_image(self, author, image_bytes):
+            raise LinkedInError("upload quota exceeded")
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):
+            assert "content" not in payload
+            return "urn:li:share:999"
+
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
+
+    body = api.post("/api/rows/01A/publish-now").json()
+    assert body["status"] == "POSTED"
+
+
+def test_publish_now_route_respects_the_pause_switch(api, monkeypatch):
+    from lnp import publish_now as publish_now_mod
+
+    def explode(*a, **kw):  # pragma: no cover - must never run
+        raise AssertionError("must not touch LinkedIn while paused")
+
+    seed([Row(ID="01A", Status=Status.APPROVED, DraftText="a real draft",
+               ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())])
+    connect_linkedin(store_for())
+    store_for().set_config_value("PAUSED", "TRUE")
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", explode)
+
+    body = api.post("/api/rows/01A/publish-now").json()
+    assert body["status"] == "APPROVED"
+    assert "paused" in body["error"].lower()
+
+
+# --------------------------------------------------------------------------
+# Audience: who this account writes for, and the voice card it seeds
+# --------------------------------------------------------------------------
+
+
+def test_set_audience_saves_description_and_redrafts_who_and_stance(api, monkeypatch):
+    from lnp import voice as voice_mod
+
+    store_for().save_voice_card(STARTER_VOICE_CARD)
+
+    def fake_complete(config, *, system, user, model=None, max_tokens=0, **kw):
+        assert "Staff platform engineers" in user
+        return "## Who is writing\nStaff platform engineers.\n\n## Stance\n- Prefers proven tools.\n"
+
+    monkeypatch.setattr(voice_mod, "complete", fake_complete)
+
+    body = api.put(
+        "/api/audience", json={"description": "Staff platform engineers"}
+    ).json()
+    assert "Staff platform engineers" in body["content"]
+    assert "Prefers proven tools" in body["content"]
+    # The audience-agnostic sections survive untouched.
+    assert "## Structure" in body["content"]
+    assert "## Banned" in body["content"]
+    assert "<!-- AMENDMENTS-BEGIN -->" in body["content"]
+
+    me = api.get("/api/me").json()
+    assert me["audience_description"] == "Staff platform engineers"
+
+
+def test_set_audience_rejects_a_blank_description(api):
+    response = api.put("/api/audience", json={"description": "   "})
+    assert response.status_code == 422
+
+
+def test_set_audience_runs_inside_a_metered_run(api, monkeypatch):
+    """The call has to go through runner.runs(), the same as every other
+    on-demand LLM call, or it is unlimited and free rather than metered."""
+    from lnp import llm, voice as voice_mod
+
+    store_for().save_voice_card(STARTER_VOICE_CARD)
+    seen = {}
+
+    def fake_complete(config, *, system, user, model=None, max_tokens=0, **kw):
+        seen["meter"] = llm.current_meter()
+        return "## Who is writing\nSomeone.\n\n## Stance\n- a point.\n"
+
+    monkeypatch.setattr(voice_mod, "complete", fake_complete)
+    response = api.put("/api/audience", json={"description": "Someone specific"})
+    assert response.status_code == 200
+    assert seen["meter"] is not None

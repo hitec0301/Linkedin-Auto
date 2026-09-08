@@ -196,6 +196,8 @@ class PipelineRow(Base):
     edit_distance: Mapped[Optional[float]] = mapped_column(Float)
     reach: Mapped[Optional[int]] = mapped_column(Integer)
     error: Mapped[str] = mapped_column(Text, default="")
+    image_prompt: Mapped[str] = mapped_column(Text, default="")
+    image_data: Mapped[str] = mapped_column(Text, default="")
 
     archived_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
     updated_at: Mapped[datetime] = mapped_column(
@@ -304,6 +306,42 @@ class Source(Base):
     last_error: Mapped[str] = mapped_column(Text, default="")
 
 
+class Discussion(Base):
+    """A scratchpad: explore a source and argue with it before it becomes a post.
+
+    Nothing here is a pipeline row - a discussion someone abandons leaves
+    nothing behind. `row_id` is set only once "turn into a post" commits it
+    to one, so a discussion is either still just a conversation or has
+    become exactly one row, never both. `started_from_row_id` is the
+    opposite direction: set when the discussion was opened from an existing
+    candidate rather than a bare URL, so "turn into a post" knows to update
+    that row instead of minting a duplicate for the same source.
+
+    `messages` is the whole transcript, JSON rather than a second table: a
+    discussion is a handful of turns, not a table's worth of rows, and
+    `VoiceAmendment.source_row_ids` already sets the precedent for a small
+    list living on the record it belongs to instead of its own table.
+    """
+
+    __tablename__ = "discussions"
+
+    id: Mapped[str] = mapped_column(ID, primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(
+        ID, ForeignKey("tenants.id", ondelete="CASCADE"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, default=_now, onupdate=_now
+    )
+    source_url: Mapped[str] = mapped_column(Text, default="")
+    source_title: Mapped[str] = mapped_column(Text, default="")
+    started_from_row_id: Mapped[str] = mapped_column(ID, default="")
+    row_id: Mapped[str] = mapped_column(ID, default="")
+    messages: Mapped[list] = mapped_column(JSON, default=list)
+
+    __table_args__ = (Index("ix_discussions_tenant_updated", "tenant_id", "updated_at"),)
+
+
 class UsageEvent(Base):
     """One model call, recorded for the cap.
 
@@ -332,5 +370,5 @@ class UsageEvent(Base):
 
 ALL_TABLES = [
     Tenant, LinkedInApp, LinkedInToken, PipelineRow, Setting,
-    Feedback, VoiceAmendment, VoiceCard, Source, UsageEvent,
+    Feedback, VoiceAmendment, VoiceCard, Source, UsageEvent, Discussion,
 ]

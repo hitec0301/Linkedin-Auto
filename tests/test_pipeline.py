@@ -150,6 +150,7 @@ def test_column_order_is_exact():
         "WhyItMatters", "RelevanceScore", "Selected", "Angle", "DraftText",
         "FinalText", "RevisionNote", "RevisionCount", "CharCount", "Status",
         "ScheduledFor", "PostURN", "PostedAt", "EditDistance", "Reach", "Error",
+        "ImagePrompt", "ImageData",
     ]
 
 
@@ -435,8 +436,10 @@ from lnp.voice import (
     amend_card_text,
     build_voice_context,
     collect_feedback,
+    draft_starter_sections,
     existing_amendments,
     find_recurring,
+    replace_starter_sections,
     retrieve_examples,
 )
 
@@ -455,6 +458,61 @@ def test_starter_card_has_markers_and_banned_list():
     assert AMENDMENTS_BEGIN in STARTER_CARD and AMENDMENTS_END in STARTER_CARD
     for banned in ["game-changer", "delve", "Thoughts?", "in today's rapidly evolving landscape"]:
         assert banned in STARTER_CARD
+
+
+# ---- Tailoring the starter card from a free-text description -------------
+
+
+def test_draft_starter_sections_sends_the_description(card_config):
+    seen = {}
+
+    def fake_completer(config, *, system, user, model=None, max_tokens=0):
+        seen["user"] = user
+        return "## Who is writing\nStaff engineers.\n\n## Stance\n- Skeptical of hype.\n"
+
+    result = draft_starter_sections(card_config, "Staff engineers at SaaS companies",
+                                     completer=fake_completer)
+    assert "Staff engineers at SaaS companies" in seen["user"]
+    assert result.startswith("## Who is writing")
+
+
+def test_draft_starter_sections_strips_code_fences(card_config):
+    def fenced(config, *, system, user, model=None, max_tokens=0):
+        return "```markdown\n## Who is writing\nSomeone.\n\n## Stance\n- A point.\n```"
+
+    result = draft_starter_sections(card_config, "anything", completer=fenced)
+    assert "```" not in result
+    assert result.startswith("## Who is writing")
+
+
+def test_replace_starter_sections_keeps_everything_else_on_the_real_card():
+    """Structure, Banned, Formatting and the amendment markers are audience-
+    agnostic writing-craft rules; regenerating them risks losing a detail an
+    LLM call has no way to know matters. Only Who/Stance should move."""
+    new_sections = (
+        "## Who is writing\nStaff platform engineers.\n\n"
+        "## Stance\n- Prefers boring, proven tools.\n"
+    )
+    result = replace_starter_sections(STARTER_CARD, new_sections)
+
+    assert "Staff platform engineers" in result
+    assert "Prefers boring, proven tools" in result
+    assert "An L&D leader working in edtech" not in result  # the old section is gone
+    assert AMENDMENTS_BEGIN in result and AMENDMENTS_END in result
+    assert "## Structure" in result and "## Banned" in result and "## Formatting" in result
+    for banned in ["game-changer", "delve", "Thoughts?"]:
+        assert banned in result
+
+
+def test_replace_starter_sections_inserts_when_who_is_missing():
+    """A customer who deleted the section should not lose the new one - it goes
+    in ahead of whatever they kept, not silently dropped."""
+    card = "# Voice card\n\n## Structure\n- short posts\n"
+    result = replace_starter_sections(
+        card, "## Who is writing\nSomeone.\n\n## Stance\n- a point.\n"
+    )
+    assert result.index("## Who is writing") < result.index("## Structure")
+    assert "short posts" in result
 
 
 def test_amending_a_card_is_idempotent():
@@ -845,6 +903,49 @@ def iso_now():
     return iso()
 
 
+def test_scheduled_publish_uploads_and_attaches_a_generated_image(monkeypatch):
+    """The batch checker (jobs/publish.py) attaches an image the same way
+    the manual "Post now" path does."""
+    import types
+
+    row = Row(ID="01A", Status=Status.APPROVED,
+              ScheduledFor=(utcnow() - timedelta(minutes=1)).isoformat(),
+              DraftText="A real approved draft with real text in it.",
+              ImagePrompt="a prompt", ImageData="aGVsbG8=")
+    store = connect_linkedin(make_store([row], tenants=(TENANT,)))
+    run = make_run(store)
+    calls = {}
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        def upload_image(self, author, image_bytes):
+            calls["image_bytes"] = image_bytes
+            return "urn:li:image:xyz"
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):
+            calls["payload"] = payload
+            return "urn:li:share:999888777"
+
+    monkeypatch.setattr(publish_job, "LinkedIn", FakeAPI)
+
+    published = publish_job.publish(run, types.SimpleNamespace(limit=None), dry_run=False)
+
+    assert published == 1
+    assert calls["image_bytes"] == b"hello"
+    assert calls["payload"]["content"] == {"media": {"id": "urn:li:image:xyz"}}
+    assert rows_of(store)[0].status == Status.POSTED
+
+
 def test_ambiguous_row_with_both_variants_is_refused():
     """Both variants still present means nobody said which post this is."""
     text = f"{VARIANT_A}\nfirst post\n\n{VARIANT_B}\nsecond post"
@@ -882,6 +983,71 @@ def test_linkedin_payload_shape():
     assert headers["LinkedIn-Version"] == "202605"
     assert headers["X-Restli-Protocol-Version"] == "2.0.0"
     assert headers["Authorization"] == "Bearer t"
+
+
+def test_linkedin_payload_carries_an_image_when_given_one():
+    from lnp.tokens import TokenSet
+    api = LinkedIn(Config({"publish": {"api_version": "202605"}}), TokenSet(access_token="t"))
+    payload = api.build_payload("urn:li:person:abc", "the post body", image_urn="urn:li:image:xyz")
+    assert payload["content"] == {"media": {"id": "urn:li:image:xyz"}}
+    without_image = api.build_payload("urn:li:person:abc", "the post body")
+    assert "content" not in without_image
+
+
+def test_upload_image_registers_and_puts_the_bytes():
+    from lnp.tokens import TokenSet
+
+    class FakeResponse:
+        def __init__(self, status_code, json_body=None, text=""):
+            self.status_code = status_code
+            self._json = json_body or {}
+            self.text = text
+
+        def json(self):
+            return self._json
+
+    class FakeSession:
+        def __init__(self):
+            self.put_calls = []
+
+        def post(self, url, **kw):
+            assert "initializeUpload" in url
+            return FakeResponse(200, {"value": {
+                "uploadUrl": "https://upload.example/xyz",
+                "image": "urn:li:image:xyz",
+            }})
+
+        def put(self, url, **kw):
+            self.put_calls.append((url, kw))
+            return FakeResponse(201)
+
+    session = FakeSession()
+    api = LinkedIn(Config({}), TokenSet(access_token="t"), session=session)
+    urn = api.upload_image("urn:li:person:abc", b"pretend-image-bytes")
+    assert urn == "urn:li:image:xyz"
+    put_url, put_kwargs = session.put_calls[0]
+    assert put_url == "https://upload.example/xyz"
+    assert put_kwargs["data"] == b"pretend-image-bytes"
+    assert put_kwargs["headers"]["Authorization"] == "Bearer t"
+
+
+def test_upload_image_raises_when_init_fails():
+    from lnp.tokens import TokenSet
+
+    class FakeResponse:
+        status_code = 500
+        text = "boom"
+
+        def json(self):
+            return {}
+
+    class FakeSession:
+        def post(self, *a, **kw):
+            return FakeResponse()
+
+    api = LinkedIn(Config({}), TokenSet(access_token="t"), session=FakeSession())
+    with pytest.raises(LinkedInError, match="500"):
+        api.upload_image("urn:li:person:abc", b"bytes")
 
 
 def test_missing_restli_id_header_is_not_confirmed():
@@ -974,9 +1140,12 @@ def real_config():
     return load_config(REAL_CONFIG_PATH)
 
 
-def test_shipped_config_has_dry_run_on():
-    """The repo must not ship able to post on the first run."""
-    assert real_config().dry_run is True
+def test_shipped_config_has_dry_run_off():
+    """This deployment has deliberately turned dry_run off: Post now and the
+    scheduled checker both publish for real. Flip publish.dry_run back to
+    true in config/config.yaml (and update this test) to go back to logging
+    payloads instead of posting them."""
+    assert real_config().dry_run is False
 
 
 def test_publish_dry_run_logs_a_full_payload_and_posts_nothing(monkeypatch, capsys):
@@ -1021,6 +1190,322 @@ def test_publish_dry_run_logs_a_full_payload_and_posts_nothing(monkeypatch, caps
 
     # Nothing moved: the row is still waiting for a real run.
     assert rows_of(store)[0].status == Status.APPROVED
+
+
+# ---- lnp.publish_now: the "post now" button on approve --------------------
+
+
+def test_publish_one_posts_immediately_and_marks_the_row_posted(monkeypatch):
+    """Same LinkedIn client, same POSTING/POSTED sequence, one row, on request."""
+    from lnp import publish_now as publish_now_mod
+    from lnp.util import iso
+
+    row = Row(ID="01A", Status=Status.APPROVED, ScheduledFor=iso(utcnow()),
+              DraftText="A real approved draft with real text in it.")
+    store = connect_linkedin(make_store([row], tenants=(TENANT,)))
+    run = make_run(store)
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):
+            return "urn:li:share:999888777"
+
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
+
+    result = publish_now_mod.publish_one(run, rows_of(store)[0], dry_run=False)
+
+    assert result.published is True
+    updated = rows_of(store)[0]
+    assert updated.status == Status.POSTED
+    assert updated.PostURN == "urn:li:share:999888777"
+    assert updated.Error == ""
+
+
+def test_publish_one_uploads_and_attaches_a_generated_image(monkeypatch):
+    from lnp import publish_now as publish_now_mod
+    from lnp.util import iso
+
+    row = Row(ID="01A", Status=Status.APPROVED, ScheduledFor=iso(utcnow()),
+              DraftText="A real approved draft with real text in it.",
+              ImagePrompt="a prompt", ImageData="aGVsbG8=")  # "hello"
+    store = connect_linkedin(make_store([row], tenants=(TENANT,)))
+    run = make_run(store)
+    calls = {}
+
+    class FakeAPI:
+        base = "https://api.linkedin.com"
+        version = "202605"
+
+        def __init__(self, config, tokens, session=None):
+            pass
+
+        def person_urn(self):
+            return "urn:li:person:ABC123"
+
+        def upload_image(self, author, image_bytes):
+            calls["image_bytes"] = image_bytes
+            return "urn:li:image:xyz"
+
+        build_payload = LinkedIn.build_payload
+
+        def create_post(self, payload):
+            calls["payload"] = payload
+            return "urn:li:share:999888777"
+
+    monkeypatch.setattr(publish_now_mod, "LinkedIn", FakeAPI)
+    result = publish_now_mod.publish_one(run, rows_of(store)[0], dry_run=False)
+
+    assert result.published is True
+    assert calls["image_bytes"] == b"hello"
+    assert calls["payload"]["content"] == {"media": {"id": "urn:li:image:xyz"}}
+
+
+def test_publish_one_refuses_while_paused_without_touching_linkedin():
+    from lnp import publish_now as publish_now_mod
+    from lnp.util import iso
+
+    def explode(*a, **kw):  # pragma: no cover - must never run
+        raise AssertionError("must not touch LinkedIn while paused")
+
+    row = Row(ID="01A", Status=Status.APPROVED, ScheduledFor=iso(utcnow()),
+              DraftText="A real approved draft.")
+    store = connect_linkedin(make_store([row], paused="TRUE", tenants=(TENANT,)))
+    run = make_run(store)
+    run.token_backend = explode
+
+    result = publish_now_mod.publish_one(run, rows_of(store)[0], dry_run=False)
+
+    assert result.published is False
+    assert "paused" in result.detail.lower()
+    updated = rows_of(store)[0]
+    assert updated.status == Status.APPROVED           # nothing moved
+    assert "paused" in updated.Error.lower()
+
+
+# ---- lnp.redraft: "Redraft with AI" on any row, at any stage -------------
+
+
+def test_redraft_now_drafts_a_new_row(monkeypatch):
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+
+    row = Row(ID="01A", Status=Status.NEW, SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft", lambda config, row, ctx, **kw: "A fresh draft. " * 20)
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "Procurement cycles decide adoption.")
+
+    assert result.cloned is False
+    assert result.correction is False
+    assert result.proposals == 0
+    updated = rows_of(store)[0]
+    assert updated.status == Status.DRAFTED
+    assert updated.Angle == "Procurement cycles decide adoption."
+    assert "fresh draft" in updated.DraftText
+    assert updated.ScheduledFor
+
+
+def test_redraft_now_revises_in_place_and_lands_on_drafted(monkeypatch):
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+
+    row = Row(ID="01A", Status=Status.DRAFTED, DraftText="old draft", Angle="original angle",
+              RevisionCount="1", SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+    monkeypatch.setattr(voice_mod, "propose_rules", lambda config, items, card, **kw: [])
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "Cut the closing question.")
+
+    assert result.cloned is False
+    assert result.correction is True
+    updated = rows_of(store)[0]
+    assert updated.status == Status.DRAFTED
+    assert updated.RevisionCount == "2"
+    assert updated.RevisionNote == ""
+    assert "revised draft" in updated.DraftText
+
+
+def test_redraft_now_clears_a_stale_final_text_on_revision(monkeypatch):
+    """effective_text prefers FinalText, so a leftover from before this
+    revision would hide the new draft - it has to go, not just DraftText."""
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+
+    row = Row(ID="01A", Status=Status.DRAFTED, DraftText="old draft", FinalText="my hand-edited version",
+              Angle="original angle", RevisionCount="0",
+              SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+    monkeypatch.setattr(voice_mod, "propose_rules", lambda config, items, card, **kw: [])
+
+    redraft_mod.redraft_now(run, rows_of(store)[0], "Cut the closing question.")
+
+    updated = rows_of(store)[0]
+    assert updated.FinalText == ""
+    assert "revised draft" in updated.DraftText
+    assert "revised draft" in updated.effective_text  # the fresh draft is what's now visible
+
+
+def test_redraft_now_survives_the_learning_step_failing(monkeypatch):
+    """The redraft already committed by the time learning runs; a failure
+    there - a rate limit, a flaky call - must not look like the redraft failed."""
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+
+    row = Row(ID="01A", Status=Status.DRAFTED, DraftText="old draft", Angle="original angle",
+              RevisionCount="0", SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+
+    def explode(*a, **kw):
+        raise RuntimeError("rate limited")
+    monkeypatch.setattr(voice_mod, "propose_rules", explode)
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "Cut the closing question.")
+
+    assert result.proposals == 0
+    updated = rows_of(store)[0]
+    assert "revised draft" in updated.DraftText  # the redraft landed regardless
+    assert updated.Angle == "original angle"   # untouched by a revision
+
+
+def test_redraft_now_files_a_proposal_from_the_correction(monkeypatch):
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+    from lnp.voice import Proposal
+
+    row = Row(ID="01A", Status=Status.DRAFTED, DraftText="old draft", Angle="an angle",
+              SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+    monkeypatch.setattr(
+        voice_mod, "propose_rules",
+        lambda config, items, card, **kw: [
+            Proposal(rule="Cut the closing question.", rationale="asked directly", signal="NOTE"),
+        ],
+    )
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "Cut the closing question.")
+
+    assert result.proposals == 1
+    queued = store.amendment_records()
+    assert len(queued) == 1
+    assert queued[0].rule == "Cut the closing question."
+    assert queued[0].accepted is False
+
+
+def test_redraft_now_does_not_queue_the_same_proposal_twice(monkeypatch):
+    """A correction typed again before the first proposal is decided must not
+    file a near-duplicate - it should still be sitting there, unaccepted."""
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+    from lnp.voice import Proposal
+
+    rows = [
+        Row(ID="01A", Status=Status.DRAFTED, DraftText="old draft a", Angle="an angle",
+            SourceURL="https://x.test/a", SourceTitle="A title"),
+        Row(ID="01B", Status=Status.DRAFTED, DraftText="old draft b", Angle="another angle",
+            SourceURL="https://x.test/b", SourceTitle="B title"),
+    ]
+    store = make_store(rows, tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+    monkeypatch.setattr(
+        voice_mod, "propose_rules",
+        lambda config, items, card, **kw: [
+            Proposal(rule="Cut the closing question.", rationale="asked directly", signal="NOTE"),
+        ],
+    )
+
+    first = redraft_mod.redraft_now(run, rows_of(store)[0], "Cut the closing question.")
+    second = redraft_mod.redraft_now(run, [r for r in rows_of(store) if r.ID == "01B"][0],
+                                      "Cut the closing question, please.")
+
+    assert first.proposals == 1
+    assert second.proposals == 0   # already queued, not yet decided
+    assert len(store.amendment_records()) == 1
+
+
+def test_redraft_now_clones_a_posted_row_and_leaves_it_untouched(monkeypatch):
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+    from lnp.util import iso
+
+    row = Row(ID="01OLD", Status=Status.POSTED, DraftText="what shipped", FinalText="what shipped",
+              PostURN="urn:li:share:1", PostedAt=iso(utcnow()),
+              SourceURL="https://x.test/a", SourceTitle="A title", Audience="AUD_CORPORATE")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft", lambda config, row, ctx, **kw: "A brand new take. " * 20)
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "A completely different angle.")
+
+    assert result.cloned is True
+    assert result.correction is False
+    rows = {r.ID: r for r in rows_of(store)}
+    assert len(rows) == 2
+    original = rows["01OLD"]
+    assert original.status == Status.POSTED
+    assert original.PostURN == "urn:li:share:1"     # untouched
+    assert original.DraftText == "what shipped"      # untouched
+    clone = rows[result.row.ID]
+    assert clone.status == Status.DRAFTED
+    assert clone.Audience == "AUD_CORPORATE"         # carried over from the source
+    assert "brand new take" in clone.DraftText
+
+
+def test_redraft_now_on_an_approved_row_returns_it_to_drafted(monkeypatch):
+    """Redrafting something about to publish requires a fresh decision to approve it again."""
+    from lnp import drafting as drafting_mod, redraft as redraft_mod, voice as voice_mod
+
+    row = Row(ID="01A", Status=Status.APPROVED, DraftText="old draft", Angle="an angle",
+              ScheduledFor=(utcnow() + timedelta(days=1)).isoformat(),
+              SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "revise", lambda config, row, ctx, **kw: "A revised draft. " * 18)
+    monkeypatch.setattr(voice_mod, "propose_rules", lambda config, items, card, **kw: [])
+
+    result = redraft_mod.redraft_now(run, rows_of(store)[0], "Make it sharper.")
+
+    assert result.row.status == Status.DRAFTED
+
+
+def test_redraft_now_refuses_a_row_being_published():
+    from lnp import redraft as redraft_mod
+
+    row = Row(ID="01A", Status=Status.POSTING, DraftText="in flight",
+              SourceURL="https://x.test/a", SourceTitle="A title")
+    store = make_store([row], tenants=(TENANT,))
+    run = make_run(store)
+
+    with pytest.raises(redraft_mod.RedraftRefused):
+        redraft_mod.redraft_now(run, rows_of(store)[0], "anything")
 
 
 def test_publish_stops_at_the_kill_switch(monkeypatch, capsys):

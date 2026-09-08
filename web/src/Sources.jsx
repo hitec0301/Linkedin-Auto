@@ -10,7 +10,7 @@ const TIERS = {
 
 const BLANK = { name: '', url: '', tier: 2, audience: '', active: true }
 
-export default function Sources() {
+export default function Sources({ me, go }) {
   const sources = useAsync(() => api.sources(), [])
   const [draft, setDraft] = useState(BLANK)
   const [error, setError] = useState('')
@@ -36,6 +36,16 @@ export default function Sources() {
           when candidates are ranked, not how often it is read — a tier 1 feed
           does not get you more posts, it gets its items taken more seriously.
         </p>
+
+        {me?.audience_description && (
+          <p className="muted">
+            Your audience, from Setup: "{me.audience_description}" — add feeds
+            that speak to that.{' '}
+            <a href="#" onClick={(e) => { e.preventDefault(); go('setup') }}>Edit it</a>.
+            Finding the feeds themselves is still on you; this product does not
+            crawl the web to guess at them.
+          </p>
+        )}
 
         {sources.error && <Notice kind="error">{sources.error}</Notice>}
         {error && <Notice kind="error">{error}</Notice>}

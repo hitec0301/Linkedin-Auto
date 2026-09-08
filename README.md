@@ -13,49 +13,52 @@ is wrong, the thing to change is the voice card, not the architecture.
 The shipped voice and source list are written for an L&D leader in edtech
 posting to corporate L&D practitioners and academic educators. Both are
 per-account and fully editable, so that is a starting position rather than a
-constraint.
+constraint. **About your audience**, on the Setup screen, moves that starting
+position: a few sentences on who a customer writes for redrafts the "Who is
+writing" and "Stance" sections of their voice card to match, leaving
+Structure, Banned, and Formatting - the audience-agnostic rules about writing
+for LinkedIn specifically, not about any one field - untouched. It can be
+rerun any time their focus changes. It does not touch the source list:
+finding real feeds for a niche needs a search capability this product does
+not have, and fabricating URLs would break curation rather than help it, so
+the Sources screen shows the audience description as a reminder and leaves
+finding feeds to the person who knows their field.
 
 ---
 
 ## How it runs
 
-A web service and four scheduled jobs, all from one image. Each job serves
-every live account in turn.
-
-```
-JOB A  curate       Mon 12:00 UTC   feeds -> dedupe -> score -> 10 candidates
-       [them: tick 3-4, write a one-line angle for each]        ~10 min/week
-JOB B  draft        hourly          drafts ticked rows; regenerates rows sent back
-       [them: edit their version, or send it back with a note, then approve]
-JOB C  publish      every 30 min    posts approved rows whose slot is due
-JOB D  voice_amend  Sun 15:00 UTC   proposes voice rules from their corrections
-       [them: tick the ones they agree with; nothing else reaches the card]
-```
-
-Cron is UTC and does not follow daylight saving, so the local times drift by an
-hour twice a year. Nothing depends on the exact minute.
+One web service, one image. Fetching candidates, drafting, and learning a
+voice rule all happen on request, the moment a person acts on the Review or
+Voice screen - there is nothing scheduled to wait for. The one exception is
+publishing something already scheduled for later, which runs in a background
+thread inside the same service (see "One service" further down).
 
 ### The status machine
 
 ```
-NEW -> DRAFTED -> (REVISE -> DRAFTED)* -> APPROVED -> POSTING -> POSTED
-                                                   \-> FAILED -> APPROVED
+NEW -> DRAFTED -> APPROVED -> POSTING -> POSTED
+                          \-> FAILED
 
 any -> SKIPPED ;  DRAFTED/APPROVED -> EXPIRED ;  POSTED, SKIPPED, EXPIRED are terminal
 ```
 
-Every transition goes through `assert_transition()`, which raises on anything
-not in that diagram, whichever interface asked. The web app derives the
-buttons it offers from the same table, so a button only exists for a move the
-machine actually has - the rule is written once and read twice, rather than
-restated in the browser where the two copies can drift.
+That diagram is what a normal life through the pipeline looks like, not a
+fence: the status dropdown on the Review screen offers every real status
+directly, with no gating on the move being "legal" by that diagram, so a
+person can walk a row back from Posted to Drafted to send it out again, or
+jump a fresh candidate straight to Approved. `store.set_status_freely()` logs
+anything outside the diagram rather than refusing it. `POSTING` is the one
+exception: it is a marker the publish path sets on itself while a post is
+actually going out, not a status a person chooses, and the dropdown never
+offers it.
 
-### What the jobs will not do
+### What the pipeline will not do
 
 These are enforced in code and each has a test:
 
-1. Job C acts only on `APPROVED`. Every other status is a no-op. There is no
-   flag that changes this.
+1. The publish checker acts only on `APPROVED`. Every other status is a no-op.
+   There is no flag that changes this.
 2. `POSTING` is written to the row before the HTTP call and `POSTED` after, so
    a crashed run cannot double-publish.
 3. A row stuck in `POSTING` is never blindly retried. The Posts API is asked
@@ -63,72 +66,111 @@ These are enforced in code and each has a test:
    row is left alone.
 4. A row more than 48 hours past its `ScheduledFor` becomes `EXPIRED` and is
    never published. A four-day-old take is worse than no post.
-5. Jobs never write `Selected`, `Angle`, `FinalText`, `RevisionNote` or `Reach`.
-   Those columns belong to the customer; an attempt to write one raises. The
-   single exception is clearing `RevisionNote` after a successful regenerate.
-6. The reverse holds too: the web app cannot write `DraftText`. The difference
-   between what the model wrote and what actually went out is the only learning
-   signal the system has, so an edit goes to `FinalText` and the draft stays.
-7. `PAUSED` stops Job C immediately, from the switch on the Setup screen.
+5. The API never writes `DraftText`, `PostURN`, `PostedAt` or `EditDistance` -
+   the model's and the pipeline's own columns. The difference between what the
+   model wrote and what actually went out is the only learning signal the
+   system has, so a person's edit goes to `FinalText` and the draft stays.
+   "Redraft with AI" on a posted, skipped, or expired row does not touch that
+   row either - it clones a fresh candidate and drafts that instead, for
+   exactly this reason.
+6. The reverse holds too: nothing but a person, through the API, can write
+   `Selected`, `Angle`/`RevisionNote` (surfaced together as one `take` field),
+   `FinalText`, or `Reach`.
+7. `PAUSED` stops the publish checker immediately, from the switch on the
+   Setup screen.
 8. A row approved with both drafts still in it is refused, not guessed at.
 9. The drafting prompt forbids any number that is not in the fetched source
    extract.
-10. Every job crash alerts, and names the account it concerns. A silent
-    pipeline looks like a working one.
+10. A crash on one tenant's turn alerts and names the account; the checker
+    moves on to the next tenant rather than stopping. A silent pipeline looks
+    like a working one.
 11. No query reaches data without a tenant id, and the tenant id comes from the
     session rather than from a parameter. Another account's row id reads
     exactly like one that does not exist.
+12. Accepting a proposed voice rule writes it into the card immediately - there
+    is no batch job left to do that later, so accepting is the only gate and
+    it fires the moment a person ticks it.
 
 ---
 
 ## The customer's week
 
-**Monday, ten minutes.** Job A has put ten candidates on the Review screen,
-each with an audience tag, a theme tag, and a sentence on why it matters. They
-tick three or four and write a one-line angle for each.
+There is no weekly rhythm to keep up with any more - everything runs when the
+person does it, in whatever order they do it. This is the shape it usually
+takes, not a schedule it enforces.
 
-A new account does not wait for the first Monday: once LinkedIn is connected,
-the Review screen offers **Fetch candidates now**, which runs Job A on the
-spot for that one account. It is offered only while Review is empty, and a
-batch that just ran cannot be re-triggered for ten minutes - both limits exist
-because each click is a real feed fetch and a real model call, charged against
-the same monthly allowance the scheduled run uses.
+**Fetch candidates now**, on the Review screen, reads their feeds, dedupes,
+scores, and drops ten candidates onto the screen, each with an audience tag, a
+theme tag, and a sentence on why it matters - one call, no waiting for a batch
+job to get around to it. A batch that just ran cannot be re-triggered for ten
+minutes, because each click is a real feed fetch and a real model call,
+charged against the same monthly allowance.
 
-The angle is the whole system. It is their thesis, and the source article is
-evidence for it. "Districts are buying AI tutoring seats faster than they can
-staff the humans who supervise them" is an angle. "AI tutoring adoption is
-growing" is a summary, and a summary is what comes back.
+Every row is one card, from the moment it lands as a candidate through
+drafted, approved, and posted - the same card the whole way, not a different
+screen per stage. Two things live on it throughout:
 
-**Within the hour.** Job B drafts each ticked row and assigns a slot. For the
-first twenty posts it produces two variants, so they can see the range.
+- **Your take.** Before a draft exists this is the angle - their thesis, with
+  the source article as evidence for it. "Districts are buying AI tutoring
+  seats faster than they can staff the humans who supervise them" is an angle;
+  "AI tutoring adoption is growing" is a summary, and a summary is what comes
+  back. Once a draft exists, the same box becomes the revision instruction -
+  what to fix, not what to write from scratch.
+- **Redraft with AI.** One button, present on every row at every stage, that
+  reads whatever is currently in the take box. No draft yet - it drafts,
+  using the take as the angle, or writes a generic blurb if the box is empty,
+  so there is always something to edit or publish rather than a blank card. A
+  draft already exists - it revises in place, using the take as the
+  instruction, and lands back on `DRAFTED` either way (redrafting something
+  that was `APPROVED` sends it back through Approved again on purpose: a post
+  that changes mid-flight should always get a fresh publish decision).
+  Redrafting a posted, skipped, or expired row never rewrites that row - it
+  clones a fresh candidate from the same source and drafts that instead, so
+  the historical record of what actually went out is never touched.
 
-**Then, per draft, one of four buttons:**
+The draft itself is shown but not editable - edits go in **your version**
+(`FinalText`), a separate field, and that separation is the measurement: the
+distance between the two is what the health metric and the voice learning are
+computed from.
 
-| They want | They press |
-|---|---|
-| It's good | **Approve for publishing** |
-| Small fix | edit *your version*, then **Approve** |
-| Structural fix | **Send back with a note** |
-| It's wrong | **Skip** |
+**Status** is a dropdown on the card, offering every real status directly -
+New, Drafted, Approved, Failed, Skipped, Expired, Posted - with no gating on
+what the state machine would normally allow next. Setting it to Approved is
+what "approve for publishing" means now; setting it to Skipped is what a plain
+reject used to be. There is no `POSTING` in the list - it is a marker the
+publish path sets on itself while a post is actually going out, not something
+to choose by hand.
 
-The draft is shown but not editable. Edits go in a separate field, and that
-separation is the measurement: the distance between the two is what the health
-metric and the weekly voice job are computed from.
+**Once a row is Approved**, a schedule row appears: a date/time field, defaulted
+to the next open slot, and a **Post now** button. Post now publishes
+immediately - through the same client and the same POSTING-before/POSTED-after
+sequence the background checker itself uses, so a manual post and a scheduled
+one leave the system identically. It still defers to the pause switch and to
+`publish.dry_run`: either one leaves the row approved and due immediately, for
+the checker to pick up on its next pass exactly as if the button had not been
+pressed. Left alone, the row waits for its scheduled time, and the background
+publish checker (see "One service") posts it, writing back the URN, the
+timestamp, and the edit distance.
 
-If they were given two variants, one has to go before approving. A row approved
-with both still in it is refused, not guessed at.
+**Generate image**, on any card with a draft, asks Claude for a short visual
+brief describing the post and hands that to Gemini to render (needs
+`GEMINI_API_KEY`; see "Set the variables" below). The result is a draft like
+any other - review it, regenerate, or remove it before publishing. It is
+never required: Post now and the scheduled checker both publish text-only if
+a row has no image, and if the image fails to upload at publish time the
+text still goes out, with a warning rather than a failed post.
 
-**Job C** posts approved rows when their slot arrives, and writes back the URN,
-the timestamp, and the edit distance.
+**Bulk-remove** on the Review screen's toolbar select-and-skip several
+not-relevant candidates at once, instead of one at a time.
 
-**Sunday.** Job D reads their corrections and proposes voice rules on the Voice
-screen. They tick the ones they agree with; the next Sunday run writes those
-into their card. Nothing edits the card without a tick.
-
-**They should not wait for Sunday.** When a draft comes out wrong, the Voice
-screen has the whole card in a text box. That is the fastest fix available, it
-takes thirty seconds, and it takes effect on the next hourly draft run. Job D
-exists to catch what they would not have thought to write down.
+**Voice learning fires on every correction, not on a weekly batch.** The
+moment a revision instruction is used to redraft a row, the system checks
+whether the same instruction has come up enough times to be worth a rule, and
+proposes one on the Voice screen if so - accepting it writes it into the card
+right then, not on a Sunday. When a draft comes out wrong in a way no
+correction will catch, the Voice screen still has the whole card in a text
+box: that is the fastest fix available, and it takes effect on the very next
+draft.
 
 Impressions are theirs to fill in by hand. Automated engagement retrieval needs
 `r_member_social`, a restricted permission this product deliberately does not
@@ -160,10 +202,11 @@ charging for something that stopped working.
 
 ### The kill switch
 
-The switch on a customer's Setup screen, or `PAUSED` in their settings. Job C
-checks it before anything else and exits without posting. If the settings are
-unreadable, or the key is missing, the job treats itself as paused rather than
-guessing: an unreachable stop button might be pressed.
+The switch on a customer's Setup screen, or `PAUSED` in their settings. The
+publish checker checks it before anything else and skips that account without
+posting. If the settings are unreadable, or the key is missing, it treats the
+account as paused rather than guessing: an unreachable stop button might be
+pressed.
 
 ### Failure mode 1: a customer's LinkedIn access expired
 
@@ -184,8 +227,9 @@ were stale before anyone got to them.
 **Symptom.** A row sits at `POSTING` and you have an alert saying it could not
 be verified.
 
-**Why.** The job writes `POSTING`, calls LinkedIn, then writes `POSTED`. If it
-dies between those, the row is left mid-flight. The next run does **not** retry
+**Why.** Whatever published it - the background checker or a manual "Post
+now" - writes `POSTING`, calls LinkedIn, then writes `POSTED`. If it dies
+between those, the row is left mid-flight. The next pass does **not** retry
 it — it asks the Posts API whether the post exists:
 
 - confirmed present → the row becomes `POSTED` and the URN is recorded;
@@ -211,9 +255,9 @@ angle is the problem, not the prose — a new angle on a fresh row beats a fourt
 revision.
 
 **The same correction keeps recurring.** If one instruction appears on three or
-more different posts, Job D flags it `RECURRING`, sorts it to the top of the
-Voice screen, and alerts. A rule that keeps being repeated is the clearest sign
-the system is not learning.
+more different posts, the redraft that lands the third one flags it
+`RECURRING`, sorts it to the top of the Voice screen, and alerts. A rule that
+keeps being repeated is the clearest sign the system is not learning.
 
 **An account runs out of allowance.** Drafting stops for that account until the
 next period. Approving and publishing what is already drafted are unaffected,
@@ -230,11 +274,15 @@ config/voice_card.md    the starter voice card, likewise
 
 src/lnp/models.py       status machine, Row, column ownership, health metric
 src/lnp/runner.py       one run per account: store, sources, card, tokens, meter
-src/lnp/curate.py       Job A's work, shared by the cron job and "fetch now"
+src/lnp/curate.py       fetching and scoring candidates - "fetch candidates now"
+src/lnp/draft.py        drafting and revising - shared by "redraft with AI"
+src/lnp/redraft.py      "redraft with AI": draft, revise, or clone-and-draft
+src/lnp/publish_now.py  one row, published on request - the "post now" button
+src/lnp/publish_loop.py the publish checker: the one thing still on a clock
 src/lnp/ingest.py       feeds, two-stage dedupe, education filtering
 src/lnp/scoring.py      batched scoring, tier weights, quota enforcement
 src/lnp/drafting.py     extraction, prompts, post-processing, revision
-src/lnp/voice.py        the card, feedback signals, rule proposals
+src/lnp/voice.py        the card, feedback signals, rule proposals, tailoring
 src/lnp/tokens.py       OAuth rotation, proactive refresh, expiry warnings
 src/lnp/linkedin.py     Posts API, and the stuck-row recovery query
 src/lnp/llm.py          Anthropic access, and the metering hook every call passes
@@ -251,34 +299,36 @@ src/lnp/api/            FastAPI: sign-in, the pipeline, the account
 web/src/                React: Review, Published, Voice, Sources, Setup
 alembic/                migrations; the schema of record in production
 
-jobs/                   the four scheduled entry points
+jobs/                   manual/ops CLI entry points - nothing here is scheduled
 scripts/gen_keys.py     the two secrets a deployment needs
-scripts/serve.sh        migrate, then start the web service
+scripts/serve.sh        migrate, start the web service, start the publish checker
 tests/test_pipeline.py  every invariant above, with the network mocked
 tests/test_store.py     the store guards, tenant isolation, the cap, the runner
 tests/test_api.py       tenancy, the human-side guard, and the two OAuth flows
+tests/test_publish_loop.py  the in-process publish checker's own loop behaviour
 ```
 
 ### Commands
 
 ```bash
-pytest                                  # 179 tests, no network, no server
+pytest                                  # 224 tests, no network, no server
 TEST_DATABASE_URL=postgresql://localhost/lnp_test pytest    # on real Postgres
 
 alembic upgrade head                    # apply migrations
 alembic revision --autogenerate -m "…"  # after editing schema.py
 python scripts/gen_keys.py              # the two secrets, printed once
 
-python jobs/curate.py                   # every live account
-python jobs/curate.py --tenant 01J…     # one account
+python jobs/curate.py --tenant 01J…     # fetch candidates for one account, by hand
 python jobs/curate.py --no-write        # score and print, write nothing
-python jobs/draft.py --print            # draft and print, write nothing
+python jobs/draft.py --row 01HZY…       # draft one row, by hand
 python jobs/publish.py --dry-run        # log the payload, post nothing
 python jobs/voice_amend.py --dry-run    # propose rules, write nothing
 ```
 
-Every job takes `--tenant`, which is how you reproduce one customer's problem
-without touching anybody else's account.
+Nothing in `jobs/` runs on a schedule any more (see "One service" below) - these
+are ops tools for reproducing one customer's problem by hand, the same work the
+API already does on request. Every one of them takes `--tenant`, so you can run
+it against a single account without touching anybody else's.
 
 ---
 
@@ -303,26 +353,38 @@ the customer's edits go in `FinalText` and the draft stays as written. That is
 why the web app shows the draft read-only next to a field of their own, and why
 "send it back with a note" is a separate action rather than a retype.
 
-### The five services
+### One service
 
-One image, built once, from the same `Dockerfile`. The web service serves the
-API and the built front end from the same origin, which is why the session
-cookie can be `SameSite=Lax` and there is no CORS configuration to get wrong.
+One image, one Railway service, built once from the same `Dockerfile`. The web
+service serves the API and the built front end from the same origin, which is
+why the session cookie can be `SameSite=Lax` and there is no CORS configuration
+to get wrong.
 
-| Service | Start command | Schedule (UTC) |
+| Service | Start command | Schedule |
 |---|---|---|
 | `web` | `sh scripts/serve.sh` | always on |
-| `curate` | `python jobs/curate.py` | `0 12 * * 1` |
-| `draft` | `python jobs/draft.py` | `0 * * * *` |
-| `publish` | `python jobs/publish.py` | `*/30 * * * *` |
-| `voice` | `python jobs/voice_amend.py` | `0 15 * * 0` |
 
-Restart policy `NEVER` on the four cron services; a cron job that exits 0 has
-finished. The web service restarts normally.
+There used to be four more services here, each a cron job on its own schedule
+(fetch Monday morning, draft hourly, publish every half hour, propose voice
+rules on Sunday). None of that is on a clock any more: fetching candidates,
+drafting, and learning a voice rule all happen on request, the moment a person
+does something on the Review or Voice screen, because a schedule that runs
+whether or not anyone is looking does not know what the person actually wants
+next.
 
-Each job iterates every account whose subscription is `trialing` or `active`.
-One account's broken feed alerts and the loop moves on — the tenth customer
-does not lose their week because the third one's source list rotted.
+The one exception is publishing something already scheduled for later - the
+whole point of "schedule for later" is that it still happens after the person
+has closed the tab. That is now a background thread inside the `web` service
+itself (`src/lnp/publish_loop.py`), checking every
+`publish_checker.interval_seconds` (default 60s, in `config/config.yaml`) for
+approved rows whose time has arrived, using the exact same `jobs/publish.py`
+logic the old cron service ran. There is nothing left to schedule outside the
+one service, so there is no second deployable to keep in sync with it.
+
+The checker iterates every account whose subscription is `trialing` or
+`active`. One account's broken feed, or a failed publish, alerts and the loop
+moves on to the next tenant — the tenth customer does not lose their post
+because the third one's token expired.
 
 ### Connecting the repo to Railway
 
@@ -360,6 +422,7 @@ them. Project → **Variables**:
 | `LNP_AUTH_CLIENT_ID` | the sign-in app from step 1 |
 | `LNP_AUTH_CLIENT_SECRET` | the secret for that app |
 | `ANTHROPIC_API_KEY` | yours: the operator pays for drafting |
+| `GEMINI_API_KEY` | optional: only needed for "Generate image" on a post |
 | `SLACK_WEBHOOK_URL` | optional, and the only way you hear about a failed run |
 
 Referencing `${{Postgres.DATABASE_URL}}` rather than copying the string means a
@@ -372,22 +435,14 @@ accepted; the code rewrites either to the driver it actually uses.
 `<that URL>/auth/linkedin/callback` to your sign-in app's **Authorized redirect
 URLs** on LinkedIn. It has to match character for character.
 
-**6. Add the four cron services.** Each is **New → GitHub Repo**, same
-repository, then Settings → **Custom Start Command** and **Cron Schedule**:
-
-| Service | Start command | Cron (UTC) | Restart policy |
-|---|---|---|---|
-| `curate` | `python jobs/curate.py` | `0 12 * * 1` | NEVER |
-| `draft` | `python jobs/draft.py` | `0 * * * *` | NEVER |
-| `publish` | `python jobs/publish.py` | `*/30 * * * *` | NEVER |
-| `voice` | `python jobs/voice_amend.py` | `0 15 * * 0` | NEVER |
-
-Restart policy **NEVER** on all four: a cron job that exits 0 has finished, and
-restarting it runs it again immediately — on `publish` that is the one
-behaviour you do not want. The web service keeps the default restart policy.
+That is the whole deployment — one service. There is no step 6: fetching,
+drafting, and learning a voice rule all happen on request from the screen, and
+publishing what is already scheduled runs in a background thread inside this
+same service (see "One service" above), so there is nothing else to add on
+Railway.
 
 The build runs the test suite, so a broken commit fails at build time rather
-than at 07:00 on a Monday with nobody watching.
+than silently, with nobody watching.
 
 ### Testing it
 
@@ -419,7 +474,7 @@ Every other screen works without it, and the test suite covers the OAuth paths
 with no browser at all:
 
 ```bash
-pytest                              # 218 tests, no network
+pytest                              # 224 tests, no network
 pytest tests/test_api.py -v         # tenancy, the guards, both OAuth flows
 TEST_DATABASE_URL=postgresql://localhost/lnp_test pytest   # against real Postgres
 ```
@@ -445,18 +500,23 @@ so a failure tells you exactly which one broke:
    screen has a card — that is provisioning having run.
 5. Walk the wizard with a throwaway LinkedIn app of your own, as a customer
    would. It ends with **Authorise posting** and a green "Connected".
-6. Run curate by hand rather than waiting until Monday: the `curate` service →
-   **Deploy** (or `railway run python jobs/curate.py`). Candidates should appear
-   on the Review screen within a minute.
-7. Tick one, write an angle, and run `draft` the same way. A draft appears.
-8. **Leave `publish.dry_run: true` in `config/config.yaml` for the first
-   fortnight.** Approve a row and run `publish` by hand: it logs the exact
-   payload it would send and posts nothing. Read those logs each morning, fix
-   the voice card, and only then set `dry_run: false` and redeploy.
+6. On the Review screen, click **Fetch candidates now**. Candidates appear
+   within a few seconds — no cron, no waiting for Monday.
+7. Write a take on one and click **Redraft with AI**. A draft appears in
+   place, on the same card.
+8. **For a new account, set `publish.dry_run: true` in `config/config.yaml`
+   for the first fortnight.** Set the row's status to Approved and either
+   click **Post now** or leave it a schedule time: the in-process publish
+   checker (see "One service" above) picks it up within
+   `publish_checker.interval_seconds` and logs the exact payload it would
+   send, posting nothing. Read those logs each morning, fix the voice card,
+   and only then set `dry_run: false` and redeploy. This repo currently ships
+   with `dry_run: false` — Post now and the scheduled checker both publish
+   for real.
 
 The kill switch works throughout, for each account, from the switch on their
-Setup screen. Publishing stops within half an hour and everything else keeps
-running.
+Setup screen. Publishing stops within `publish_checker.interval_seconds` and
+everything else keeps running.
 
 ### What I could not verify
 

@@ -1,78 +1,44 @@
-"""The pipeline: what the human sees, and the four decisions they make.
+"""The pipeline: what the human sees, and the decisions they make.
 
-Ticking a row, writing an angle, editing the text, approving. Everything else
-in this product exists to make those four things take ten minutes a week.
-
-There is no endpoint here that publishes. Approving marks a row APPROVED and
-the publish job takes it from there, which keeps a single writer to LinkedIn
-and one place where the POSTING/POSTED sequence is enforced.
+Every row is one card, at any stage of its life, with the same handful of
+actions available throughout: edit the take, redraft with AI, set the
+status directly, and - once Approved - say when it goes out. There is no
+per-status set of buttons; the status dropdown is the state machine's whole
+surface now; the only other module-specific action is redraft, since it is
+the one that touches the model rather than just a column.
 """
 
 from __future__ import annotations
 
-import threading
 from contextlib import closing
-from typing import Dict, List, Optional
+from datetime import timedelta
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from .. import runner
-from ..config import Config
+from .. import log, runner
+from ..config import Config, ConfigError
 from ..curate import curate as run_curate
+from ..draft import next_slot
+from ..image_gen import ImageGenError, generate_image_now as run_generate_image
+from ..publish_now import publish_one as run_publish_one
+from ..redraft import RedraftRefused, redraft_now as run_redraft_now
 from ..db.schema import Tenant
-from ..db.store import PipelineStore
-from ..models import (
-    ColumnPermissionError,
-    LEGAL_TRANSITIONS,
-    Row,
-    Status,
-    TransitionError,
+from ..db.store import PipelineStore, StoreError
+from ..models import ColumnPermissionError, Row, Status
+from ..util import iso, parse_dt, utcnow
+from .deps import ON_DEMAND_LLM_LOCK, PUBLISH_NOW_LOCK, active_tenant, config, current_store
+from .schemas import (
+    BulkSkipIn, NewPostIn, RedraftIn, ROW_COLUMN_BY_FIELD, RowEdit, RowOut, ScheduleIn, StatusIn,
 )
-from ..db.store import StoreError
-from ..util import parse_dt, utcnow
-from .deps import active_tenant, config, current_store
-from .schemas import ROW_COLUMN_BY_FIELD, ReviseIn, RowEdit, RowOut
 
 router = APIRouter(prefix="/api/rows", tags=["pipeline"])
-
-# Everything the Review screen shows before it says "nothing waiting" - the
-# same set decides whether an on-demand curate run is offered, so the button
-# and the emptiness message can never disagree about what "waiting" means.
-WAITING_STATUSES = {
-    Status.NEW, Status.DRAFTED, Status.REVISE,
-    Status.APPROVED, Status.FAILED, Status.POSTING,
-}
+logger = log.get("routes_pipeline")
 
 # A brand-new account with an empty Sources list, or one whose last run wrote
 # nothing but duplicates, would otherwise let a stuck "Fetch now" button be
 # clicked repeatedly - each click is a real feed fetch and a real model call.
 CURATE_NOW_COOLDOWN_MINUTES = 10
-
-# lnp.llm's usage meter is a process-global, not a per-thread one, because the
-# scheduled jobs only ever run one tenant at a time in a single thread. This
-# on-demand path is reached from FastAPI's threadpool, so two accounts
-# clicking "Fetch now" at the same instant could otherwise attribute one
-# tenant's model spend to the other's cap. The lock serialises the rare,
-# human-triggered case rather than making the meter thread-safe everywhere.
-_CURATE_NOW_LOCK = threading.Lock()
-
-# What the interface may offer, per status. Derived from the state machine so
-# a button cannot exist for a move the store would refuse.
-ACTIONS: Dict[str, List[str]] = {
-    Status.NEW: ["edit", "skip"],
-    Status.DRAFTED: ["edit", "approve", "revise", "skip"],
-    Status.REVISE: ["edit", "skip"],
-    Status.APPROVED: ["edit", "unapprove", "skip"],
-    Status.POSTING: [],
-    Status.POSTED: ["edit"],  # only Reach, which the human fills in later
-    Status.FAILED: ["approve", "skip"],
-    Status.SKIPPED: [],
-    Status.EXPIRED: [],
-}
-
-
-def allowed_actions(row: Row) -> List[str]:
-    return list(ACTIONS.get(row.status, []))
 
 
 def find(store: PipelineStore, row_id: str) -> Row:
@@ -91,7 +57,32 @@ def list_rows(
     if status_filter:
         wanted = {s.strip().upper() for s in status_filter.split(",") if s.strip()}
         rows = [r for r in rows if r.status in wanted]
-    return [RowOut.of(r, allowed_actions(r)) for r in rows]
+    return [RowOut.of(r) for r in rows]
+
+
+@router.post("", response_model=RowOut, status_code=201)
+def create_row(
+    body: NewPostIn,
+    store: PipelineStore = Depends(current_store),
+    tenant: Tenant = Depends(active_tenant),
+) -> RowOut:
+    """A post someone starts themselves: a source to cite, and a take to write from.
+
+    Everything the automatic path adds on top - dedupe, a relevance score, an
+    audience and theme tag - is triage for a slate nobody asked for yet. A
+    row someone deliberately started skips straight past that; it is exactly
+    as real a row as a fetched one from the moment it exists, and "Redraft
+    with AI" treats it identically - it fetches this SourceURL itself the
+    same way it would a candidate's.
+    """
+    row = Row(
+        SourceURL=body.source_url,
+        SourceTitle=body.source_title,
+        Angle=body.take,
+        Status=Status.NEW,
+    )
+    store.append_rows([row])
+    return RowOut.of(row)
 
 
 @router.post("/curate-now")
@@ -100,22 +91,14 @@ def curate_now(
     store: PipelineStore = Depends(current_store),
     cfg: Config = Depends(config),
 ) -> dict:
-    """Fetch and score a batch right now, instead of waiting for Monday.
+    """Fetch and score a batch right now.
 
-    Offered only when there is nothing on Review already - a full slate
-    exists precisely so a new account is not still empty five minutes after
-    connecting LinkedIn. Runs the exact function Job A runs on its own
-    schedule, against this one account, so there is no second code path to
-    keep in sync.
+    Available any time - dedupe reads the same URL/title history regardless
+    of who is asking, so a second fetch on top of an existing slate adds only
+    what is genuinely new. Runs the exact function the weekly job used to
+    run, against this one account, so there is no second code path to keep
+    in sync now that nothing runs it on a schedule.
     """
-    waiting = [r for r in store.pipeline_rows() if r.status in WAITING_STATUSES]
-    if waiting:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"there are already {len(waiting)} row(s) waiting on Review; "
-            "clear those before fetching more",
-        )
-
     last_run = parse_dt(store.config_values().get("LAST_CURATE"))
     if last_run is not None:
         minutes_ago = (utcnow() - last_run).total_seconds() / 60
@@ -126,7 +109,7 @@ def curate_now(
                 f"a batch just ran; try again in about {wait} minute(s)",
             )
 
-    with _CURATE_NOW_LOCK, closing(runner.runs("curate", cfg, tenant_id=tenant.id)) as runs:
+    with ON_DEMAND_LLM_LOCK, closing(runner.runs("curate", cfg, tenant_id=tenant.id)) as runs:
         run = next(runs, None)
         if run is None:
             raise HTTPException(status.HTTP_409_CONFLICT, "this account is not active")
@@ -140,10 +123,91 @@ def curate_now(
     return {"written": written, "detail": f"{written} candidate(s) ready on Review"}
 
 
+@router.post("/{row_id}/redraft-now", response_model=RowOut)
+def redraft_now_route(
+    row_id: str,
+    body: RedraftIn,
+    tenant: Tenant = Depends(active_tenant),
+    cfg: Config = Depends(config),
+) -> RowOut:
+    """Draft, revise, or - for a posted/skipped/expired row - clone and draft.
+
+    The one AI action the interface offers, reachable from any row at any
+    stage. What it does depends only on whether the row already has a draft
+    to revise; see lnp.redraft for the full shape of that decision.
+    """
+    with ON_DEMAND_LLM_LOCK, closing(runner.runs("draft", cfg, tenant_id=tenant.id)) as runs:
+        run = next(runs, None)
+        if run is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "this account is not active")
+        row = next((r for r in run.store.pipeline_rows() if r.ID == row_id), None)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")
+        try:
+            result = run_redraft_now(run, row, body.take)
+        except RedraftRefused as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        updated = next(
+            (r for r in run.store.pipeline_rows() if r.ID == result.row.ID), None
+        )
+        if updated is None:  # pragma: no cover - the row cannot vanish mid-request
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")
+        return RowOut.of(updated)
+
+
+@router.post("/{row_id}/generate-image", response_model=RowOut)
+def generate_image_route(
+    row_id: str,
+    tenant: Tenant = Depends(active_tenant),
+    cfg: Config = Depends(config),
+) -> RowOut:
+    """Generate an image for this row's post and attach it as a draft.
+
+    Model-owned, like DraftText: this always overwrites whatever image the
+    row already had. Never blocks Post now on its own - a row can publish
+    with or without one - so a failure here is reported plainly rather than
+    retried silently.
+    """
+    with ON_DEMAND_LLM_LOCK, closing(runner.runs("image", cfg, tenant_id=tenant.id)) as runs:
+        run = next(runs, None)
+        if run is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "this account is not active")
+        row = next((r for r in run.store.pipeline_rows() if r.ID == row_id), None)
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")
+        try:
+            updated_row = run_generate_image(run, row)
+        except ImageGenError as exc:
+            logger.error("image generation failed", extra={"row_id": row_id, "error": str(exc)})
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+        except ConfigError as exc:
+            logger.error("image generation misconfigured", extra={"row_id": row_id, "error": str(exc)})
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
+        updated = next(
+            (r for r in run.store.pipeline_rows() if r.ID == updated_row.ID), None
+        )
+        if updated is None:  # pragma: no cover - the row cannot vanish mid-request
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")
+        return RowOut.of(updated)
+
+
+@router.delete("/{row_id}/image", response_model=RowOut)
+def remove_image_route(
+    row_id: str,
+    store: PipelineStore = Depends(current_store),
+    tenant: Tenant = Depends(active_tenant),
+) -> RowOut:
+    """Drop a generated image, going back to a text-only post."""
+    row = find(store, row_id)
+    store.write(row, {"ImagePrompt": "", "ImageData": ""})
+    return RowOut.of(row)
+
+
 @router.get("/{row_id}", response_model=RowOut)
 def get_row(row_id: str, store: PipelineStore = Depends(current_store)) -> RowOut:
-    row = find(store, row_id)
-    return RowOut.of(row, allowed_actions(row))
+    return RowOut.of(find(store, row_id))
 
 
 @router.patch("/{row_id}", response_model=RowOut)
@@ -155,111 +219,185 @@ def edit_row(
 ) -> RowOut:
     """Edit the columns a person owns.
 
-    Not DraftText. The store refuses it, and the refusal explains why: the
-    difference between the draft and what was published is the only thing this
-    system learns from, and folding an edit back into the draft erases it.
+    `take` is not a real column: before a draft exists it is the angle,
+    once one does it is the revision instruction, and which one a save
+    lands in depends only on whether DraftText is populated yet - never on
+    Status, so it keeps working the same way after a status the dropdown
+    sets by hand as it does after one a draft or a post left behind.
+
+    Never DraftText. The store refuses it, and the refusal explains why: the
+    difference between the draft and what was published is the only thing
+    this system learns from, and folding an edit back into the draft erases it.
     """
+    row = find(store, row_id)
+    fields = body.model_dump(exclude_unset=True)
+    take = fields.pop("take", None)
+
     updates = {
         ROW_COLUMN_BY_FIELD[field]: value
-        for field, value in body.model_dump(exclude_unset=True).items()
+        for field, value in fields.items()
         if value is not None
     }
     if "Selected" in updates:
         updates["Selected"] = "TRUE" if updates["Selected"] else "FALSE"
     if "Reach" in updates:
         updates["Reach"] = str(updates["Reach"])
+    if take is not None:
+        updates["Angle" if not row.DraftText else "RevisionNote"] = take
 
-    row = find(store, row_id)
     try:
         store.write_as_human(row, updates)
     except ColumnPermissionError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except StoreError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    return RowOut.of(row, allowed_actions(row))
+    return RowOut.of(row)
 
 
-def _move(store: PipelineStore, row: Row, target: str, updates=None) -> RowOut:
-    try:
-        store.transition(row, target, updates, allow_revision_note=True)
-    except TransitionError as exc:
-        # The interface offered a move the machine does not have. Say what the
-        # row actually is rather than a generic 400: it usually means the row
-        # changed under them, and the next thing they need is to reload.
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"this row is {row.status} and cannot move to {target}. "
-            f"Reload to see its current state.",
-        ) from exc
-    return RowOut.of(row, allowed_actions(row))
-
-
-@router.post("/{row_id}/approve", response_model=RowOut)
-def approve(
+@router.put("/{row_id}/status", response_model=RowOut)
+def set_status(
     row_id: str,
+    body: StatusIn,
     store: PipelineStore = Depends(current_store),
     tenant: Tenant = Depends(active_tenant),
 ) -> RowOut:
-    """Approve a draft for publishing.
+    """Set a row's status directly - every real status, chosen freely.
 
-    The one irreversible-ish decision in the product, so it is its own endpoint
-    with its own name. It does not publish; it says this may be published, and
-    the publish job posts it when its slot arrives.
+    Not gated by the state machine: this is that gate, replaced by a
+    dropdown on request, so an irregular jump is logged rather than
+    refused. POSTING is the one exception store.set_status_freely still
+    enforces - it is a marker the publish path sets itself, not a status a
+    person chooses.
     """
     row = find(store, row_id)
-    if not row.effective_text.strip():
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "there is nothing to publish in this row yet",
-        )
-    return _move(store, row, Status.APPROVED, {"Error": ""})
+    try:
+        store.set_status_freely(row, body.status)
+    except StoreError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return RowOut.of(row)
 
 
-@router.post("/{row_id}/unapprove", response_model=RowOut)
-def unapprove(
+@router.post("/{row_id}/restore", response_model=RowOut)
+def restore_row(
     row_id: str,
     store: PipelineStore = Depends(current_store),
     tenant: Tenant = Depends(active_tenant),
+    cfg: Config = Depends(config),
 ) -> RowOut:
-    """Take an approval back.
+    """Bring a Failed or Expired row back to Approved, ready to try again.
 
-    APPROVED -> DRAFTED is not a legal edge - approval is meant to be a
-    considered act, not a toggle - so changing your mind retires the row and
-    keeps the draft readable. Deliberately slightly inconvenient.
+    The status dropdown can already make this move - Failed -> Approved is
+    legal there, and Expired can be forced through it - but neither touches
+    ScheduledFor, which is still whatever stale time got the row retired in
+    the first place. Left alone, the next publish pass expires it right back
+    out before anyone notices it moved. This always writes a fresh slot, the
+    same one a brand-new draft would get, so the row is actually due again
+    rather than looking restored and quietly expiring a second time.
+    """
+    row = find(store, row_id)
+    if row.status not in (Status.FAILED, Status.EXPIRED):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"this row is {row.status}, not failed or expired",
+        )
+    taken = {r.ScheduledFor for r in store.pipeline_rows() if r.ScheduledFor}
+    slot = next_slot(cfg, taken)
+    store.set_status_freely(row, Status.APPROVED)
+    store.write(row, {"ScheduledFor": slot, "Error": ""})
+    return RowOut.of(row)
+
+
+def _validate_schedule(raw: str) -> str:
+    """Parse and validate a customer-supplied publish time. Returns the ISO string to store."""
+    when = parse_dt(raw)
+    if when is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "could not understand that date/time"
+        )
+    if when < utcnow() - timedelta(minutes=1):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "that time has already passed")
+    return iso(when)
+
+
+def _publish_now(tenant_id: str, cfg: Config, row_id: str) -> Optional[Row]:
+    """Run lnp.publish_now.publish_one for exactly one row.
+
+    Returns the row as last observed through the session the attempt went
+    through, or None if the account or the row is gone by the time the run
+    starts - both of which `active_tenant` and `find` above already make
+    unreachable in the ordinary case.
+    """
+    with PUBLISH_NOW_LOCK, closing(runner.runs("publish", cfg, tenant_id=tenant_id)) as runs:
+        run = next(runs, None)
+        if run is None:
+            return None
+        live_row = next((r for r in run.store.pipeline_rows() if r.ID == row_id), None)
+        if live_row is None:
+            return None
+        run_publish_one(run, live_row, dry_run=cfg.dry_run)
+        return next((r for r in run.store.pipeline_rows() if r.ID == row_id), None)
+
+
+@router.put("/{row_id}/schedule", response_model=RowOut)
+def reschedule(
+    row_id: str,
+    body: ScheduleIn,
+    store: PipelineStore = Depends(current_store),
+    tenant: Tenant = Depends(active_tenant),
+) -> RowOut:
+    """Move an already-approved row's publish time."""
+    row = find(store, row_id)
+    if row.status != Status.APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"this row is {row.status}, not approved and waiting to publish",
+        )
+    store.write(row, {"ScheduledFor": _validate_schedule(body.scheduled_for)})
+    return RowOut.of(row)
+
+
+@router.post("/{row_id}/publish-now", response_model=RowOut)
+def publish_now_route(
+    row_id: str,
+    store: PipelineStore = Depends(current_store),
+    tenant: Tenant = Depends(active_tenant),
+    cfg: Config = Depends(config),
+) -> RowOut:
+    """Publish an already-approved row immediately, instead of waiting for its slot.
+
+    PAUSED and dry_run both still apply; a refusal leaves the row APPROVED
+    and due now for the background checker to pick up.
     """
     row = find(store, row_id)
     if row.status != Status.APPROVED:
-        raise HTTPException(status.HTTP_409_CONFLICT, "this row is not approved")
-    return _move(store, row, Status.SKIPPED, {"Error": "unapproved before publishing"})
-
-
-@router.post("/{row_id}/revise", response_model=RowOut)
-def revise(
-    row_id: str,
-    body: ReviseIn,
-    store: PipelineStore = Depends(current_store),
-    tenant: Tenant = Depends(active_tenant),
-) -> RowOut:
-    """Send a draft back with an instruction.
-
-    The instruction is the valuable part: a note like "stop opening with a
-    question" is a rule already half-written, which is why the weekly voice
-    job weights notes above inferred edits.
-    """
-    row = find(store, row_id)
-    store.write_as_human(row, {"RevisionNote": body.note.strip()})
-    return _move(store, row, Status.REVISE)
-
-
-@router.post("/{row_id}/skip", response_model=RowOut)
-def skip(
-    row_id: str,
-    store: PipelineStore = Depends(current_store),
-    tenant: Tenant = Depends(active_tenant),
-) -> RowOut:
-    row = find(store, row_id)
-    if Status.SKIPPED not in LEGAL_TRANSITIONS.get(row.status, set()):
         raise HTTPException(
-            status.HTTP_409_CONFLICT, f"a {row.status} row cannot be skipped"
+            status.HTTP_409_CONFLICT,
+            f"this row is {row.status}, not approved and waiting to publish",
         )
-    return _move(store, row, Status.SKIPPED)
+    updated = _publish_now(tenant.id, cfg, row_id)
+    if updated is None:  # pragma: no cover - the row cannot vanish mid-request
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")
+    return RowOut.of(updated)
+
+
+@router.post("/bulk-skip")
+def bulk_skip(
+    body: BulkSkipIn,
+    store: PipelineStore = Depends(current_store),
+    tenant: Tenant = Depends(active_tenant),
+) -> dict:
+    """Remove several rows at once - the bulk-select toolbar's one action.
+
+    Best-effort over the list: a row already gone, or mid-publish, is
+    skipped over rather than failing the whole batch, the same way one
+    account's broken feed does not cost every other row in a curate run.
+    """
+    rows = {r.ID: r for r in store.pipeline_rows()}
+    removed: List[str] = []
+    for row_id in body.ids:
+        row = rows.get(row_id)
+        if row is None or row.status == Status.POSTING:
+            continue
+        store.set_status_freely(row, Status.SKIPPED)
+        removed.append(row_id)
+    return {"removed": removed}
