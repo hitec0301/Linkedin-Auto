@@ -109,6 +109,19 @@ export default function RowCard({ row, busy, act, reload, selectable, selected, 
 
         {row.error && <Notice kind="error">{row.error}</Notice>}
 
+        {(row.status === 'FAILED' || row.status === 'EXPIRED') && (
+          <div className="note-row">
+            <p className="muted field" style={{ margin: 0 }}>
+              {row.status === 'FAILED'
+                ? 'Publishing failed. Republish to send it back to Approved with a fresh slot.'
+                : 'This expired before its slot arrived. Republish to give it a fresh one.'}
+            </p>
+            <button className="action primary" disabled={!!busy} onClick={() => act(() => api.restoreRow(row.id))}>
+              {busy === 'working' ? 'Republishing…' : 'Republish'}
+            </button>
+          </div>
+        )}
+
         {row.status === 'POSTING' && <p className="muted">Publishing now — nothing to do.</p>}
 
         {hasVariants ? (

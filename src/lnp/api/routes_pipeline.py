@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from .. import log, runner
 from ..config import Config, ConfigError
 from ..curate import curate as run_curate
+from ..draft import next_slot
 from ..image_gen import ImageGenError, generate_image_now as run_generate_image
 from ..publish_now import publish_one as run_publish_one
 from ..redraft import RedraftRefused, redraft_now as run_redraft_now
@@ -273,6 +274,36 @@ def set_status(
         store.set_status_freely(row, body.status)
     except StoreError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return RowOut.of(row)
+
+
+@router.post("/{row_id}/restore", response_model=RowOut)
+def restore_row(
+    row_id: str,
+    store: PipelineStore = Depends(current_store),
+    tenant: Tenant = Depends(active_tenant),
+    cfg: Config = Depends(config),
+) -> RowOut:
+    """Bring a Failed or Expired row back to Approved, ready to try again.
+
+    The status dropdown can already make this move - Failed -> Approved is
+    legal there, and Expired can be forced through it - but neither touches
+    ScheduledFor, which is still whatever stale time got the row retired in
+    the first place. Left alone, the next publish pass expires it right back
+    out before anyone notices it moved. This always writes a fresh slot, the
+    same one a brand-new draft would get, so the row is actually due again
+    rather than looking restored and quietly expiring a second time.
+    """
+    row = find(store, row_id)
+    if row.status not in (Status.FAILED, Status.EXPIRED):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"this row is {row.status}, not failed or expired",
+        )
+    taken = {r.ScheduledFor for r in store.pipeline_rows() if r.ScheduledFor}
+    slot = next_slot(cfg, taken)
+    store.set_status_freely(row, Status.APPROVED)
+    store.write(row, {"ScheduledFor": slot, "Error": ""})
     return RowOut.of(row)
 
 

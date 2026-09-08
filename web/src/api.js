@@ -63,6 +63,7 @@ export const api = {
   reschedule: (id, scheduledFor) =>
     request(`/api/rows/${id}/schedule`, { method: 'PUT', body: { scheduled_for: scheduledFor } }),
   publishNow: (id) => request(`/api/rows/${id}/publish-now`, { method: 'POST' }),
+  restoreRow: (id) => request(`/api/rows/${id}/restore`, { method: 'POST' }),
   generateImage: (id) => request(`/api/rows/${id}/generate-image`, { method: 'POST' }),
   removeImage: (id) => request(`/api/rows/${id}/image`, { method: 'DELETE' }),
 

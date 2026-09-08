@@ -28,7 +28,7 @@ from lnp.db import session as session_mod
 from lnp.db.schema import Base, Source, Tenant, VoiceAmendment, VoiceCard
 from lnp.db.store import PipelineStore
 from lnp.models import Row, Status
-from lnp.util import iso, utcnow
+from lnp.util import iso, parse_dt, utcnow
 
 TENANT = "01J000000000000000000000AA"
 OTHER = "01J000000000000000000000BB"
@@ -1369,6 +1369,61 @@ def test_reschedule_refuses_an_unparseable_time(api):
                ScheduledFor=(utcnow() + timedelta(days=1)).isoformat())])
     response = api.put("/api/rows/01A/schedule", json={"scheduled_for": "not a date"})
     assert response.status_code == 400
+
+
+# --------------------------------------------------------------------------
+# Restore: bring a Failed or Expired row back to Approved
+# --------------------------------------------------------------------------
+
+
+def test_restore_a_failed_row_reapproves_it_with_a_fresh_slot(api):
+    stale = utcnow() - timedelta(days=10)
+    seed([Row(ID="01A", Status=Status.FAILED, DraftText="a draft",
+               ScheduledFor=stale.isoformat(), Error="LinkedIn refused the post: 429")])
+    body = api.post("/api/rows/01A/restore").json()
+    assert body["status"] == "APPROVED"
+    assert body["error"] == ""
+    # Not the stale slot that got it retired - it must actually be in the future,
+    # or the very next publish pass would just expire it again.
+    assert parse_dt(body["scheduled_for"]) > utcnow()
+
+
+def test_restore_an_expired_row_reapproves_it_with_a_fresh_slot(api):
+    stale = utcnow() - timedelta(days=10)
+    seed([Row(ID="01A", Status=Status.EXPIRED, DraftText="a draft",
+               ScheduledFor=stale.isoformat())])
+    body = api.post("/api/rows/01A/restore").json()
+    assert body["status"] == "APPROVED"
+    assert parse_dt(body["scheduled_for"]) > utcnow()
+
+
+def test_restore_does_not_collide_with_an_already_taken_slot(api):
+    taken = utcnow() + timedelta(days=1)
+    seed([
+        Row(ID="01APPR", Status=Status.APPROVED, DraftText="a draft", ScheduledFor=taken.isoformat()),
+        Row(ID="01FAILED", Status=Status.FAILED, DraftText="a draft",
+            ScheduledFor=(utcnow() - timedelta(days=5)).isoformat()),
+    ])
+    body = api.post("/api/rows/01FAILED/restore").json()
+    assert body["scheduled_for"] != taken.isoformat()
+
+
+def test_restore_refuses_a_row_that_is_not_failed_or_expired(api):
+    seed([Row(ID="01A", Status=Status.DRAFTED, DraftText="a draft")])
+    response = api.post("/api/rows/01A/restore")
+    assert response.status_code == 409
+
+
+def test_restore_refuses_a_posted_row(api):
+    seed([Row(ID="01A", Status=Status.POSTED, DraftText="a draft", PostURN="urn:li:share:1")])
+    response = api.post("/api/rows/01A/restore")
+    assert response.status_code == 409
+
+
+def test_restore_does_not_reach_another_tenants_row(api):
+    seed([Row(ID="01THEIRS", Status=Status.FAILED, DraftText="a draft")], tenant_id=OTHER)
+    response = api.post("/api/rows/01THEIRS/restore")
+    assert response.status_code == 404
 
 
 def test_publish_now_route_refuses_a_row_that_is_not_approved(api):

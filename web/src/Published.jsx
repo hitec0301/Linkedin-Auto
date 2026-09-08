@@ -8,12 +8,35 @@ export default function Published() {
   const health = useAsync(() => api.health(), [])
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
+  const [restored, setRestored] = useState(null)
 
   async function act(fn) {
     setBusy('working')
     setError('')
     try {
       await fn()
+      rows.reload()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  // Restoring moves the row to Approved, which takes it off this list on
+  // the very next reload - so, same as "Post now", the confirmation has to
+  // come from the response itself, before that reload can erase all trace
+  // of what just happened.
+  async function restore(row) {
+    setBusy('working')
+    setError('')
+    setRestored(null)
+    try {
+      const updated = await api.restoreRow(row.id)
+      setRestored({
+        title: row.source_title || 'Untitled',
+        when: (updated.scheduled_for || '').replace('T', ' ').replace('Z', ''),
+      })
       rows.reload()
     } catch (err) {
       setError(err.message)
@@ -32,6 +55,14 @@ export default function Published() {
   return (
     <>
       {error && <Notice kind="error">{error}</Notice>}
+      {restored && (
+        <Notice kind="ok">
+          "{restored.title}" is back on Review, Approved
+          {restored.when ? ` and due ${restored.when}` : ''}.
+          {' '}
+          <a href="#" onClick={(e) => { e.preventDefault(); setRestored(null) }}>Dismiss</a>
+        </Notice>
+      )}
       {h && <Health stats={h} />}
 
       {posted.length === 0 && <p className="empty">Nothing published yet.</p>}
@@ -45,7 +76,7 @@ export default function Published() {
           <h3>Not published</h3>
           <table>
             <thead>
-              <tr><th>Status</th><th>Item</th><th>Why</th></tr>
+              <tr><th>Status</th><th>Item</th><th>Why</th><th /></tr>
             </thead>
             <tbody>
               {rest.map((row) => (
@@ -53,6 +84,17 @@ export default function Published() {
                   <td>{row.status.toLowerCase()}</td>
                   <td>{row.source_title}</td>
                   <td className="muted">{row.error || '—'}</td>
+                  <td>
+                    {(row.status === 'FAILED' || row.status === 'EXPIRED') && (
+                      <button
+                        className="action"
+                        disabled={!!busy}
+                        onClick={() => restore(row)}
+                      >
+                        {busy === 'working' ? 'Republishing…' : 'Republish'}
+                      </button>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
