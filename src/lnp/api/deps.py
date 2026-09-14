@@ -7,6 +7,7 @@ there is no route that can be pointed at somebody else's account.
 
 from __future__ import annotations
 
+import threading
 from typing import Iterator, Optional
 
 from fastapi import Cookie, Depends, HTTPException, status
@@ -19,6 +20,28 @@ from ..db.store import PipelineStore
 from .security import SESSION_COOKIE, read_session
 
 _config: Optional[Config] = None
+
+# lnp.llm's usage meter is a process-global, not a per-thread one, because
+# every existing caller (the scheduled jobs) runs one tenant at a time in a
+# single thread. Every route that opens its own runner.Run to make an
+# on-demand LLM call - curate-now, redraft-now, drafting a starter voice
+# card from a description - shares this one lock, so two such requests
+# landing on FastAPI's threadpool at once cannot attribute one tenant's
+# model spend to another's cap. One lock, not one per route module: two
+# separate locks would each serialise their own callers and still race
+# against each other.
+ON_DEMAND_LLM_LOCK = threading.Lock()
+
+# store.transition()'s guard checks the in-memory row it is handed, not a
+# fresh read under a database lock, because every existing writer used to be
+# single-threaded and sequential (one cron job at a time). Two things can now
+# reach the same row's publish path at once: a person clicking "Post now" and
+# the background publish checker's own periodic sweep. This lock serialises
+# both against each other, tenant-wide - it does not scope per row, because
+# the checker processes one tenant's due rows in a batch and a finer lock
+# would not stop it from racing a "Post now" click on a different row in the
+# same batch.
+PUBLISH_NOW_LOCK = threading.Lock()
 
 
 def config() -> Config:

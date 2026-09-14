@@ -1,9 +1,49 @@
+import { useState } from 'react'
 import { api } from './api.js'
-import { AutoSave, Notice, useAsync } from './bits.jsx'
+import { Notice, useAsync } from './bits.jsx'
+import RowCard from './RowCard.jsx'
 
 export default function Published() {
   const rows = useAsync(() => api.rows('POSTED,EXPIRED,SKIPPED,FAILED'), [])
   const health = useAsync(() => api.health(), [])
+  const [busy, setBusy] = useState('')
+  const [error, setError] = useState('')
+  const [restored, setRestored] = useState(null)
+
+  async function act(fn) {
+    setBusy('working')
+    setError('')
+    try {
+      await fn()
+      rows.reload()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  // Restoring moves the row to Approved, which takes it off this list on
+  // the very next reload - so, same as "Post now", the confirmation has to
+  // come from the response itself, before that reload can erase all trace
+  // of what just happened.
+  async function restore(row) {
+    setBusy('working')
+    setError('')
+    setRestored(null)
+    try {
+      const updated = await api.restoreRow(row.id)
+      setRestored({
+        title: row.source_title || 'Untitled',
+        when: (updated.scheduled_for || '').replace('T', ' ').replace('Z', ''),
+      })
+      rows.reload()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy('')
+    }
+  }
 
   if (rows.loading) return <p className="empty">Loading…</p>
   if (rows.error) return <Notice kind="error">{rows.error}</Notice>
@@ -14,31 +54,21 @@ export default function Published() {
 
   return (
     <>
+      {error && <Notice kind="error">{error}</Notice>}
+      {restored && (
+        <Notice kind="ok">
+          "{restored.title}" is back on Review, Approved
+          {restored.when ? ` and due ${restored.when}` : ''}.
+          {' '}
+          <a href="#" onClick={(e) => { e.preventDefault(); setRestored(null) }}>Dismiss</a>
+        </Notice>
+      )}
       {h && <Health stats={h} />}
 
       {posted.length === 0 && <p className="empty">Nothing published yet.</p>}
 
       {posted.map((row) => (
-        <div className="panel" key={row.id}>
-          <h3>{row.source_title || 'Untitled'}</h3>
-          <div className="meta">
-            <span>{(row.posted_at || '').replace('T', ' ').replace('Z', '')}</span>
-            {row.edit_distance > 0 && <span>you changed {Math.round(row.edit_distance * 100)}%</span>}
-            {row.revision_count > 0 && <span>{row.revision_count} revision(s)</span>}
-          </div>
-          <div className="post-text">{row.final_text || row.draft_text}</div>
-          <label>
-            Impressions, when you have them. Nothing reads this automatically —
-            LinkedIn's analytics are not scraped.
-          </label>
-          <AutoSave
-            id={row.id}
-            rows={1}
-            value={row.reach ? String(row.reach) : ''}
-            placeholder="e.g. 4200"
-            onSave={(v) => api.editRow(row.id, { reach: Number(v.replace(/\D/g, '')) || 0 })}
-          />
-        </div>
+        <RowCard key={row.id} row={row} busy={busy} act={act} reload={rows.reload} />
       ))}
 
       {rest.length > 0 && (
@@ -46,7 +76,7 @@ export default function Published() {
           <h3>Not published</h3>
           <table>
             <thead>
-              <tr><th>Status</th><th>Item</th><th>Why</th></tr>
+              <tr><th>Status</th><th>Item</th><th>Why</th><th /></tr>
             </thead>
             <tbody>
               {rest.map((row) => (
@@ -54,6 +84,17 @@ export default function Published() {
                   <td>{row.status.toLowerCase()}</td>
                   <td>{row.source_title}</td>
                   <td className="muted">{row.error || '—'}</td>
+                  <td>
+                    {(row.status === 'FAILED' || row.status === 'EXPIRED') && (
+                      <button
+                        className="action"
+                        disabled={!!busy}
+                        onClick={() => restore(row)}
+                      >
+                        {busy === 'working' ? 'Republishing…' : 'Republish'}
+                      </button>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>

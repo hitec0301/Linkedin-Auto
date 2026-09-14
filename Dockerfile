@@ -1,7 +1,7 @@
-# The image every service runs: the web app and the four scheduled jobs. One
-# image, one build, and the only difference between the services is the start
-# command - so a job can never be running different code from the API that
-# shows its results.
+# The one image this product runs: the web app, which also runs the publish
+# checker in a background thread. jobs/ still ships in the image as manual
+# ops tooling (reproduce one customer's problem by hand), but nothing in it
+# is scheduled - there is only the one service and the one start command.
 # Stage one builds the front end. Node is needed to produce the bundle and
 # never to serve it, so it does not travel into the runtime image.
 FROM node:22-slim AS web

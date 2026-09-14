@@ -79,7 +79,6 @@ def complete(
     user: str,
     model: Optional[str] = None,
     max_tokens: int = 4000,
-    temperature: Optional[float] = None,
     max_retries: int = 4,
     api: Optional[anthropic.Anthropic] = None,
 ) -> str:
@@ -87,6 +86,13 @@ def complete(
 
     Retries rate limits and server errors; a 4xx that is not a rate limit is a
     bug in our request and is raised immediately rather than hammered.
+
+    No `temperature` parameter: the installed SDK's Messages.create() no
+    longer accepts one, and it does not appear anywhere in the package - not
+    renamed, not moved under another param - so this is a removed API
+    surface, not a stale type stub. Every caller only ever asked for the
+    default anyway (config's old drafting.temperature was 1.0, the API's own
+    default), so there is nothing left to preserve.
     """
     api = api or client()
     model = model or config.get("drafting.model", "claude-sonnet-4-6")
@@ -96,8 +102,6 @@ def complete(
         "system": system,
         "messages": [{"role": "user", "content": user}],
     }
-    if temperature is not None:
-        kwargs["temperature"] = temperature
 
     if _meter is not None:
         _meter.check()

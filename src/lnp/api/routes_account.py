@@ -9,17 +9,22 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from contextlib import closing
+
+from .. import runner, voice
+from ..config import Config
 from ..db.schema import LinkedInApp, LinkedInToken, Source, VoiceCard
 from ..db.schema import Tenant
 from ..db.store import PipelineStore
 from ..db.usage import summary as usage_summary
 from ..models import health_stats
-from ..db.store import KEY_PAUSED, StoreError
+from ..db.store import KEY_AUDIENCE_DESCRIPTION, KEY_PAUSED, StoreError
 from ..util import iso
-from .deps import active_tenant, config, current_store, current_tenant, db
+from .deps import ON_DEMAND_LLM_LOCK, active_tenant, config, current_store, current_tenant, db
 from .schemas import (
     AmendmentDecision,
     AmendmentOut,
+    AudienceIn,
     HealthOut,
     MeOut,
     PauseIn,
@@ -55,6 +60,7 @@ def me(
         linkedin_app_configured=bool(app and app.client_id),
         linkedin_connected=bool(token and token.access_token),
         post_count=store.post_count(),
+        audience_description=store.config_values().get(KEY_AUDIENCE_DESCRIPTION, ""),
     )
 
 
@@ -159,6 +165,41 @@ def delete_source(
 
 
 # --------------------------------------------------------------------------
+# Audience: who this account writes for, and the voice card it seeds
+# --------------------------------------------------------------------------
+
+
+@router.put("/audience", response_model=VoiceCardOut)
+def set_audience(
+    body: AudienceIn,
+    tenant: Tenant = Depends(active_tenant),
+    cfg: Config = Depends(config),
+) -> VoiceCardOut:
+    """Save who this account writes for, and draft a starter card from it.
+
+    Only "Who is writing" and "Stance" are regenerated - Structure, Banned,
+    Formatting, the amendment markers, and anything already hand-edited stay
+    exactly as they are. This can be called again later to redo those two
+    sections from a fresh description; it is not a one-time setup step.
+
+    Goes through its own runner.Run, the same as the pipeline's other
+    on-demand LLM calls, so this call is metered against the account's
+    monthly allowance like every other model call rather than being free.
+    """
+    description = body.description
+    with ON_DEMAND_LLM_LOCK, closing(runner.runs("voice_amend", cfg, tenant_id=tenant.id)) as runs:
+        run = next(runs, None)
+        if run is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "this account is not active")
+        run.store.set_config_value(KEY_AUDIENCE_DESCRIPTION, description)
+        sections = voice.draft_starter_sections(run.config, description)
+        updated_card = voice.replace_starter_sections(run.store.load_voice_card(), sections)
+        run.store.save_voice_card(updated_card)
+        card = run.session.get(VoiceCard, tenant.id)
+        return VoiceCardOut(content=card.content, updated_at=iso(card.updated_at))
+
+
+# --------------------------------------------------------------------------
 # Voice
 # --------------------------------------------------------------------------
 
@@ -214,10 +255,11 @@ def decide_amendment(
 ) -> AmendmentOut:
     """Tick or untick a proposed rule.
 
-    This endpoint is the only way `accepted` ever becomes true. Nothing the
-    model produces reaches the voice card without a person doing this, and
-    accepting here still does not write the card — the weekly job does, so
-    there is one place where the card changes.
+    This endpoint is the only way `accepted` ever becomes true, and
+    accepting writes it into the voice card immediately - there is no
+    weekly job left to do that later, so this is the only moment it can
+    happen. Nothing the model produces reaches the card without a person
+    doing this first.
     """
     from ..db.schema import VoiceAmendment
 
@@ -231,6 +273,8 @@ def decide_amendment(
         )
     found.accepted = body.accepted
     session.commit()
+    if body.accepted:
+        voice.apply_accepted(store)
     return AmendmentOut(
         id=found.id, created_at=iso(found.created_at), rule=found.rule,
         rationale=found.rationale, signal=found.signal,

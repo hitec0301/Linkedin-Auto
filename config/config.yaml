@@ -76,13 +76,12 @@ scoring:
 drafting:
   model: claude-sonnet-4-6
   max_tokens: 4000
-  temperature: 1.0
   min_chars: 900
   max_chars: 1300
   # LinkedIn truncates near 210 characters. The first two lines have to carry
   # the hook and the claim on their own.
   hook_chars: 210
-  max_hashtags: 3
+  max_hashtags: 5
   # Two variants while the human is still calibrating the voice card.
   variants_until_post: 20
   max_revisions: 3
@@ -105,8 +104,9 @@ voice:
   max_proposals_per_run: 5
 
 publish:
-  # Leave this on for two weeks. It logs the exact payload and posts nothing.
-  dry_run: true
+  # Off: publishing (manual "Post now" and the scheduled checker alike)
+  # posts for real. Set back to true to log the payload and post nothing.
+  dry_run: false
   # A row more than this many hours past ScheduledFor expires unpublished. A
   # four-day-old take is worse than no post.
   staleness_hours: 48
@@ -115,6 +115,19 @@ publish:
   api_base: https://api.linkedin.com
   api_version: "202605"
   request_timeout_seconds: 30
+
+imaging:
+  # "Generate image" writes a short visual brief with this model first, then
+  # hands it to Gemini. Needs GEMINI_API_KEY; unset means the button errors.
+  prompt_model: claude-sonnet-4-6
+  model: gemini-2.5-flash-image
+  request_timeout_seconds: 60
+
+publish_checker:
+  # How often the in-process background thread checks for approved rows
+  # whose ScheduledFor has arrived. This is the one thing still on a clock -
+  # everything else in the pipeline runs on request instead.
+  interval_seconds: 60
 
 schedule:
   timezone: America/New_York

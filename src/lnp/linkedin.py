@@ -1,8 +1,14 @@
 """LinkedIn Posts API client.
 
-Personal profile, text-only. No images, documents, or article shares: those are
-a separate multi-step upload flow and roughly triple the failure surface for a
-post that reads the same. The source URL goes in the body as plain text.
+Personal profile. Text always; an image is optional, attached through the
+separate multi-step upload flow the Posts API requires: register an upload,
+PUT the bytes, then reference the returned URN in the post payload. This is
+real extra failure surface for a post that would otherwise read the same, so
+`upload_image` is called right before the post it will be attached to - never
+earlier, since the upload URL LinkedIn hands back is short-lived - and every
+caller treats an upload failure as "publish the text without the image"
+rather than "fail the post". Documents and article shares are still out of
+scope. The source URL goes in the body as plain text.
 """
 
 from __future__ import annotations
@@ -91,8 +97,8 @@ class LinkedIn:
 
     # ---- posting ---------------------------------------------------------
 
-    def build_payload(self, author: str, commentary: str) -> Dict:
-        return {
+    def build_payload(self, author: str, commentary: str, image_urn: str = "") -> Dict:
+        payload = {
             "author": author,
             "commentary": commentary,
             "visibility": "PUBLIC",
@@ -104,6 +110,53 @@ class LinkedIn:
             "lifecycleState": "PUBLISHED",
             "isReshareDisabledByAuthor": False,
         }
+        if image_urn:
+            payload["content"] = {"media": {"id": image_urn}}
+        return payload
+
+    def upload_image(
+        self, author: str, image_bytes: bytes, mime_type: str = "image/png"
+    ) -> str:
+        """Register an image upload, PUT the bytes, and return the image URN.
+
+        Two HTTP calls where every other method here makes one: LinkedIn hands
+        back a short-lived upload URL rather than accepting bytes directly, so
+        this must be called right before the post that will reference the
+        result, never at generation time.
+        """
+        init = self.session.post(
+            f"{self.base}/rest/images?action=initializeUpload",
+            headers=self._headers(),
+            json={"initializeUploadRequest": {"owner": author}},
+            timeout=self.timeout,
+        )
+        if init.status_code >= 400:
+            raise LinkedInError(
+                f"image upload init failed ({init.status_code}): {init.text[:800]}"
+            )
+        value = init.json().get("value", {})
+        upload_url = value.get("uploadUrl")
+        image_urn = value.get("image")
+        if not upload_url or not image_urn:
+            raise LinkedInError("image upload init returned no uploadUrl/image urn")
+
+        put = self.session.put(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {self.tokens.access_token}",
+                "Content-Type": mime_type,
+            },
+            data=image_bytes,
+            timeout=self.timeout,
+        )
+        if put.status_code >= 400:
+            raise LinkedInError(
+                f"image upload failed ({put.status_code}): {put.text[:800]}"
+            )
+        logger.info(
+            "image uploaded", extra={"urn": image_urn, "bytes": len(image_bytes)}
+        )
+        return image_urn
 
     def create_post(self, payload: Dict) -> str:
         """POST the payload and return the URN from the x-restli-id header."""

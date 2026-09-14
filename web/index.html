@@ -4,6 +4,16 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Publishing pipeline</title>
+    <script>
+      // Applied before paint, so a saved preference never flashes the wrong
+      // theme first. No preference saved yet - up to App.jsx to decide.
+      try {
+        var saved = localStorage.getItem('theme')
+        if (saved === 'light' || saved === 'dark') {
+          document.documentElement.dataset.theme = saved
+        }
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="root"></div>

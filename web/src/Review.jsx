@@ -1,23 +1,57 @@
 import { useState } from 'react'
 import { api } from './api.js'
-import { AutoSave, Confirm, Notice, StatusTag, useAsync } from './bits.jsx'
+import { Notice, useAsync } from './bits.jsx'
+import RowCard from './RowCard.jsx'
 
 // The order the human works in: things waiting on them first, things waiting
 // on the machine last. A row they cannot act on should never be at the top of
-// the page competing for attention.
+// the page competing for attention. Terminal statuses (Posted, Skipped,
+// Expired) live on Published instead - once a row is done, it stops
+// competing with the ones still waiting on a decision.
 const ORDER = ['DRAFTED', 'REVISE', 'APPROVED', 'NEW', 'FAILED', 'POSTING']
 
-export default function Review() {
+export default function Review({ onDiscuss }) {
   const rows = useAsync(() => api.rows(ORDER.join(',')), [])
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const [fetchMsg, setFetchMsg] = useState('')
+  const [picked, setPicked] = useState(() => new Set())
+  const [composing, setComposing] = useState(false)
+  const [postNotice, setPostNotice] = useState(null)
 
   async function act(fn) {
     setBusy('working')
     setError('')
     try {
       await fn()
+      rows.reload()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  // Publishing takes the row off this screen the moment it lands (Posted
+  // rows live on Published, not Review) - a plain `act()` reload would make
+  // a successful post look like the button did nothing. This captures the
+  // outcome from the response itself, before that reload can erase it.
+  async function postNow(row) {
+    setBusy('working')
+    setError('')
+    setPostNotice(null)
+    try {
+      const updated = await api.publishNow(row.id)
+      if (updated.status === 'POSTED') {
+        const link = updated.post_urn
+          ? `https://www.linkedin.com/feed/update/${encodeURIComponent(updated.post_urn)}/`
+          : ''
+        setPostNotice({ kind: 'ok', text: 'Published to LinkedIn.', link })
+      } else if (/^dry run/.test(updated.error || '')) {
+        setPostNotice({ kind: 'warn', text: `Not published — ${updated.error}` })
+      } else if (updated.error) {
+        setPostNotice({ kind: 'error', text: updated.error })
+      }
       rows.reload()
     } catch (err) {
       setError(err.message)
@@ -41,6 +75,22 @@ export default function Review() {
     }
   }
 
+  function toggle(id) {
+    setPicked((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  async function removeSelected() {
+    const ids = [...picked]
+    if (ids.length === 0) return
+    await act(() => api.bulkSkip(ids))
+    setPicked(new Set())
+  }
+
   if (rows.loading) return <p className="empty">Loading…</p>
   if (rows.error) return <Notice kind="error">{rows.error}</Notice>
 
@@ -48,165 +98,152 @@ export default function Review() {
     (a, b) => ORDER.indexOf(a.status) - ORDER.indexOf(b.status),
   )
   const drafted = sorted.filter((r) => r.status === 'DRAFTED').length
+  const visibleIds = new Set(sorted.map((r) => r.id))
+  const pickedCount = [...picked].filter((id) => visibleIds.has(id)).length
 
   return (
     <>
       {error && <Notice kind="error">{error}</Notice>}
+      {postNotice && (
+        <Notice kind={postNotice.kind}>
+          {postNotice.text}
+          {postNotice.link && (
+            <>
+              {' '}
+              <a href={postNotice.link} target="_blank" rel="noreferrer">View it on LinkedIn ↗</a>
+            </>
+          )}
+          {' '}
+          <a href="#" onClick={(e) => { e.preventDefault(); setPostNotice(null) }}>Dismiss</a>
+        </Notice>
+      )}
 
-      {sorted.length === 0 ? (
-        <div className="empty">
-          <p>Nothing waiting. The next batch of candidates arrives Monday morning.</p>
-          <div className="actions" style={{ justifyContent: 'center' }}>
-            <button className="action primary" disabled={!!busy} onClick={fetchNow}>
-              {busy === 'fetching' ? 'Fetching…' : 'Fetch candidates now'}
+      <div className="toprow">
+        <p>
+          {sorted.length === 0
+            ? 'Nothing waiting. Fetch candidates whenever you want the next batch.'
+            : drafted > 0
+              ? `${drafted} draft${drafted === 1 ? '' : 's'} waiting on you.`
+              : 'No drafts waiting. Write a take on a candidate and redraft it.'}
+        </p>
+        <div className="actions" style={{ marginTop: 0 }}>
+          <button className="action" disabled={!!busy} onClick={() => setComposing((v) => !v)}>
+            {composing ? 'Cancel' : 'New post'}
+          </button>
+          <button className="action" disabled={!!busy} onClick={fetchNow}>
+            {busy === 'fetching' ? 'Fetching…' : 'Fetch candidates now'}
+          </button>
+        </div>
+      </div>
+      {fetchMsg && <p className="muted" style={{ marginTop: -10 }}>{fetchMsg}</p>}
+
+      {composing && (
+        <NewPostForm
+          onCancel={() => setComposing(false)}
+          onCreated={() => { setComposing(false); rows.reload() }}
+        />
+      )}
+
+      {pickedCount > 0 && (
+        <div className="bulkbar">
+          <span className="count">{pickedCount} selected</span>
+          <div className="right">
+            <a href="#" className="clear" onClick={(e) => { e.preventDefault(); setPicked(new Set()) }}>
+              Clear selection
+            </a>
+            <button className="action danger" disabled={!!busy} onClick={removeSelected}>
+              Remove selected
             </button>
           </div>
-          {fetchMsg && <p className="muted">{fetchMsg}</p>}
         </div>
-      ) : (
-        <p className="muted" style={{ marginTop: 0 }}>
-          {drafted > 0
-            ? `${drafted} draft${drafted === 1 ? '' : 's'} waiting on you.`
-            : 'No drafts waiting. Tick the candidates you want and give each an angle.'}
-        </p>
       )}
 
       {sorted.map((row) => (
-        <RowCard key={row.id} row={row} busy={busy} act={act} />
+        <RowCard
+          key={row.id}
+          row={row}
+          busy={busy}
+          act={act}
+          reload={rows.reload}
+          selectable
+          selected={picked.has(row.id)}
+          onToggleSelect={toggle}
+          onDiscuss={onDiscuss}
+          onPostNow={postNow}
+        />
       ))}
     </>
   )
 }
 
-function RowCard({ row, busy, act }) {
-  const [revising, setRevising] = useState(false)
-  const [note, setNote] = useState('')
-  const can = (name) => row.allowed_actions.includes(name)
-  const text = row.final_text || row.draft_text
+/**
+ * Start a post from your own writeup instead of a fetched candidate.
+ *
+ * Owns its own submit state rather than routing through the page's `act` -
+ * a validation error (a malformed URL, most often) should leave the form
+ * open with what was typed still in it, not close it and lose the draft.
+ */
+function NewPostForm({ onCancel, onCreated }) {
+  const [sourceUrl, setSourceUrl] = useState('')
+  const [sourceTitle, setSourceTitle] = useState('')
+  const [take, setTake] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+
+  async function submit() {
+    setSubmitting(true)
+    setError('')
+    try {
+      await api.createRow({ source_url: sourceUrl, source_title: sourceTitle, take })
+      onCreated()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
 
   return (
-    <div className="panel row-card">
-      <h3>{row.source_title || 'Untitled'}</h3>
-      <div className="meta">
-        <StatusTag status={row.status} />
-        {row.audience && <span className="tag">{row.audience.replace('AUD_', '').toLowerCase()}</span>}
-        {row.theme && <span className="tag">{row.theme.replace('THM_', '').toLowerCase()}</span>}
-        {row.source_url && <a href={row.source_url} target="_blank" rel="noreferrer">source</a>}
-        {row.scheduled_for && <span>slot {row.scheduled_for.replace('T', ' ').replace('Z', '')}</span>}
-        {row.revision_count > 0 && <span>{row.revision_count} revision(s)</span>}
-      </div>
+    <div className="panel card">
+      <h3>New post</h3>
+      {error && <Notice kind="error">{error}</Notice>}
 
-      {row.why_it_matters && <p className="muted">{row.why_it_matters}</p>}
+      <label className="field-label">Source URL — the article you're citing</label>
+      <input
+        type="url"
+        value={sourceUrl}
+        placeholder="https://…"
+        onChange={(e) => setSourceUrl(e.target.value)}
+      />
 
-      {row.error && <Notice kind="error">{row.error}</Notice>}
+      <label className="field-label">Title, if you want one (optional)</label>
+      <input
+        type="text"
+        value={sourceTitle}
+        placeholder="Untitled if left blank"
+        onChange={(e) => setSourceTitle(e.target.value)}
+      />
 
-      {row.status === 'NEW' && (
-        <>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={row.selected}
-              onChange={(e) => act(() => api.editRow(row.id, { selected: e.target.checked }))}
-            />
-            Write about this one
-          </label>
-          <label htmlFor={`angle-${row.id}`}>
-            Angle — one line, in your words. This is what the draft is built from.
-          </label>
-          <AutoSave
-            id={row.id}
-            value={row.angle}
-            placeholder="e.g. the compliance-training numbers everyone quotes are measuring the wrong thing"
-            onSave={(v) => api.editRow(row.id, { angle: v })}
-          />
-        </>
-      )}
-
-      {text && (
-        <>
-          <div className="post-text">{text}</div>
-          <div className="muted">
-            {text.length} characters
-            {row.final_text && row.final_text !== row.draft_text && ' · edited by you'}
-          </div>
-        </>
-      )}
-
-      {['DRAFTED', 'REVISE', 'APPROVED'].includes(row.status) && (
-        <>
-          <label>Your version — edit freely. The draft above is kept as written.</label>
-          <AutoSave
-            id={row.id}
-            rows={8}
-            value={row.final_text}
-            placeholder="Leave empty to publish the draft as it stands."
-            onSave={(v) => api.editRow(row.id, { final_text: v })}
-          />
-        </>
-      )}
-
-      {revising && (
-        <>
-          <label>What should change? Write it as a rule, not a rewrite.</label>
-          <textarea
-            rows={3}
-            value={note}
-            placeholder="e.g. stop opening with a question"
-            onChange={(e) => setNote(e.target.value)}
-          />
-        </>
-      )}
+      <label className="field-label">Your writeup — the thesis a first draft is built from</label>
+      <textarea
+        className="note"
+        rows={5}
+        value={take}
+        placeholder="What's your take on this article? Write as much as you want - this is what the draft argues, the article is just evidence for it."
+        onChange={(e) => setTake(e.target.value)}
+      />
 
       <div className="actions">
-        {can('approve') && !revising && (
-          <button
-            className="action primary"
-            disabled={!!busy || !text.trim()}
-            onClick={() => act(() => api.approve(row.id))}
-          >
-            Approve for publishing
-          </button>
-        )}
-        {can('revise') && !revising && (
-          <button className="action" onClick={() => setRevising(true)}>
-            Send back with a note
-          </button>
-        )}
-        {revising && (
-          <>
-            <button
-              className="action primary"
-              disabled={!note.trim() || !!busy}
-              onClick={() => act(async () => {
-                await api.revise(row.id, note)
-                setRevising(false)
-                setNote('')
-              })}
-            >
-              Send back
-            </button>
-            <button className="action" onClick={() => { setRevising(false); setNote('') }}>
-              Cancel
-            </button>
-          </>
-        )}
-        {can('unapprove') && !revising && (
-          <Confirm
-            label="Take approval back"
-            question="This retires the row rather than returning it to draft. Sure?"
-            onConfirm={() => act(() => api.unapprove(row.id))}
-          />
-        )}
-        {can('skip') && !revising && (
-          <Confirm
-            label="Skip"
-            question="Skipped rows do not come back. Sure?"
-            onConfirm={() => act(() => api.skip(row.id))}
-          />
-        )}
-        {row.status === 'POSTING' && (
-          <span className="muted">Publishing now — nothing to do.</span>
-        )}
+        <button
+          className="action primary"
+          disabled={submitting || !sourceUrl.trim()}
+          onClick={submit}
+        >
+          {submitting ? 'Creating…' : 'Create'}
+        </button>
+        <button className="action" disabled={submitting} onClick={onCancel}>
+          Cancel
+        </button>
       </div>
     </div>
   )
