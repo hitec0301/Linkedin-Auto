@@ -115,6 +115,7 @@ class DiscussionRecord:
     updated_at: str = ""
     source_url: str = ""
     source_title: str = ""
+    pasted_text: str = ""
     started_from_row_id: str = ""
     row_id: str = ""
     messages: List[Dict[str, str]] = field(default_factory=list)
@@ -585,6 +586,7 @@ class PipelineStore:
             updated_at=iso(d.updated_at) if d.updated_at else "",
             source_url=d.source_url,
             source_title=d.source_title,
+            pasted_text=d.pasted_text,
             started_from_row_id=d.started_from_row_id,
             row_id=d.row_id,
             messages=list(d.messages or []),
@@ -606,13 +608,14 @@ class PipelineStore:
 
     def create_discussion(
         self, *, source_url: str, source_title: str, started_from_row_id: str,
-        messages: Sequence[Dict[str, str]],
+        messages: Sequence[Dict[str, str]], pasted_text: str = "",
     ) -> DiscussionRecord:
         found = Discussion(
             id=ulid.new().str,
             tenant_id=self.tenant_id,
             source_url=source_url,
             source_title=source_title,
+            pasted_text=pasted_text,
             started_from_row_id=started_from_row_id,
             messages=list(messages),
         )

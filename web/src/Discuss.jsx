@@ -71,7 +71,7 @@ export default function Discuss({ seed, onSeedConsumed, go }) {
             onClick={() => setOpenId(d.id)}
           >
             <div className="card-head">
-              <h3>{d.source_title || d.source_url}</h3>
+              <h3>{d.source_title || d.source_url || d.pasted_text.slice(0, 60) || 'Untitled'}</h3>
               {d.row_id && <span className="tag">became a post</span>}
             </div>
             <div className="card-body">
@@ -91,14 +91,22 @@ export default function Discuss({ seed, onSeedConsumed, go }) {
 function NewDiscussionForm({ busy, onStart }) {
   const [sourceUrl, setSourceUrl] = useState('')
   const [sourceTitle, setSourceTitle] = useState('')
+  const [pastedText, setPastedText] = useState('')
   const [error, setError] = useState('')
+
+  const canStart = !!(sourceUrl.trim() || pastedText.trim())
 
   async function submit() {
     setError('')
     try {
-      await onStart({ source_url: sourceUrl, source_title: sourceTitle })
+      await onStart({
+        source_url: sourceUrl,
+        source_title: sourceTitle,
+        pasted_text: pastedText,
+      })
       setSourceUrl('')
       setSourceTitle('')
+      setPastedText('')
     } catch (err) {
       setError(err.message)
     }
@@ -109,7 +117,7 @@ function NewDiscussionForm({ busy, onStart }) {
       <h3>New discussion</h3>
       {error && <Notice kind="error">{error}</Notice>}
 
-      <label className="field-label">Source URL — the article to discuss</label>
+      <label className="field-label">Source URL — an article to discuss (optional if you paste text below)</label>
       <input
         type="url"
         value={sourceUrl}
@@ -125,10 +133,21 @@ function NewDiscussionForm({ busy, onStart }) {
         onChange={(e) => setSourceTitle(e.target.value)}
       />
 
+      <label className="field-label">
+        Or paste text — a comment you're reacting to, a quote, your own notes
+      </label>
+      <textarea
+        className="note"
+        rows={4}
+        value={pastedText}
+        placeholder="Paste whatever you want to argue with or about…"
+        onChange={(e) => setPastedText(e.target.value)}
+      />
+
       <div className="actions">
         <button
           className="action primary"
-          disabled={busy || !sourceUrl.trim()}
+          disabled={busy || !canStart}
           onClick={submit}
         >
           {busy ? 'Starting…' : 'Start discussing'}
@@ -217,12 +236,17 @@ function DiscussionChat({ id, onBack, onBecamePost, go }) {
 
       <div className="panel card">
         <div className="card-head">
-          <h3>{discussion.source_title || 'Untitled'}</h3>
+          <h3>{discussion.source_title || (discussion.source_url ? 'Untitled' : 'Pasted text')}</h3>
         </div>
         <div className="card-body">
-          <div className="meta">
-            <a href={discussion.source_url} target="_blank" rel="noreferrer">source ↗</a>
-          </div>
+          {discussion.source_url && (
+            <div className="meta">
+              <a href={discussion.source_url} target="_blank" rel="noreferrer">source ↗</a>
+            </div>
+          )}
+          {discussion.pasted_text && (
+            <p className="why">{discussion.pasted_text}</p>
+          )}
 
           <div className="chat-thread">
             {discussion.messages.map((m, i) => (

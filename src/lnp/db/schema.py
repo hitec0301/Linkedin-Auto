@@ -335,6 +335,10 @@ class Discussion(Base):
     )
     source_url: Mapped[str] = mapped_column(Text, default="")
     source_title: Mapped[str] = mapped_column(Text, default="")
+    # What the person pasted in directly, instead of or alongside a URL - a
+    # comment they're reacting to, notes, a quote. Read the same way a
+    # fetched article extract is: material to discuss, not a thesis.
+    pasted_text: Mapped[str] = mapped_column(Text, default="")
     started_from_row_id: Mapped[str] = mapped_column(ID, default="")
     row_id: Mapped[str] = mapped_column(ID, default="")
     messages: Mapped[list] = mapped_column(JSON, default=list)

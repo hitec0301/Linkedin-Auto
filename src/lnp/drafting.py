@@ -114,6 +114,12 @@ no markdown fences."""
 
 CONSTRAINTS = """\
 Constraints:
+- Three moves, in order: the problem (the concrete issue, named plainly - \
+not "there's a lot of talk about X" but the actual friction or tension), \
+the implication (what it costs or risks if this goes unaddressed), and a \
+potential solution (a direction worth taking, not necessarily a complete \
+plan). No headings or labels for the three - move from one to the next in \
+plain prose, and let the angle decide how much weight each gets.
 - {min_chars}-{max_chars} characters in total.
 - The first two lines carry the hook and the claim, and must make sense alone. \
 LinkedIn truncates near {hook_chars} characters behind a "see more" link; \

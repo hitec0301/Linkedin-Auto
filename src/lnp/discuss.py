@@ -1,8 +1,13 @@
 """Discuss: explore a source, argue with it, before it becomes a post.
 
+A source is a URL, pasted text, or both - a link to react to, a comment
+someone else wrote that you want to argue with, your own raw notes, or an
+article plus your reaction to it. At least one is required; whichever are
+given are treated as material to discuss, nothing more.
+
 Three model calls, each doing one thing:
 
-  summarize   read the article, write a short neutral summary to react to.
+  summarize   read the source, write a short neutral summary to react to.
   respond     read the transcript so far and engage with what was just
               argued - push back with a real counterpoint or complication
               when there is one, agree when there genuinely isn't a
@@ -23,7 +28,7 @@ for the variant picker instead of a bare take waiting on a second click.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from . import drafting, log
 from .config import Config
@@ -38,25 +43,28 @@ if TYPE_CHECKING:
 logger = log.get("discuss")
 
 SUMMARY_SYSTEM = """\
-You are briefing someone on an article so they can react to it - agree, \
-disagree, or push back on some part of it. Write a short, neutral summary: \
-what the article actually says, not your opinion of it. Three to six \
-sentences. No preamble, no headline, no markdown."""
+You are briefing someone on a source so they can react to it - agree, \
+disagree, or push back on some part of it. The source may be a fetched \
+article, text they pasted in themselves (a comment, a quote, their own \
+notes), or both. Write a short, neutral summary: what the source actually \
+says, not your opinion of it. Three to six sentences. No preamble, no \
+headline, no markdown."""
 
 RESPOND_SYSTEM = """\
 You are a sharp, honest conversation partner helping someone work out what \
-they think about an article before they write a LinkedIn post about it.
+they think about a source before they write a LinkedIn post about it. The \
+source may be a fetched article, text they pasted in themselves, or both.
 
 Engage with what they just said. If there is a real counterpoint, a \
-complication, or a piece of the article their argument does not account \
+complication, or a piece of the source their argument does not account \
 for, raise it - directly, not hedged. If they are right and there \
 genuinely is not a good rebuttal, say so plainly rather than manufacturing \
 disagreement. If a question would sharpen their position more than either, \
 ask it.
 
-Use only what is in the article extract you are given as fact about the \
-article; do not invent details it does not contain. Keep it conversational \
-- a few sentences, not an essay. No preamble, no markdown."""
+Use only what is in the source material you are given as fact about it; do \
+not invent details it does not contain. Keep it conversational - a few \
+sentences, not an essay. No preamble, no markdown."""
 
 SYNTHESIZE_SYSTEM = """\
 Read this conversation - someone working out what they think about an \
@@ -70,36 +78,58 @@ One paragraph. Write it as an angle, the way a person would state their \
 own take, not as "the user argued that...". No preamble, no markdown."""
 
 
-def _extract_block(extract: "drafting.Extract") -> str:
-    if extract.ok and extract.text:
-        return f"Extract:\n{extract.text}"
-    return (
-        f"Extract: unavailable ({extract.note}). Discuss the article by "
-        "title and URL only; do not invent details about its content."
-    )
+def _source_block(
+    *, source_url: str, source_title: str,
+    extract: Optional["drafting.Extract"], pasted_text: str,
+) -> str:
+    """Everything known about what's being discussed - a URL's fetched
+    extract, pasted text, or both - in one block. `extract` is None when no
+    URL was given at all, distinct from one that was given but failed to
+    fetch."""
+    parts = []
+    if source_title:
+        parts.append(f"Title: {source_title}")
+    if source_url:
+        parts.append(f"URL: {source_url}")
+    if extract is not None:
+        if extract.ok and extract.text:
+            parts.append(f"Article extract:\n{extract.text}")
+        else:
+            parts.append(
+                f"Article extract: unavailable ({extract.note}). Do not "
+                "invent details about its content."
+            )
+    if pasted_text.strip():
+        parts.append(f"Pasted text:\n{pasted_text.strip()}")
+    return "\n\n".join(parts)
 
 
 def _transcript(messages: List[Dict[str, str]]) -> str:
     return "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
 
 
-def summarize(config: Config, *, source_url: str, source_title: str) -> Tuple[str, "drafting.Extract"]:
-    extract = drafting.fetch_extract(config, source_url)
-    prompt = "\n\n".join([
-        f"Title: {source_title or '(no title given)'}",
-        f"URL: {source_url}",
-        _extract_block(extract),
-    ])
+def summarize(
+    config: Config, *, source_url: str = "", source_title: str = "", pasted_text: str = "",
+) -> Tuple[str, Optional["drafting.Extract"]]:
+    extract = drafting.fetch_extract(config, source_url) if source_url else None
+    prompt = _source_block(
+        source_url=source_url, source_title=source_title,
+        extract=extract, pasted_text=pasted_text,
+    )
     summary = complete(config, system=SUMMARY_SYSTEM, user=prompt, max_tokens=500)
     return summary, extract
 
 
-def respond(config: Config, *, source_url: str, source_title: str, messages: List[Dict[str, str]]) -> str:
-    extract = drafting.fetch_extract(config, source_url)
+def respond(
+    config: Config, *, source_url: str = "", source_title: str = "",
+    pasted_text: str = "", messages: List[Dict[str, str]],
+) -> str:
+    extract = drafting.fetch_extract(config, source_url) if source_url else None
     prompt = "\n\n".join([
-        f"Title: {source_title or '(no title given)'}",
-        f"URL: {source_url}",
-        _extract_block(extract),
+        _source_block(
+            source_url=source_url, source_title=source_title,
+            extract=extract, pasted_text=pasted_text,
+        ),
         "---",
         "Conversation so far:",
         _transcript(messages),
@@ -112,12 +142,16 @@ def synthesize_take(config: Config, *, messages: List[Dict[str, str]]) -> str:
 
 
 def start_discussion(
-    run: "runner.Run", *, source_url: str, source_title: str, started_from_row_id: str = "",
+    run: "runner.Run", *, source_url: str = "", source_title: str = "",
+    pasted_text: str = "", started_from_row_id: str = "",
 ) -> "DiscussionRecord":
-    summary, _extract = summarize(run.config, source_url=source_url, source_title=source_title)
+    summary, _extract = summarize(
+        run.config, source_url=source_url, source_title=source_title, pasted_text=pasted_text,
+    )
     return run.store.create_discussion(
         source_url=source_url,
         source_title=source_title,
+        pasted_text=pasted_text,
         started_from_row_id=started_from_row_id,
         messages=[{"role": "assistant", "content": summary}],
     )
@@ -131,6 +165,7 @@ def continue_discussion(
         run.config,
         source_url=discussion.source_url,
         source_title=discussion.source_title,
+        pasted_text=discussion.pasted_text,
         messages=messages,
     )
     return run.store.append_discussion_messages(

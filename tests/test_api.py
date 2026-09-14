@@ -684,6 +684,105 @@ def test_create_discussion_rejects_a_bad_url(api):
     assert response.status_code == 422
 
 
+def test_create_discussion_rejects_neither_url_nor_text(api):
+    response = api.post("/api/discussions", json={})
+    assert response.status_code == 422
+
+
+def test_create_discussion_works_from_pasted_text_alone(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+    from lnp.drafting import Extract
+
+    seen = {}
+
+    def fake_summarize(config, **kw):
+        seen.update(kw)
+        return "A neutral summary of the pasted text.", None
+
+    monkeypatch.setattr(discuss_mod, "summarize", fake_summarize)
+
+    body = api.post("/api/discussions", json={
+        "pasted_text": "A comment I want to argue with: remote work kills mentorship.",
+    }).json()
+    assert body["source_url"] == ""
+    assert body["pasted_text"] == "A comment I want to argue with: remote work kills mentorship."
+    assert body["messages"] == [
+        {"role": "assistant", "content": "A neutral summary of the pasted text."}
+    ]
+    assert seen["pasted_text"] == "A comment I want to argue with: remote work kills mentorship."
+    assert seen["source_url"] == ""
+
+
+def test_create_discussion_works_from_url_and_pasted_text_together(api, monkeypatch):
+    from lnp import discuss as discuss_mod
+
+    seen = {}
+
+    def fake_summarize(config, **kw):
+        seen.update(kw)
+        return "Summary.", None
+
+    monkeypatch.setattr(discuss_mod, "summarize", fake_summarize)
+
+    body = api.post("/api/discussions", json={
+        "source_url": "https://x.test/a", "pasted_text": "My reaction to it.",
+    }).json()
+    assert body["source_url"] == "https://x.test/a"
+    assert body["pasted_text"] == "My reaction to it."
+    assert seen["source_url"] == "https://x.test/a"
+    assert seen["pasted_text"] == "My reaction to it."
+
+
+def test_summarize_skips_fetching_when_no_url_is_given(monkeypatch):
+    """Pasted-text-only discussions never hit the network for an article
+    that was never given."""
+    from lnp import discuss as discuss_mod, drafting as drafting_mod
+    from lnp.config import Config
+
+    def explode(*a, **kw):  # pragma: no cover - must never run
+        raise AssertionError("must not fetch when there is no URL")
+
+    monkeypatch.setattr(drafting_mod, "fetch_extract", explode)
+
+    seen = {}
+    monkeypatch.setattr(
+        discuss_mod, "complete",
+        lambda config, *, system, user, **kw: (seen.update(user=user) or "a summary"),
+    )
+
+    summary, extract = discuss_mod.summarize(
+        Config({}), pasted_text="A comment about remote work and mentorship."
+    )
+    assert summary == "a summary"
+    assert extract is None
+    assert "A comment about remote work and mentorship." in seen["user"]
+    assert "URL:" not in seen["user"]
+
+
+def test_summarize_includes_both_url_and_pasted_text_when_both_given(monkeypatch):
+    from lnp import discuss as discuss_mod, drafting as drafting_mod
+    from lnp.config import Config
+    from lnp.drafting import Extract
+
+    monkeypatch.setattr(
+        drafting_mod, "fetch_extract",
+        lambda config, url: Extract("the article body", True),
+    )
+    seen = {}
+    monkeypatch.setattr(
+        discuss_mod, "complete",
+        lambda config, *, system, user, **kw: (seen.update(user=user) or "a summary"),
+    )
+
+    discuss_mod.summarize(
+        Config({}), source_url="https://x.test/a", source_title="A title",
+        pasted_text="My own reaction to it.",
+    )
+    assert "https://x.test/a" in seen["user"]
+    assert "the article body" in seen["user"]
+    assert "My own reaction to it." in seen["user"]
+
+
 def test_create_discussion_can_start_from_an_existing_row(api, monkeypatch):
     from lnp import discuss as discuss_mod
     from lnp.drafting import Extract
@@ -772,6 +871,31 @@ def test_turn_into_post_creates_a_new_row_when_standalone(api, monkeypatch):
 
     discussion = api.get(f"/api/discussions/{created['id']}").json()
     assert discussion["row_id"] == row["id"]
+
+
+def test_turn_into_post_works_from_a_pasted_text_only_discussion(api, monkeypatch):
+    """No URL at all - the row this produces has no source to fetch, and
+    drafting still works from the angle alone, same as any row with no
+    working source link."""
+    from lnp import discuss as discuss_mod, drafting as drafting_mod, voice as voice_mod
+
+    monkeypatch.setattr(discuss_mod, "summarize", lambda config, **kw: ("Summary.", None))
+    created = api.post("/api/discussions", json={
+        "pasted_text": "A comment I want to argue with.",
+    }).json()
+    monkeypatch.setattr(discuss_mod, "respond", lambda config, **kw: "Counterpoint.")
+    api.post(f"/api/discussions/{created['id']}/messages", json={"content": "My argument."})
+
+    monkeypatch.setattr(discuss_mod, "synthesize_take", lambda config, **kw: "The synthesized thesis.")
+    store_for().save_voice_card("A starter voice card.")
+    monkeypatch.setattr(voice_mod, "build_voice_context", lambda config, **kw: "VOICE CONTEXT")
+    monkeypatch.setattr(drafting_mod, "draft",
+                         lambda config, row, ctx, **kw: "A fresh draft of about the right length. " * 20)
+
+    row = api.post(f"/api/discussions/{created['id']}/turn-into-post").json()
+    assert row["status"] == "DRAFTED"
+    assert row["source_url"] == ""
+    assert "fresh draft" in row["draft_text"]
 
 
 def test_turn_into_post_updates_the_row_it_started_from(api, monkeypatch):

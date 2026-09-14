@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ..drafting import contains_both_variants, split_variants
 from ..models import ALL_STATUSES, COLUMNS, Row
@@ -153,17 +153,33 @@ class ScheduleIn(BaseModel):
 
 
 class NewDiscussionIn(BaseModel):
-    source_url: str = Field(min_length=1, max_length=2000)
+    """A URL, pasted text, or both - a link is no longer required on its
+    own, since a discussion can just as well start from a comment or notes
+    someone pastes in directly."""
+
+    source_url: str = Field(default="", max_length=2000)
     source_title: str = Field(default="", max_length=300)
+    pasted_text: str = Field(default="", max_length=20000)
     row_id: str = Field(default="", max_length=26)
 
     @field_validator("source_url")
     @classmethod
-    def looks_like_a_url(cls, value: str) -> str:
+    def looks_like_a_url_if_given(cls, value: str) -> str:
         value = value.strip()
-        if not (value.startswith("http://") or value.startswith("https://")):
+        if value and not (value.startswith("http://") or value.startswith("https://")):
             raise ValueError("needs to be a full URL, starting with http:// or https://")
         return value
+
+    @field_validator("pasted_text")
+    @classmethod
+    def strip_pasted_text(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def at_least_one_source(self) -> "NewDiscussionIn":
+        if not self.source_url and not self.pasted_text:
+            raise ValueError("give a link, some pasted text, or both to discuss")
+        return self
 
 
 class DiscussionMessageIn(BaseModel):
@@ -188,6 +204,7 @@ class DiscussionOut(BaseModel):
     updated_at: str = ""
     source_url: str = ""
     source_title: str = ""
+    pasted_text: str = ""
     started_from_row_id: str = ""
     row_id: str = ""
     messages: List[DiscussionMessageOut] = Field(default_factory=list)

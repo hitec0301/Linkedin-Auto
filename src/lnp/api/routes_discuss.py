@@ -29,6 +29,7 @@ def _out(d) -> DiscussionOut:
     return DiscussionOut(
         id=d.id, created_at=d.created_at, updated_at=d.updated_at,
         source_url=d.source_url, source_title=d.source_title,
+        pasted_text=d.pasted_text,
         started_from_row_id=d.started_from_row_id, row_id=d.row_id,
         messages=d.messages,
     )
@@ -59,7 +60,8 @@ def create_discussion(
     tenant: Tenant = Depends(active_tenant),
     cfg: Config = Depends(config),
 ) -> DiscussionOut:
-    """Fetch the source and ask the model for a neutral summary to react to."""
+    """Fetch the source (if a URL was given) and ask the model for a
+    neutral summary to react to."""
     with ON_DEMAND_LLM_LOCK, closing(runner.runs("discuss", cfg, tenant_id=tenant.id)) as runs:
         run = next(runs, None)
         if run is None:
@@ -68,7 +70,7 @@ def create_discussion(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such row")
         discussion = discuss_mod.start_discussion(
             run, source_url=body.source_url, source_title=body.source_title,
-            started_from_row_id=body.row_id,
+            pasted_text=body.pasted_text, started_from_row_id=body.row_id,
         )
         return _out(discussion)
 
